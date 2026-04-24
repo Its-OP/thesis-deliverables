@@ -1,0 +1,16 @@
+name: thesis-deliverables
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.13
+  - pip
+  - pyarrow>=15
+  - numpy<2.0
+  - pip:
+      - torch>=2.2
+      - awkward>=2.6
+      - PyYAML>=6.0
+      - tqdm>=4.66
+      - matplotlib>=3.8
+      - pytest>=7
