@@ -15,7 +15,7 @@ class TestMetricsAccumulatorExists:
     """MetricsAccumulator should be importable from training_utils."""
 
     def test_importable(self):
-        from utils.training_utils import MetricsAccumulator
+        from utils.metrics import MetricsAccumulator
         assert callable(MetricsAccumulator)
 
 
@@ -24,7 +24,7 @@ class TestMetricsAccumulatorBasicUsage:
 
     def test_update_and_compute(self):
         """update() accepts batch data, compute() returns final metrics dict."""
-        from utils.training_utils import MetricsAccumulator
+        from utils.metrics import MetricsAccumulator
 
         accumulator = MetricsAccumulator(
             k_values=(10, 200),
@@ -48,7 +48,7 @@ class TestMetricsAccumulatorBasicUsage:
 
     def test_multiple_updates(self):
         """Multiple update() calls should accumulate data."""
-        from utils.training_utils import MetricsAccumulator
+        from utils.metrics import MetricsAccumulator
 
         accumulator = MetricsAccumulator(k_values=(10,))
 
@@ -81,7 +81,7 @@ class TestGlobalPercentiles:
         Global p90 of [0, 0, 0, 50, 50, 50] should be 50.
         Batch-averaged p90 = (0 + 50) / 2 = 25 — WRONG.
         """
-        from utils.training_utils import MetricsAccumulator
+        from utils.metrics import MetricsAccumulator
 
         accumulator = MetricsAccumulator(k_values=(200,))
 
@@ -116,7 +116,7 @@ class TestGlobalPercentiles:
 
     def test_p95_with_single_outlier(self):
         """p95 should reflect the worst-ranked GT track globally."""
-        from utils.training_utils import MetricsAccumulator
+        from utils.metrics import MetricsAccumulator
 
         accumulator = MetricsAccumulator(k_values=(200,))
 
@@ -153,7 +153,7 @@ class TestGlobalBreakdown:
     def test_breakdown_counts_globally(self):
         """Batch 1: 3/3 found. Batch 2: 1/3 found.
         Global: found_3_of_3 = 0.5, found_1_of_3 = 0.5."""
-        from utils.training_utils import MetricsAccumulator
+        from utils.metrics import MetricsAccumulator
 
         accumulator = MetricsAccumulator(k_values=(200,))
 
@@ -187,7 +187,7 @@ class TestGlobalRecallConsistency:
 
     def test_single_batch_matches_direct_call(self):
         """MetricsAccumulator with one batch should match compute_recall_at_k_metrics."""
-        from utils.training_utils import MetricsAccumulator, compute_recall_at_k_metrics
+        from utils.metrics import MetricsAccumulator, compute_recall_at_k_metrics
 
         scores = torch.randn(4, 50)
         labels = torch.zeros(4, 1, 50)

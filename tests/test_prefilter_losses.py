@@ -1,8 +1,3 @@
-"""Unit tests for weaver.nn.model.prefilter_losses.
-
-Covers: listwise_ce_loss, infonce_in_event, logit_adjust_offset,
-object_condensation_loss.
-"""
 from __future__ import annotations
 
 import math
@@ -14,7 +9,6 @@ from weaver.nn.model.prefilter_losses import (
     infonce_in_event,
     listwise_ce_loss,
     logit_adjust_offset,
-    object_condensation_loss,
 )
 
 
@@ -110,28 +104,6 @@ class TestLogitAdjustOffset:
     def test_degenerate_cases_return_zero(self):
         assert logit_adjust_offset(0, 100, tau=1.0) == 0.0
         assert logit_adjust_offset(100, 0, tau=1.0) == 0.0
-
-
-class TestObjectCondensationLoss:
-    def test_finite(self):
-        scores, labels, valid_mask = _make_scores_and_labels()
-        embeddings = torch.randn(BATCH_SIZE, 8, NUM_TRACKS)
-        beta = torch.sigmoid(scores)
-        loss = object_condensation_loss(
-            embeddings, beta, labels, valid_mask,
-        )
-        assert torch.isfinite(loss)
-
-    def test_gradient_flow(self):
-        scores, labels, valid_mask = _make_scores_and_labels()
-        embeddings = torch.randn(BATCH_SIZE, 8, NUM_TRACKS, requires_grad=True)
-        beta = torch.sigmoid(scores).clone().requires_grad_(True)
-        loss = object_condensation_loss(
-            embeddings, beta, labels, valid_mask,
-        )
-        loss.backward()
-        assert torch.isfinite(embeddings.grad).all()
-        assert torch.isfinite(beta.grad).all()
 
 
 class TestTrackPreFilterLossDispatch:

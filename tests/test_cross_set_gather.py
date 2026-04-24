@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from weaver.nn.model.HierarchicalGraphBackbone import cross_set_gather
+from weaver.nn.model.graph_ops import cross_set_gather
 
 
 def _cross_set_gather_reference(

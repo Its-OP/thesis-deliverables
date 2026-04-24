@@ -25,7 +25,7 @@ test = ["pytest>=7"]
 condor = ["uproot>=5"]
 
 [tool.setuptools]
-py-modules = ["pretrain_backbone", "train_prefilter"]
+py-modules = ["train_prefilter"]
 
 [tool.setuptools.packages.find]
 where = ["."]
