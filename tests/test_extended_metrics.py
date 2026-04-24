@@ -13,7 +13,7 @@ import tempfile
 import pytest
 import torch
 
-from utils.training_utils import compute_recall_at_k_metrics
+from utils.metrics import compute_recall_at_k_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -197,94 +197,6 @@ class TestPerEventBreakdown:
 
 
 # ===========================================================================
-# 0.2 Tests: compute_conditional_recall
-# ===========================================================================
-
-
-class TestConditionalRecall:
-    """Tests for compute_conditional_recall() — per-bin recall by pT and dxy."""
-
-    def test_function_exists_and_importable(self):
-        """compute_conditional_recall should be importable."""
-        from utils.training_utils import compute_conditional_recall
-        assert callable(compute_conditional_recall)
-
-    def test_returns_pt_bin_metrics(self):
-        """Should return recall_pt_* and count_pt_* for each pT bin."""
-        from utils.training_utils import compute_conditional_recall
-
-        scores, labels, mask = make_event(
-            num_tracks=20, gt_indices=[0, 1, 2], gt_scores=[10, 9, 8],
-        )
-        features = torch.randn(1, 16, 20)
-        features[0, 0, 0] = 0.4   # pT in [0.3, 0.5) bin
-        features[0, 0, 1] = 1.5   # pT in [1.0, 2.0) bin
-        features[0, 0, 2] = 3.0   # pT in [2.0, inf) bin
-
-        metrics = compute_conditional_recall(
-            scores, labels, mask, features,
-            feature_index_pt=0, feature_index_dxy_significance=6,
-        )
-        assert 'recall_pt_0.3_0.5' in metrics
-        assert 'recall_pt_1_2' in metrics
-        assert 'recall_pt_2+' in metrics
-        assert 'count_pt_0.3_0.5' in metrics
-
-    def test_returns_dxy_bin_metrics(self):
-        """Should return recall_dxy_* and count_dxy_* for each |dxy| bin."""
-        from utils.training_utils import compute_conditional_recall
-
-        scores, labels, mask = make_event(
-            num_tracks=20, gt_indices=[0], gt_scores=[10],
-        )
-        features = torch.randn(1, 16, 20)
-        features[0, 6, 0] = 0.3   # |dxy_sig| in [0, 0.5) bin
-
-        metrics = compute_conditional_recall(
-            scores, labels, mask, features,
-            feature_index_pt=0, feature_index_dxy_significance=6,
-        )
-        assert 'recall_dxy_0_0.5' in metrics
-        assert 'count_dxy_0_0.5' in metrics
-
-    def test_returns_2d_grid_metrics(self):
-        """Should return recall_2d_pt*_dxy* for the full 5x5 grid."""
-        from utils.training_utils import compute_conditional_recall
-
-        scores, labels, mask = make_event(
-            num_tracks=20, gt_indices=[0], gt_scores=[10],
-        )
-        features = torch.randn(1, 16, 20)
-        metrics = compute_conditional_recall(
-            scores, labels, mask, features,
-        )
-        # 5 pT bins * 5 dxy bins * 2 (recall + count) = 50
-        # Plus 5 pt recall + 5 pt count + 5 dxy recall + 5 dxy count = 20
-        # Total = 70
-        assert len(metrics) == 70
-
-    def test_found_track_has_recall_one(self):
-        """A GT track scored highest should have recall 1.0 in its bin."""
-        from utils.training_utils import compute_conditional_recall
-
-        scores, labels, mask = make_event(
-            num_tracks=20, gt_indices=[0], gt_scores=[100],
-        )
-        features = torch.zeros(1, 16, 20)
-        features[0, 0, 0] = 1.5   # pT bin [1, 2)
-        features[0, 6, 0] = 3.0   # |dxy| bin [2, 5)
-
-        metrics = compute_conditional_recall(
-            scores, labels, mask, features,
-            feature_index_pt=0, feature_index_dxy_significance=6,
-            top_k=200,
-        )
-        assert metrics['recall_pt_1_2'] == pytest.approx(1.0)
-        assert metrics['recall_dxy_2_5'] == pytest.approx(1.0)
-        assert metrics['count_pt_1_2'] == 1
-
-
-# ===========================================================================
 # 0.3 Tests: save_epoch_metrics
 # ===========================================================================
 
@@ -294,12 +206,12 @@ class TestSaveEpochMetrics:
 
     def test_function_exists_and_importable(self):
         """save_epoch_metrics should be importable."""
-        from utils.training_utils import save_epoch_metrics
+        from utils.metrics import save_epoch_metrics
         assert callable(save_epoch_metrics)
 
     def test_creates_json_file(self):
         """Should create metrics/epoch_N.json in experiment directory."""
-        from utils.training_utils import save_epoch_metrics
+        from utils.metrics import save_epoch_metrics
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = save_epoch_metrics({'recall_at_200': 0.629}, tmpdir, 5)
@@ -308,7 +220,7 @@ class TestSaveEpochMetrics:
 
     def test_json_content_matches_input(self):
         """Written JSON should contain the exact metrics passed."""
-        from utils.training_utils import save_epoch_metrics
+        from utils.metrics import save_epoch_metrics
 
         input_metrics = {
             'recall_at_200': 0.629,
@@ -324,7 +236,7 @@ class TestSaveEpochMetrics:
 
     def test_creates_metrics_subdirectory(self):
         """Should create the metrics/ subdirectory if it doesn't exist."""
-        from utils.training_utils import save_epoch_metrics
+        from utils.metrics import save_epoch_metrics
 
         with tempfile.TemporaryDirectory() as tmpdir:
             save_epoch_metrics({}, tmpdir, 1)

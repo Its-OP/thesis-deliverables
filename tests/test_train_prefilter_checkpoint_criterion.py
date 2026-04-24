@@ -86,7 +86,7 @@ class TestPerfectAt256SemanticsMatchDiagnostic:
         direct "all GT in top-256" fraction — same definition as the
         offline diagnostic in ``prefilter_perfect_recall_diagnostic``.
         """
-        from utils.training_utils import MetricsAccumulator
+        from utils.metrics import MetricsAccumulator
 
         # 3 events, 300 tracks each, 3 GT pions per event.
         # Event 0: all 3 GT within top-10 (perfect @256).

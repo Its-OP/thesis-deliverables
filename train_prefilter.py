@@ -43,7 +43,7 @@ from torch.utils.data import DataLoader
 
 from weaver.utils.dataset import SimpleIterDataset
 
-from pretrain_backbone import (
+from utils.experiment import (
     WarmupThenCosineScheduler,
     WarmupThenPlateauScheduler,
     _TeeStream,
@@ -51,15 +51,14 @@ from pretrain_backbone import (
     plot_loss_curves,
     save_loss_history,
 )
-from utils.optimizers import OPTIMIZER_NAMES, build_optimizer
-from utils.training_utils import (
-    CheckpointManager,
-    MetricsAccumulator,
+from utils.checkpointing import CheckpointManager
+from utils.dataset_helpers import (
     extract_label_from_inputs,
     load_network_module,
-    save_epoch_metrics,
     trim_to_max_valid_tracks,
 )
+from utils.metrics import MetricsAccumulator, save_epoch_metrics
+from utils.optimizers import OPTIMIZER_NAMES, build_optimizer
 
 logger = logging.getLogger('train_prefilter')
 
@@ -123,11 +122,7 @@ def train_one_epoch(
     label_input_index: int,
     grad_clip_max_norm: float = 1.0,
     augmentation: torch.nn.Module | None = None,
-    ema_teacher: torch.nn.Module | None = None,
-    ema_decay: float = 0.999,
-    kl_weight: float = 0.1,
 ) -> tuple[dict[str, float], int]:
-    """Train for one epoch."""
     model.train()
     loss_accumulators: dict[str, float] | None = None
     num_batches = 0
@@ -139,7 +134,6 @@ def train_one_epoch(
 
         inputs = [X[k].to(device) for k in data_config.input_names]
         padded_length = inputs[0].shape[2]
-
         inputs = trim_to_max_valid_tracks(inputs, mask_input_index)
 
         if batch_index == 0:
@@ -155,7 +149,6 @@ def train_one_epoch(
         )
         points, features, lorentz_vectors, mask = model_inputs
 
-        # Optional set-friendly augmentation (JetCLR-style).
         if augmentation is not None:
             points, features, lorentz_vectors, mask = augmentation(
                 points, features, lorentz_vectors, mask, track_labels,
@@ -164,56 +157,12 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast('cuda', enabled=grad_scaler is not None):
-            # Contrastive denoising re-enabled (2026-04-07) as a regularizer
-            # for the dim256+cutoff overfit. The DRW/temperature-annealing
-            # ablation ruled out exotic loss enhancements as the *trigger*
-            # (DRW's epoch-31 activation was the loss discontinuity), but
-            # denoising itself is a GT-invariance regularizer and helps with
-            # the residual ~2pp train/val gap. DRW and temperature annealing
-            # stay disabled in the wrapper — see reports/prefilter_analysis_20260406.md.
             loss_dict = model.compute_loss(
                 points, features, lorentz_vectors, mask, track_labels,
             )
-            student_scores = loss_dict.get('_scores')
-
-            # Self-distillation EMA teacher (E12). Teacher runs in eval
-            # mode and no-grad. KL between student and teacher logits
-            # (softened with temperature 1) is added with kl_weight.
-            if ema_teacher is not None and student_scores is not None:
-                with torch.no_grad():
-                    teacher_scores = ema_teacher(
-                        points, features, lorentz_vectors, mask,
-                    )
-                valid_mask = mask.squeeze(1).bool()
-                student_logits = student_scores.masked_fill(
-                    ~valid_mask, float('-inf'),
-                )
-                teacher_logits = teacher_scores.masked_fill(
-                    ~valid_mask, float('-inf'),
-                )
-                student_log_prob = torch.nn.functional.log_softmax(
-                    student_logits, dim=-1,
-                )
-                teacher_prob = torch.nn.functional.softmax(
-                    teacher_logits, dim=-1,
-                )
-                # Per-event KL, averaged over events with at least 1 positive.
-                kl_per_event = torch.nn.functional.kl_div(
-                    student_log_prob, teacher_prob,
-                    reduction='none',
-                )
-                kl_per_event = kl_per_event.sum(dim=-1)
-                kl_loss = kl_per_event.mean()
-                loss_dict['kl_loss'] = kl_loss
-                loss_dict['total_loss'] = loss_dict['total_loss'] + (
-                    kl_weight * kl_loss
-                )
-
-            # Remove cached scores (non-scalar) before loss accumulation
             loss_dict.pop('_scores', None)
             loss = loss_dict['total_loss']
 
-        # Single GPU→CPU sync instead of two (isnan + isinf)
         if not torch.isfinite(loss).item():
             logger.warning(
                 f'Epoch {epoch} | Batch {batch_index} | '
@@ -239,25 +188,6 @@ def train_one_epoch(
             grad_scaler.update()
         else:
             optimizer.step()
-
-        # EMA teacher update (E12). θ_teacher ← decay · θ_teacher + (1-decay) · θ_student.
-        if ema_teacher is not None:
-            with torch.no_grad():
-                student_params = dict(model.named_parameters())
-                for name, teacher_param in ema_teacher.named_parameters():
-                    student_param = student_params.get(name)
-                    if student_param is None:
-                        continue
-                    teacher_param.data.mul_(ema_decay).add_(
-                        student_param.data, alpha=1.0 - ema_decay,
-                    )
-                # Buffers (BN running stats) — copy straight through.
-                student_buffers = dict(model.named_buffers())
-                for name, teacher_buffer in ema_teacher.named_buffers():
-                    student_buffer = student_buffers.get(name)
-                    if student_buffer is None:
-                        continue
-                    teacher_buffer.data.copy_(student_buffer.data)
 
         scheduler.step_batch()
 
@@ -522,14 +452,7 @@ def validate(
 
 
 def _build_argument_parser() -> argparse.ArgumentParser:
-    """Build the CLI argument parser.
-
-    Split out from ``main`` so tests can inspect flag defaults and parsing
-    without executing training side effects.
-    """
-    parser = argparse.ArgumentParser(
-        description='Train TrackPreFilter (Stage 1)',
-    )
+    parser = argparse.ArgumentParser(description='Train TrackPreFilter (Stage 1)')
     parser.add_argument('--data-config', type=str, required=True)
     parser.add_argument('--data-dir', type=str, required=True)
     parser.add_argument('--network', type=str, required=True)
@@ -539,205 +462,39 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument('--batch-size', type=int, default=96)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight-decay', type=float, default=0.01)
-    parser.add_argument('--scheduler', type=str, default='cosine',
-                        choices=['plateau', 'cosine'])
+    parser.add_argument('--scheduler', type=str, default='cosine', choices=['plateau', 'cosine'])
     parser.add_argument('--warmup-fraction', type=float, default=0.05)
     parser.add_argument('--plateau-factor', type=float, default=0.5)
     parser.add_argument('--plateau-patience', type=int, default=5)
     parser.add_argument('--min-lr', type=float, default=1e-6)
     parser.add_argument('--grad-clip', type=float, default=1.0)
+    parser.add_argument('--dropout', type=float, default=0.1)
+
+    parser.add_argument('--num-neighbors', type=int, default=16)
+    parser.add_argument('--num-message-rounds', type=int, default=3)
+    parser.add_argument('--aggregation-mode', type=str, default='max', choices=['max'])
     parser.add_argument(
-        '--dropout', type=float, default=0.1,
-        help='Dropout rate in TrackPreFilter MLP hidden layers (default: 0.1). '
-             'Applied after each ReLU in the mlp-mode track_mlp, '
-             'neighbor_mlps, and scorer. Set to 0 to disable.',
+        '--use-edge-features', action=argparse.BooleanOptionalAction, default=True,
     )
-    # --- Architecture knobs (prefilter improvement campaign) ---
-    parser.add_argument(
-        '--num-neighbors', type=int, default=16,
-        help='k for k-NN neighbor aggregation (default: 16).',
-    )
-    parser.add_argument(
-        '--num-message-rounds', type=int, default=3,
-        help='Number of k-NN message-passing rounds (default: 3, '
-             'E2a campaign winner). Set to 0 for the '
-             'aggregation-ablation experiment.',
-    )
-    parser.add_argument(
-        '--aggregation-mode', type=str, default='max',
-        choices=['max', 'pna'],
-        help='Neighbor aggregation: max-pool (default) or PNA '
-             '(cat of mean, max, min, std).',
-    )
-    parser.add_argument(
-        '--use-edge-features', action=argparse.BooleanOptionalAction,
-        default=True,
-        help='Append pairwise_lv_fts (ln kT, ln z, ln ΔR, ln m²) '
-             'max-pooled over the k-NN to the aggregation input '
-             '(+4 channels). Default ON (E2a campaign winner); '
-             'pass --no-use-edge-features to disable.',
-    )
-    # --- Loss switch (prefilter improvement campaign) ---
+
     parser.add_argument(
         '--loss-type', type=str, default='pairwise',
-        choices=[
-            'pairwise', 'listwise_ce', 'infonce',
-            'logit_adjust', 'object_condensation', 'mpm_pretrain',
-        ],
-        help='Per-event supervision loss. Default pairwise matches '
-             'the historical TrackPreFilter ranking objective.',
+        choices=['pairwise', 'listwise_ce', 'infonce', 'logit_adjust'],
     )
-    parser.add_argument(
-        '--logit-adjust-tau', type=float, default=1.0,
-        help='τ for Menon 2007.07314 logit adjustment. Only used when '
-             '--loss-type=logit_adjust.',
-    )
-    parser.add_argument(
-        '--listwise-temperature', type=float, default=1.0,
-        help='Temperature for listwise_ce / infonce loss.',
-    )
-    # --- Regularisation / augmentation / SSL ---
-    parser.add_argument(
-        '--use-augmentation', action='store_true',
-        help='Apply set-friendly train-time augmentations '
-             '(track dropout, feature jitter, η-φ rotation).',
-    )
-    parser.add_argument(
-        '--ssl-pretrain-ckpt', type=str, default=None,
-        help='Load backbone weights (track_mlp, neighbor_mlps) from a '
-             'masked-particle-modeling SSL pretrain checkpoint before '
-             'supervised training starts.',
-    )
-    parser.add_argument(
-        '--mpm-pretrain-epochs', type=int, default=0,
-        help='If > 0, run that many epochs of masked-particle-modeling '
-             'pretraining before the supervised phase. Uses the model'
-             "'s track_mlp + neighbor_mlps backbone and a reconstruction "
-             'head to predict the input features of randomly masked tracks.',
-    )
-    parser.add_argument(
-        '--mpm-mask-ratio', type=float, default=0.15,
-        help='Fraction of valid tracks randomly masked during MPM pretrain.',
-    )
-    # --- Self-distillation EMA teacher (E12) ---
-    parser.add_argument(
-        '--use-self-distillation', action='store_true',
-        help='Enable self-distillation: maintain an EMA teacher copy of '
-             'the student, add a KL-divergence loss between their logits.',
-    )
-    parser.add_argument(
-        '--ema-decay', type=float, default=0.999,
-        help='EMA decay for the teacher. Higher = slower teacher.',
-    )
-    parser.add_argument(
-        '--kl-weight', type=float, default=0.1,
-        help='Weight of the KL-divergence auxiliary loss.',
-    )
-    # --- Object condensation head (E5) ---
-    parser.add_argument(
-        '--clustering-dim', type=int, default=8,
-        help='Embedding dim for object-condensation loss (E5). '
-             'Unused unless --loss-type object_condensation.',
-    )
-    parser.add_argument(
-        '--oc-potential-weight', type=float, default=1.0,
-        help='Weight of the OC attractive/repulsive potential term.',
-    )
-    parser.add_argument(
-        '--oc-beta-weight', type=float, default=1.0,
-        help='Weight of the OC β-regulariser term.',
-    )
-    parser.add_argument(
-        '--oc-q-min', type=float, default=0.1,
-        help='Minimum charge floor for object-condensation q values.',
-    )
-    # --- XGBoost stub feature (E7) ---
-    parser.add_argument(
-        '--use-xgb-stub-feature', action='store_true',
-        help='Prepend a frozen linear per-track score (16→1) as a 17th '
-             'feature channel. Stub placeholder for the real XGBoost '
-             'score cache — once the cache exists, replace the stub '
-             'with the pre-computed scores. The flag exists so the '
-             'input-dim path is exercised.',
-    )
-    # --- Expressiveness plug-in heads (prefilter P@256 sweep) ---
+    parser.add_argument('--logit-adjust-tau', type=float, default=1.0)
+    parser.add_argument('--listwise-temperature', type=float, default=1.0)
+
+    parser.add_argument('--use-augmentation', action='store_true')
+    parser.add_argument('--clustering-dim', type=int, default=8)
+
     parser.add_argument(
         '--feature-embed-mode', type=str, default='per_feature',
         choices=('none', 'per_feature'),
-        help='P1 (now baseline). "per_feature" routes each raw input '
-             'channel through its own grouped 1×1 Conv + LayerNorm + '
-             'ReLU before track_mlp, producing (16 * feature_embed_dim) '
-             'channels. Pass "none" to reproduce the pre-P1 E2a anchor.',
     )
-    parser.add_argument(
-        '--feature-embed-dim', type=int, default=32,
-        help='P1 per-feature embedding width (only used when '
-             '--feature-embed-mode=per_feature).',
-    )
-    parser.add_argument(
-        '--feature-gate', action='store_true',
-        help='P2. Apply an SE-style squeeze-excite gate to the track_mlp '
-             'output (per-event, per-channel).',
-    )
-    parser.add_argument(
-        '--feature-gate-bottleneck', type=int, default=16,
-        help='P2 SE bottleneck width (only used with --feature-gate).',
-    )
-    parser.add_argument(
-        '--film-head', action='store_true',
-        help='P3. Modulate the track_mlp output with FiLM (γ, β) derived '
-             'from event-level (mean, std) of the standardised features.',
-    )
-    parser.add_argument(
-        '--film-context-dim', type=int, default=32,
-        help='P3 FiLM context hidden width.',
-    )
-    parser.add_argument(
-        '--soft-attention-aggregation', action='store_true',
-        help='P4. Replace max-pool in each message-passing round with a '
-             'learned soft-attention aggregator over the k-NN '
-             'neighbours. Edge features flow into the attention score.',
-    )
-    parser.add_argument(
-        '--soft-attention-bottleneck', type=int, default=64,
-        help='P4 score-MLP bottleneck width.',
-    )
-    # --- Two-tier prefilter (P6) — only read by
-    #     networks/lowpt_tau_TwoTierPreFilter.py wrapper.
-    parser.add_argument(
-        '--two-tier-top-n', type=int, default=600,
-        help='P6 top-N cut between coarse and refine tiers.',
-    )
-    parser.add_argument(
-        '--two-tier-coarse-hidden-dim', type=int, default=128,
-        help='P6 coarse tier hidden dim.',
-    )
-    parser.add_argument(
-        '--two-tier-refine-hidden-dim', type=int, default=384,
-        help='P6 refine tier hidden dim.',
-    )
-    parser.add_argument(
-        '--two-tier-coarse-neighbors', type=int, default=16,
-        help='P6 coarse tier kNN k.',
-    )
-    parser.add_argument(
-        '--two-tier-refine-neighbors', type=int, default=32,
-        help='P6 refine tier kNN k (must be < --two-tier-top-n).',
-    )
-    parser.add_argument(
-        '--two-tier-coarse-rounds', type=int, default=2,
-        help='P6 coarse tier message-passing rounds.',
-    )
-    parser.add_argument(
-        '--two-tier-refine-rounds', type=int, default=3,
-        help='P6 refine tier message-passing rounds.',
-    )
-    parser.add_argument('--train-fraction', type=float, default=0.8,
-                        help='Fraction of data-dir for training (ignored if --val-data-dir set)')
-    parser.add_argument('--val-data-dir', type=str, default=None,
-                        help='Separate directory with validation parquet files. '
-                             'When set, data-dir is used entirely for training '
-                             'and val-data-dir entirely for validation.')
+    parser.add_argument('--feature-embed-dim', type=int, default=32)
+
+    parser.add_argument('--train-fraction', type=float, default=0.8)
+    parser.add_argument('--val-data-dir', type=str, default=None)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--amp', action='store_true')
@@ -749,50 +506,17 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument(
         '--optimizer', type=str, default='adamw', choices=OPTIMIZER_NAMES,
-        help='Optimizer to use. SOAP and Muon require --amp disabled.',
     )
     parser.add_argument(
         '--checkpoint-criterion', type=str,
         default='recall_at_200', choices=CHECKPOINT_CRITERIA,
-        help=(
-            'Validation metric used to pick the best checkpoint. '
-            '"recall_at_200" preserves the 17-experiment campaign convention; '
-            '"perfect_at_256" tracks the per-event perfect-recall target '
-            'directly (the prefilter-expressiveness sweep primary metric). '
-            f'Choices: {", ".join(CHECKPOINT_CRITERIA)}.'
-        ),
     )
-    parser.add_argument(
-        '--profile-steps', type=int, default=0,
-        help=(
-            'If >0, run N training batches under torch.profiler and exit '
-            'without training. Emits chrome trace + summary table.'
-        ),
-    )
-    parser.add_argument(
-        '--profile-output', type=str, default=None,
-        help=(
-            'Directory for profile artifacts. Defaults to experiment dir '
-            'when --profile-steps is set.'
-        ),
-    )
-    parser.add_argument(
-        '--profile-record-shapes', action='store_true',
-        help='Record per-op input shapes. Inflates trace size.',
-    )
-    parser.add_argument(
-        '--profile-memory', action='store_true',
-        help='Record per-op allocations. Further inflates trace size.',
-    )
-    parser.add_argument(
-        '--profile-chrome-trace', action='store_true',
-        help=(
-            'Export full chrome trace JSON. Off by default — summary '
-            'table is enough for op-level hotspots and keeps outputs '
-            'in the KB range. Enabling with --profile-steps N results '
-            'in trace files that scale roughly linearly with N.'
-        ),
-    )
+
+    parser.add_argument('--profile-steps', type=int, default=0)
+    parser.add_argument('--profile-output', type=str, default=None)
+    parser.add_argument('--profile-record-shapes', action='store_true')
+    parser.add_argument('--profile-memory', action='store_true')
+    parser.add_argument('--profile-chrome-trace', action='store_true')
 
     return parser
 
@@ -934,71 +658,18 @@ def main():
         loss_type=args.loss_type,
         logit_adjust_tau=args.logit_adjust_tau,
         listwise_temperature=args.listwise_temperature,
-        use_xgb_stub_feature=args.use_xgb_stub_feature,
         clustering_dim=args.clustering_dim,
         feature_embed_mode=args.feature_embed_mode,
         feature_embed_dim=args.feature_embed_dim,
-        use_feature_gate=args.feature_gate,
-        feature_gate_bottleneck=args.feature_gate_bottleneck,
-        use_film_head=args.film_head,
-        film_context_dim=args.film_context_dim,
-        use_soft_attention_aggregation=args.soft_attention_aggregation,
-        soft_attention_bottleneck=args.soft_attention_bottleneck,
-        # Two-tier-only kwargs — ignored by the single-tier wrapper
-        # (see `networks/lowpt_tau_TrackPreFilter.py`) and consumed by
-        # `networks/lowpt_tau_TwoTierPreFilter.py`.
-        two_tier_top_n=args.two_tier_top_n,
-        two_tier_coarse_hidden_dim=args.two_tier_coarse_hidden_dim,
-        two_tier_refine_hidden_dim=args.two_tier_refine_hidden_dim,
-        two_tier_coarse_neighbors=args.two_tier_coarse_neighbors,
-        two_tier_refine_neighbors=args.two_tier_refine_neighbors,
-        two_tier_coarse_rounds=args.two_tier_coarse_rounds,
-        two_tier_refine_rounds=args.two_tier_refine_rounds,
     )
-    # Post-construction scalar attribute tweaks for the OC / MPM flags
-    # that don't change module layout.
-    if hasattr(model, 'module'):
-        model_root = model.module
-    else:
-        model_root = model
-    model_root.oc_q_min = args.oc_q_min
-    model_root.oc_potential_weight = args.oc_potential_weight
-    model_root.oc_beta_weight = args.oc_beta_weight
-    model_root.mpm_mask_ratio = args.mpm_mask_ratio
-    # MPM masking is ON whenever loss_type == 'mpm_pretrain' (combined
-    # with ``self.training`` gate inside _forward_mlp).
-    model_root.apply_mpm_masking = args.loss_type == 'mpm_pretrain'
+    model_root = model.module if hasattr(model, 'module') else model
 
-    # Optional set-friendly training augmentation. Eval/val path is
-    # untouched — augmentation only fires in train mode.
     if args.use_augmentation:
         from utils.set_augmentation import SetAugmentation
         augmentation = SetAugmentation().to(device)
     else:
         augmentation = None
 
-    # EMA teacher for self-distillation (E12). Constructed as a second
-    # network_module.get_model call using the same flags; state dict is
-    # copied from the student, gradients frozen, set to eval mode.
-    if args.use_self_distillation:
-        ema_teacher, _ = network_module.get_model(
-            data_config,
-            dropout=args.dropout,
-            num_neighbors=args.num_neighbors,
-            num_message_rounds=args.num_message_rounds,
-            aggregation_mode=args.aggregation_mode,
-            use_edge_features=args.use_edge_features,
-            loss_type=args.loss_type,
-            logit_adjust_tau=args.logit_adjust_tau,
-            listwise_temperature=args.listwise_temperature,
-        )
-        ema_teacher = ema_teacher.to(device)
-        ema_teacher.load_state_dict(model_root.state_dict())
-        for parameter in ema_teacher.parameters():
-            parameter.requires_grad = False
-        ema_teacher.eval()
-    else:
-        ema_teacher = None
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -1193,9 +864,6 @@ def main():
                 steps_per_epoch, mask_input_index, label_input_index,
                 grad_clip_max_norm=args.grad_clip,
                 augmentation=augmentation,
-                ema_teacher=ema_teacher,
-                ema_decay=args.ema_decay,
-                kl_weight=args.kl_weight,
             )
 
             eval_steps = max(1, steps_per_epoch // 4)
