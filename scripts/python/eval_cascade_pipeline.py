@@ -1,0 +1,341 @@
+from __future__ import annotations
+
+import argparse
+import glob
+import logging
+import os
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import torch
+from torch.utils.data import DataLoader
+
+from networks.lowpt_tau_CascadeReranker import infer_stage1_kwargs
+from utils.couple_features import (
+    COUPLE_FEATURE_DIM,
+    PAIR_PHYSICS_V3_EXTRA_DIM,
+    build_couple_features_batched,
+)
+from utils.dataset_helpers import (
+    extract_label_from_inputs,
+    trim_to_max_valid_tracks,
+)
+from weaver.nn.model.CascadeReranker import CascadeReranker
+from weaver.nn.model.CoupleReranker import CoupleReranker
+from weaver.nn.model.TrackPreFilter import TrackPreFilter
+from weaver.utils.dataset import SimpleIterDataset
+
+logger = logging.getLogger('eval_cascade_pipeline')
+
+OUTPUT_SCHEMA = pa.schema([
+    pa.field('event_run', pa.int32()),
+    pa.field('event_id', pa.int64()),
+    pa.field('event_luminosity_block', pa.int32()),
+    pa.field('source_batch_id', pa.int32()),
+    pa.field('source_microbatch_id', pa.int32()),
+    pa.field('stage', pa.string()),
+    pa.field('stage1_sorted_indices', pa.list_(pa.int32())),
+    pa.field('stage2_sorted_indices', pa.list_(pa.int32())),
+    pa.field('stage3_sorted_couples', pa.list_(pa.list_(pa.int32()))),
+])
+
+
+def _load_stage1(
+    path: str, data_config, num_neighbors: int, device: str,
+) -> TrackPreFilter:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    state_dict = checkpoint['model_state_dict']
+    kwargs = infer_stage1_kwargs(state_dict, stage1_num_neighbors=num_neighbors)
+    kwargs['input_dim'] = len(data_config.input_dicts['pf_features'])
+    model = TrackPreFilter(**kwargs)
+    model.load_state_dict(state_dict, strict=False)
+    return model.to(device).eval()
+
+
+def _load_stage2(
+    path: str, input_dim: int, device: str,
+) -> tuple[CascadeReranker, int]:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    args = checkpoint.get('args', {}) or {}
+    state_dict = checkpoint['model_state_dict']
+
+    pair_embed_dims = args.get('stage2_pair_embed_dims', '64,64,64')
+    if isinstance(pair_embed_dims, str):
+        pair_embed_dims = [int(x) for x in pair_embed_dims.split(',')]
+
+    model = CascadeReranker(
+        input_dim=input_dim,
+        embed_dim=args.get('stage2_embed_dim', 512),
+        num_heads=args.get('stage2_num_heads', 8),
+        num_layers=args.get('stage2_num_layers', 2),
+        pair_input_dim=4,
+        pair_extra_dim=args.get('stage2_pair_extra_dim', 6),
+        pair_embed_dims=pair_embed_dims,
+        pair_embed_mode=args.get('stage2_pair_embed_mode', 'concat'),
+        ffn_ratio=args.get('stage2_ffn_ratio', 4),
+        dropout=args.get('stage2_dropout', 0.1),
+        loss_mode=args.get('stage2_loss_mode', 'pairwise'),
+        rs_at_k_target=args.get('stage2_rs_at_k_target', 200),
+    )
+    model.load_state_dict(state_dict, strict=False)
+    return model.to(device).eval(), int(args.get('top_k1', 256))
+
+
+def _load_stage3(path: str, device: str) -> tuple[CoupleReranker, int]:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    args = checkpoint.get('args', {}) or {}
+    state_dict = checkpoint['couple_reranker_state_dict']
+    rest_dim = COUPLE_FEATURE_DIM + PAIR_PHYSICS_V3_EXTRA_DIM - 32
+    model = CoupleReranker(
+        hidden_dim=args.get('couple_hidden_dim', 256),
+        num_residual_blocks=args.get('couple_num_residual_blocks', 4),
+        dropout=args.get('couple_dropout', 0.1),
+        ranking_num_samples=args.get('couple_ranking_num_samples', 50),
+        ranking_temperature=args.get('couple_ranking_temperature', 1.0),
+        label_smoothing=args.get('couple_label_smoothing', 0.10),
+        couple_projector_dim=args.get('couple_projector_dim', 32),
+        rest_dim=rest_dim,
+    )
+    model.load_state_dict(state_dict, strict=False)
+    return model.to(device).eval(), int(args.get('top_k2', 50))
+
+
+def _gather_along_tracks(
+    tensor: torch.Tensor, indices: torch.Tensor,
+) -> torch.Tensor:
+    expanded = indices.unsqueeze(1).expand(-1, tensor.shape[1], -1)
+    return tensor.gather(2, expanded)
+
+
+@torch.no_grad()
+def _evaluate_batch(
+    *,
+    stage: str,
+    stage1, stage2, stage3,
+    points, features, lorentz, mask,
+    top_k1, top_k2, num_couples,
+) -> list[dict]:
+    s1_scores = stage1(points, features, lorentz, mask)
+    valid_mask = mask.squeeze(1).bool()
+    s1_masked = torch.where(
+        valid_mask, s1_scores, torch.full_like(s1_scores, float('-inf')),
+    )
+    s1_sorted = torch.argsort(s1_masked, dim=1, descending=True)
+    batch_size = s1_scores.size(0)
+
+    if stage == 'stage1':
+        return [
+            {
+                'stage1_sorted_indices': s1_sorted[
+                    b, :int(valid_mask[b].sum())
+                ].tolist(),
+                'stage2_sorted_indices': [],
+                'stage3_sorted_couples': [],
+            }
+            for b in range(batch_size)
+        ]
+
+    selected_k1 = stage1.select_top_k(s1_scores, mask, top_k1)
+    f_points = _gather_along_tracks(points, selected_k1)
+    f_features = _gather_along_tracks(features, selected_k1)
+    f_lorentz = _gather_along_tracks(lorentz, selected_k1)
+    f_mask = _gather_along_tracks(mask, selected_k1)
+    f_s1 = s1_scores.gather(1, selected_k1)
+
+    s2_scores = stage2(f_points, f_features, f_lorentz, f_mask, f_s1)
+    s2_sorted_k1 = torch.argsort(s2_scores, dim=1, descending=True)
+    s2_sorted_orig = selected_k1.gather(1, s2_sorted_k1)
+
+    if stage == 'part':
+        return [
+            {
+                'stage1_sorted_indices': s1_sorted[
+                    b, :int(valid_mask[b].sum())
+                ].tolist(),
+                'stage2_sorted_indices': s2_sorted_orig[
+                    b, :int(torch.isfinite(s2_scores[b]).sum())
+                ].tolist(),
+                'stage3_sorted_couples': [],
+            }
+            for b in range(batch_size)
+        ]
+
+    top_k2_in_k1 = s2_scores.topk(top_k2, dim=1).indices
+    k2_orig = selected_k1.gather(1, top_k2_in_k1)
+    k2_features = _gather_along_tracks(f_features, top_k2_in_k1)
+    k2_points = _gather_along_tracks(f_points, top_k2_in_k1)
+    k2_lorentz = _gather_along_tracks(f_lorentz, top_k2_in_k1)
+    k2_s1 = f_s1.gather(1, top_k2_in_k1)
+    k2_s2 = s2_scores.gather(1, top_k2_in_k1)
+    k2_valid = torch.isfinite(k2_s2)
+
+    couple_inputs = build_couple_features_batched(
+        top_k2_features=k2_features,
+        top_k2_points=k2_points,
+        top_k2_lorentz=k2_lorentz,
+        top_k2_stage1_scores=k2_s1,
+        top_k2_stage2_scores=k2_s2,
+        track_valid_mask=k2_valid,
+    )
+    s3_scores = stage3(
+        couple_inputs['couple_features'], k2_features=k2_features,
+    )
+
+    upper_i, upper_j = torch.triu_indices(
+        top_k2, top_k2, offset=1, device=s3_scores.device,
+    ).unbind(0)
+
+    rows = []
+    for b in range(batch_size):
+        n_valid_k1 = int(torch.isfinite(s2_scores[b]).sum())
+        scores_b = s3_scores[b].clone()
+        scores_b[~couple_inputs['filter_a_mask'][b]] = float('-inf')
+        order = torch.argsort(scores_b, descending=True)[:num_couples]
+        keep = couple_inputs['filter_a_mask'][b][order]
+        order = order[keep]
+        i_orig = k2_orig[b, upper_i[order]].tolist()
+        j_orig = k2_orig[b, upper_j[order]].tolist()
+        rows.append({
+            'stage1_sorted_indices': s1_sorted[
+                b, :int(valid_mask[b].sum())
+            ].tolist(),
+            'stage2_sorted_indices': s2_sorted_orig[b, :n_valid_k1].tolist(),
+            'stage3_sorted_couples': [[i, j] for i, j in zip(i_orig, j_orig)],
+        })
+    return rows
+
+
+def _write_parquet(rows: list[dict], output_path: str) -> None:
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    columns = {field.name: [] for field in OUTPUT_SCHEMA}
+    for row in rows:
+        for field in OUTPUT_SCHEMA:
+            columns[field.name].append(row[field.name])
+    table = pa.table(columns, schema=OUTPUT_SCHEMA)
+    pq.write_table(table, output_path)
+
+
+def _composite_key(observers: dict, b: int) -> dict:
+    return {
+        'event_run': int(observers['event_run'][b]),
+        'event_id': int(observers['event_id'][b]),
+        'event_luminosity_block': int(observers['event_luminosity_block'][b]),
+        'source_batch_id': int(observers['source_batch_id'][b]),
+        'source_microbatch_id': int(observers['source_microbatch_id'][b]),
+    }
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description='Cascade evaluator: prefilter → ParT → couples; '
+                    'dumps per-event sorted indices to parquet.',
+    )
+    parser.add_argument(
+        '--stage', choices=('stage1', 'part', 'couples'), required=True,
+    )
+    parser.add_argument('--stage1-weights', required=True)
+    parser.add_argument('--stage2-weights')
+    parser.add_argument('--stage3-weights')
+    parser.add_argument('--num-couples', type=int, default=200)
+    parser.add_argument('--val-data-dir', required=True)
+    parser.add_argument('--data-config', required=True)
+    parser.add_argument('--output', required=True)
+    parser.add_argument('--top-k1', type=int, default=None)
+    parser.add_argument('--top-k2', type=int, default=None)
+    parser.add_argument('--stage1-num-neighbors', type=int, default=16)
+    parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument('--max-events', type=int, default=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+    )
+    args = _build_parser().parse_args(argv)
+    if args.device.startswith('mps'):
+        raise SystemExit('MPS not supported; use cpu or cuda.')
+    if args.stage in {'part', 'couples'} and not args.stage2_weights:
+        raise SystemExit('--stage2-weights required for stage=part/couples.')
+    if args.stage == 'couples' and not args.stage3_weights:
+        raise SystemExit('--stage3-weights required for stage=couples.')
+
+    device = torch.device(args.device)
+
+    parquet_files = sorted(glob.glob(f'{args.val_data_dir}/*.parquet'))
+    if not parquet_files:
+        raise FileNotFoundError(f'No parquet files in {args.val_data_dir}')
+    dataset = SimpleIterDataset(
+        {'data': parquet_files},
+        data_config_file=args.data_config,
+        for_training=False,
+        load_range_and_fraction=((0.0, 1.0), 1.0),
+        fetch_by_files=True,
+        fetch_step=len(parquet_files),
+        in_memory=False,
+    )
+    data_config = dataset.config
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size,
+        drop_last=False, num_workers=args.num_workers,
+    )
+    input_names = list(data_config.input_names)
+    mask_idx = input_names.index('pf_mask')
+    label_idx = input_names.index('pf_label')
+
+    stage1 = _load_stage1(
+        args.stage1_weights, data_config,
+        num_neighbors=args.stage1_num_neighbors, device=device,
+    )
+    stage2, top_k1 = (None, None)
+    stage3, top_k2 = (None, None)
+    if args.stage in {'part', 'couples'}:
+        stage2, top_k1 = _load_stage2(
+            args.stage2_weights,
+            input_dim=len(data_config.input_dicts['pf_features']),
+            device=device,
+        )
+        if args.top_k1 is not None:
+            top_k1 = args.top_k1
+        logger.info(f'top_k1 = {top_k1}')
+    if args.stage == 'couples':
+        stage3, top_k2 = _load_stage3(args.stage3_weights, device=device)
+        if args.top_k2 is not None:
+            top_k2 = args.top_k2
+        logger.info(f'top_k2 = {top_k2}')
+
+    rows: list[dict] = []
+    events_done = 0
+    for batch_index, (X, _, observers) in enumerate(loader):
+        inputs = [X[k].to(device) for k in input_names]
+        inputs = trim_to_max_valid_tracks(inputs, mask_idx)
+        model_inputs, _ = extract_label_from_inputs(inputs, label_idx)
+        points, features, lorentz, mask = model_inputs
+
+        batch_rows = _evaluate_batch(
+            stage=args.stage,
+            stage1=stage1, stage2=stage2, stage3=stage3,
+            points=points, features=features, lorentz=lorentz, mask=mask,
+            top_k1=top_k1, top_k2=top_k2, num_couples=args.num_couples,
+        )
+        for b, row in enumerate(batch_rows):
+            row.update(_composite_key(observers, b))
+            row['stage'] = args.stage
+            rows.append(row)
+            events_done += 1
+            if args.max_events is not None and events_done >= args.max_events:
+                break
+        if args.max_events is not None and events_done >= args.max_events:
+            break
+        if batch_index % 20 == 0:
+            logger.info(f'Batch {batch_index} | events processed: {events_done}')
+
+    logger.info(f'Total events: {len(rows)} → {args.output}')
+    _write_parquet(rows, args.output)
+
+
+if __name__ == '__main__':
+    main()
