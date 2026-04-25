@@ -57,7 +57,12 @@ def _load_stage2(
 ) -> tuple[CascadeReranker, int]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     args = checkpoint.get('args', {}) or {}
-    state_dict = checkpoint['model_state_dict']
+    full_state_dict = checkpoint['model_state_dict']
+    state_dict = {
+        key[len('stage2.'):]: value
+        for key, value in full_state_dict.items()
+        if key.startswith('stage2.')
+    } or full_state_dict
 
     pair_embed_dims = args.get('stage2_pair_embed_dims', '64,64,64')
     if isinstance(pair_embed_dims, str):
@@ -77,7 +82,13 @@ def _load_stage2(
         loss_mode=args.get('stage2_loss_mode', 'pairwise'),
         rs_at_k_target=args.get('stage2_rs_at_k_target', 200),
     )
-    model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f'Stage 2 load mismatch — missing={len(missing)}, '
+            f'unexpected={len(unexpected)}. First missing: {missing[:3]}, '
+            f'first unexpected: {unexpected[:3]}',
+        )
     return model.to(device).eval(), int(args.get('top_k1', 256))
 
 
