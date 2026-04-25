@@ -137,10 +137,10 @@ def _make_couple_cascade(top_k2: int = TOP_K2) -> CoupleCascadeModel:
     stage2 = DummyStage2(input_dim=INPUT_DIM)
     cascade = CascadeModel(stage1=stage1, stage2=stage2, top_k1=TOP_K1)
     couple_reranker = CoupleReranker(
-        input_dim=51,
         hidden_dim=32,
         num_residual_blocks=1,
         dropout=0.0,
+        couple_projector_dim=8,
     )
     return CoupleCascadeModel(
         cascade=cascade,

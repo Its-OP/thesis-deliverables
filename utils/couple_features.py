@@ -39,24 +39,6 @@ CASCADE_SCORE_DIM = 4
 COUPLE_FEATURE_DIM = 16 * 2 + PAIRWISE_PHYSICS_DIM + DERIVED_GEOM_DIM + CASCADE_SCORE_DIM
 assert COUPLE_FEATURE_DIM == 51
 
-# T2.2: pair-kinematics v2 adds 4 extra per-couple features that are
-# standard in CMS/ATLAS tau / jet-tagging rerankers:
-#   1. cos(θ_3D)   — opening angle from the 3D momenta
-#   2. (m(ij) − m_τ) / σ_m — normalized mass residual, σ_m set to
-#      ~0.1 GeV (order-of-magnitude tau mass resolution in CMS low-pT).
-#   3. dxy_sig_i · dxy_sig_j — product of 2D impact-parameter
-#      significances (concordance of displacement direction; distinct
-#      signal from `|Δdxy|`).
-#   4. dz_sig_i · dz_sig_j — product of 3D longitudinal impact-parameter
-#      significances.
-PAIR_KINEMATICS_V2_EXTRA_DIM = 4
-COUPLE_FEATURE_DIM_V2 = COUPLE_FEATURE_DIM + PAIR_KINEMATICS_V2_EXTRA_DIM
-assert COUPLE_FEATURE_DIM_V2 == 55
-
-# Scale for the mass residual; matches the ρ(770) σ by default so the
-# residual stays O(1) and doesn't require per-run retuning.
-TAU_MASS_SIGMA_GEV = 0.1
-
 # ρ(770) Gaussian indicator parameters (matches CascadeReranker._compute_extra_pairwise_features)
 RHO_MASS_GEV = 0.770
 RHO_SIGMA_GEV = 0.075
@@ -81,15 +63,6 @@ RHO_SIGMA_GEV = 0.075
 PAIR_PHYSICS_V3_EXTRA_DIM = 5
 COUPLE_FEATURE_DIM_V3 = COUPLE_FEATURE_DIM + PAIR_PHYSICS_V3_EXTRA_DIM
 assert COUPLE_FEATURE_DIM_V3 == 56
-
-# Batch-4 H9: significance-normalised pair features. Complement the
-# raw-geometry channels with their covariance-weighted significances:
-#   1. mass_residual / σ_m (unitless mass pull from tau window)
-#   2. Δφ / σ_Δφ_combined — angular separation in units of its combined
-#      Kalman σ (σ²_combined = σ²_φ_i + σ²_φ_j from the log_cov channels).
-#   3. pT-balance significance: (pT_i − pT_j) / sqrt(σ²_pT_i + σ²_pT_j)
-#      using log_pt_error as the per-track std.
-PAIR_PHYSICS_SIGNIF_EXTRA_DIM = 3
 
 A1_MASS_GEV = 1.230
 A1_WIDTH_GEV = 0.420
@@ -375,9 +348,6 @@ def build_couple_features_batched(
     top_k2_track_labels: torch.Tensor | None = None,
     track_valid_mask: torch.Tensor | None = None,
     m_tau: float = M_TAU_GEV,
-    pair_kinematics_v2: bool = False,
-    pair_physics_v3: bool = False,
-    pair_physics_signif: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Vectorized batched version of the per-event feature builder.
 
@@ -554,131 +524,37 @@ def build_couple_features_batched(
         cascade_scores,
     ]
 
-    expected_dim = COUPLE_FEATURE_DIM
-    if pair_kinematics_v2:
-        # ---- Block 5 (T2.2 v2): 4 extra pair-kinematic features ----
-        p_mag_i = torch.sqrt(
-            px_i ** 2 + py_i ** 2 + pz_i ** 2 + 1e-10,
-        )
-        p_mag_j = torch.sqrt(
-            px_j ** 2 + py_j ** 2 + pz_j ** 2 + 1e-10,
-        )
-        # cos(θ_3D): 3D momentum dot / (|p_i| |p_j|)
-        cos_opening_angle = (
-            (px_i * px_j + py_i * py_j + pz_i * pz_j)
-            / (p_mag_i * p_mag_j)
-        )
-        # Normalized mass residual; small positive when the couple is
-        # near the τ mass, negative when below.
-        mass_residual_norm = (m_ij - m_tau) / TAU_MASS_SIGMA_GEV
-        # Impact-parameter concordance products (channels 6 = dxy_sig,
-        # 7 = log_dz_sig in standardized inputs).
-        dxy_sig_product = dxy_sig_i * dxy_sig_j
-        dz_sig_product = dz_sig_i * dz_sig_j
-        pair_v2_extras = torch.stack(
-            [
-                cos_opening_angle,
-                mass_residual_norm,
-                dxy_sig_product,
-                dz_sig_product,
-            ],
-            dim=1,
-        )
-        couple_features_list.append(pair_v2_extras)
-        expected_dim = COUPLE_FEATURE_DIM_V2
-
-    if pair_physics_v3:
-        # ---- Block 5 (Batch-3 H8): 5 new physics features ----
-        # (i) Kalman-χ² proxy — combined log-covariance; standardized
-        #     channels are already log-space, so their sum is the log of
-        #     the product of the per-track covariance eigenvalues along
-        #     (φ, λ=dip). Lower value → tighter vertex constraint.
-        log_cov_phi_i = top_k2_features[:, _IDX_LOG_COV_PHI_PHI, upper_i]
-        log_cov_phi_j = top_k2_features[:, _IDX_LOG_COV_PHI_PHI, upper_j]
-        log_cov_lam_i = top_k2_features[:, _IDX_LOG_COV_LAMBDA_LAMBDA, upper_i]
-        log_cov_lam_j = top_k2_features[:, _IDX_LOG_COV_LAMBDA_LAMBDA, upper_j]
-        kalman_proxy = (
-            log_cov_phi_i + log_cov_phi_j + log_cov_lam_i + log_cov_lam_j
-        )
-        # (ii) Sum of 3D DCA significances.
-        dca_sig_i = top_k2_features[:, _IDX_DCA_SIG, upper_i]
-        dca_sig_j = top_k2_features[:, _IDX_DCA_SIG, upper_j]
-        dca_sig_sum = dca_sig_i + dca_sig_j
-        # (iii) Lab-frame helicity proxy:
-        #       cos(angle between p_i and p_i + p_j)
-        sum_px_3 = px_i + px_j
-        sum_py_3 = py_i + py_j
-        sum_pz_3 = pz_i + pz_j
-        sum_p_mag = torch.sqrt(
-            sum_px_3 ** 2 + sum_py_3 ** 2 + sum_pz_3 ** 2 + 1e-10,
-        )
-        pi_mag = torch.sqrt(
-            px_i ** 2 + py_i ** 2 + pz_i ** 2 + 1e-10,
-        )
-        helicity_lab = (
-            (px_i * sum_px_3 + py_i * sum_py_3 + pz_i * sum_pz_3)
-            / (pi_mag * sum_p_mag)
-        )
-        # (iv, v) log Breit-Wigner densities for ρ(770) and a1(1260).
-        # BW density: ρ(m²) = m_res² Γ² / ((m² - m_res²)² + m_res² Γ²)
-        # Take log for numerical stability + dynamic range.
-        m_squared_safe = torch.clamp_min(
-            m_ij ** 2, 1e-8,
-        )
-        def _log_bw(m_res: float, width: float) -> torch.Tensor:
-            num = m_res ** 2 * width ** 2
-            den = (m_squared_safe - m_res ** 2) ** 2 + m_res ** 2 * width ** 2
-            return math.log(num) - torch.log(torch.clamp_min(den, 1e-20))
-        log_bw_rho = _log_bw(RHO_MASS_GEV, RHO_WIDTH_GEV)
-        log_bw_a1 = _log_bw(A1_MASS_GEV, A1_WIDTH_GEV)
-
-        pair_v3_extras = torch.stack(
-            [
-                kalman_proxy,
-                dca_sig_sum,
-                helicity_lab,
-                log_bw_rho,
-                log_bw_a1,
-            ],
-            dim=1,
-        )
-        couple_features_list.append(pair_v3_extras)
-        expected_dim += PAIR_PHYSICS_V3_EXTRA_DIM
-
-    if pair_physics_signif:
-        # ---- Block 6 (H9): 3 significance-normalised pair features ----
-        # (i) mass pull: |m_ij − m_τ| / σ_m (σ_m = TAU_MASS_SIGMA_GEV).
-        mass_pull = (m_ij - m_tau).abs() / TAU_MASS_SIGMA_GEV
-        # (ii) Δφ significance. σ²_Δφ ≈ exp(log_cov_phi_i) + exp(log_cov_phi_j);
-        # work in standardized space, which keeps the scale O(1).
-        log_cov_phi_i_signif = top_k2_features[
-            :, _IDX_LOG_COV_PHI_PHI, upper_i,
-        ]
-        log_cov_phi_j_signif = top_k2_features[
-            :, _IDX_LOG_COV_PHI_PHI, upper_j,
-        ]
-        sigma_phi = torch.sqrt(
-            torch.exp(log_cov_phi_i_signif)
-            + torch.exp(log_cov_phi_j_signif)
-            + 1e-10,
-        )
-        delta_phi_sig = delta_phi / sigma_phi
-        # (iii) pT-balance significance: (pT_i − pT_j) / sqrt(σ²_pT_i + σ²_pT_j)
-        # using log_pt_error as per-track std in standardized space.
-        log_pt_err_i = top_k2_features[:, 9, upper_i]
-        log_pt_err_j = top_k2_features[:, 9, upper_j]
-        sigma_pt = torch.sqrt(
-            torch.exp(2 * log_pt_err_i)
-            + torch.exp(2 * log_pt_err_j)
-            + 1e-10,
-        )
-        pt_balance_sig = (pt_i - pt_j) / sigma_pt
-
-        pair_signif_extras = torch.stack(
-            [mass_pull, delta_phi_sig, pt_balance_sig], dim=1,
-        )
-        couple_features_list.append(pair_signif_extras)
-        expected_dim += PAIR_PHYSICS_SIGNIF_EXTRA_DIM
+    # pair-physics v3: 5 extra features always emitted (always on in production).
+    log_cov_phi_i = top_k2_features[:, _IDX_LOG_COV_PHI_PHI, upper_i]
+    log_cov_phi_j = top_k2_features[:, _IDX_LOG_COV_PHI_PHI, upper_j]
+    log_cov_lam_i = top_k2_features[:, _IDX_LOG_COV_LAMBDA_LAMBDA, upper_i]
+    log_cov_lam_j = top_k2_features[:, _IDX_LOG_COV_LAMBDA_LAMBDA, upper_j]
+    kalman_proxy = log_cov_phi_i + log_cov_phi_j + log_cov_lam_i + log_cov_lam_j
+    dca_sig_i = top_k2_features[:, _IDX_DCA_SIG, upper_i]
+    dca_sig_j = top_k2_features[:, _IDX_DCA_SIG, upper_j]
+    dca_sig_sum = dca_sig_i + dca_sig_j
+    sum_px_3 = px_i + px_j
+    sum_py_3 = py_i + py_j
+    sum_pz_3 = pz_i + pz_j
+    sum_p_mag = torch.sqrt(sum_px_3 ** 2 + sum_py_3 ** 2 + sum_pz_3 ** 2 + 1e-10)
+    pi_mag = torch.sqrt(px_i ** 2 + py_i ** 2 + pz_i ** 2 + 1e-10)
+    helicity_lab = (
+        (px_i * sum_px_3 + py_i * sum_py_3 + pz_i * sum_pz_3) / (pi_mag * sum_p_mag)
+    )
+    # log Breit-Wigner densities: ρ(m²) = m_res² Γ² / ((m² − m_res²)² + m_res² Γ²).
+    m_squared_safe = torch.clamp_min(m_ij ** 2, 1e-8)
+    def _log_bw(m_res: float, width: float) -> torch.Tensor:
+        num = m_res ** 2 * width ** 2
+        den = (m_squared_safe - m_res ** 2) ** 2 + m_res ** 2 * width ** 2
+        return math.log(num) - torch.log(torch.clamp_min(den, 1e-20))
+    log_bw_rho = _log_bw(RHO_MASS_GEV, RHO_WIDTH_GEV)
+    log_bw_a1 = _log_bw(A1_MASS_GEV, A1_WIDTH_GEV)
+    pair_v3_extras = torch.stack(
+        [kalman_proxy, dca_sig_sum, helicity_lab, log_bw_rho, log_bw_a1],
+        dim=1,
+    )
+    couple_features_list.append(pair_v3_extras)
+    expected_dim = COUPLE_FEATURE_DIM + PAIR_PHYSICS_V3_EXTRA_DIM
 
     couple_features = torch.cat(couple_features_list, dim=1)
     assert couple_features.shape[1] == expected_dim
