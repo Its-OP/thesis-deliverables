@@ -170,7 +170,7 @@ def get_model(data_config, **kwargs):
     _logger.info(f'Stage 1 config from checkpoint: {stage1_kwargs}')
 
     stage1 = TrackPreFilter(**stage1_kwargs)
-    stage1.load_state_dict(stage1_state)
+    stage1.load_state_dict(stage1_state, strict=False)
     _logger.info('Stage 1 loaded successfully')
 
     stage1_params = sum(p.numel() for p in stage1.parameters())

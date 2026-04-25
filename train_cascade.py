@@ -852,7 +852,7 @@ def main():
         checkpoint = torch.load(
             args.resume, map_location=device, weights_only=False,
         )
-        original_model.load_state_dict(checkpoint['model_state_dict'])
+        original_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         # EMA resume must run AFTER load_state_dict so the rebuild path
         # (case b in resume_ema_state) sees the post-resume live weights,
         # not the pre-resume init.

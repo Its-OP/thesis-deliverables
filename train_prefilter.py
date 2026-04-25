@@ -775,7 +775,7 @@ def main():
         checkpoint = torch.load(
             args.resume, map_location=device, weights_only=False,
         )
-        original_model.load_state_dict(checkpoint['model_state_dict'])
+        original_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         # Skip loading optimizer state if the saved run used a different
         # optimizer — state dicts are not portable across optimizer types.
         saved_optimizer = checkpoint.get('args', {}).get('optimizer', 'adamw')
