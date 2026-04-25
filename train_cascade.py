@@ -1,25 +1,3 @@
-"""Training script for CascadeModel (Stage 1 pre-filter → Stage 2 reranker).
-
-Reuses the same data pipeline and training loop structure as train_prefilter.py.
-Key differences:
-    - Loads Stage 1 from checkpoint (frozen, no gradients)
-    - Only Stage 2 parameters are optimized
-    - Logs both Stage 1 R@K1 and end-to-end Stage 2 metrics
-    - No temperature/DRW scheduling (that's Stage 1 specific)
-
-Usage:
-    python train_cascade.py \\
-        --data-config data/low-pt/lowpt_tau_trackfinder.yaml \\
-        --data-dir data/low-pt/train/ \\
-        --val-data-dir data/low-pt/val/ \\
-        --network networks/lowpt_tau_CascadeReranker.py \\
-        --stage1-checkpoint models/prefilter_best.pt \\
-        --top-k1 600 \\
-        --epochs 50 \\
-        --batch-size 96 \\
-        --device cuda:0 \\
-        --amp
-"""
 from __future__ import annotations
 
 import argparse
@@ -55,6 +33,11 @@ from utils.experiment import (
 )
 from utils.optimizers import OPTIMIZER_NAMES, build_optimizer
 from utils.checkpointing import CheckpointManager
+from utils.ema import (
+    build_ema_stage2,
+    resume_ema_state,
+    use_ema_stage2_for_validation,
+)
 from utils.metrics import MetricsAccumulator, save_epoch_metrics
 from utils.dataset_helpers import (
     extract_label_from_inputs,
@@ -63,34 +46,6 @@ from utils.dataset_helpers import (
 )
 
 logger = logging.getLogger('train_cascade')
-
-
-# ---------------------------------------------------------------------------
-# Metric labels for the on-disk loss_history.json
-# ---------------------------------------------------------------------------
-#
-# Maps loss-history dict keys to short human-readable descriptions. The
-# saver wraps each metric as ``{'label': str, 'values': list[float]}`` so
-# the JSON file is self-documenting.
-
-METRIC_LABELS: dict[str, str] = {
-    'train': 'Train loss (per-track ranking, mean per epoch)',
-    'val': 'Validation loss (per-track ranking)',
-    'lr': 'Learning rate',
-    'd_prime': "Cohen's d' between GT and background score distributions (val)",
-    'median_gt_rank': 'Median rank of GT pions in the per-event score order (val)',
-    'stage1_recall_at_k1': 'Stage 1 recall at K1=top_k1 — fraction of GT pions surviving the prefilter (val)',
-}
-for _k in (10, 20, 30, 50, 100, 200, 300, 400, 500, 600, 800):
-    METRIC_LABELS[f'recall_at_{_k}'] = (
-        f'R@{_k}: per-event recall at top-{_k} tracks '
-        f'(fraction of GT pions in the model top-{_k}, val-averaged)'
-    )
-    METRIC_LABELS[f'perfect_at_{_k}'] = (
-        f'P@{_k}: per-event perfect recall at top-{_k} tracks '
-        f'(fraction of events with all 3 GT pions in top-{_k}, val-averaged)'
-    )
-del _k
 
 
 def train_one_epoch(
@@ -110,12 +65,6 @@ def train_one_epoch(
     grad_clip_max_norm: float = 1.0,
     ema_stage2=None,
 ) -> tuple[dict[str, float], int]:
-    """Train Stage 2 for one epoch (Stage 1 is frozen inside CascadeModel).
-
-    When ``ema_stage2`` is not None, the EMA shadow copy of Stage 2 is
-    updated after every optimizer step:
-        θ_ema ← decay · θ_ema + (1 − decay) · θ_live
-    """
     model.train()
     loss_accumulators: dict[str, float] | None = None
     num_batches = 0
@@ -178,11 +127,7 @@ def train_one_epoch(
         else:
             optimizer.step()
 
-        # EMA update: drift the shadow copy toward the just-updated live
-        # weights. Must run AFTER optimizer.step() and BEFORE
-        # scheduler.step_batch(). On the non-finite-loss skip path above
-        # (the `continue` ~26 lines up), this is also skipped — correct
-        # semantics: the EMA only reflects real optimizer progress.
+        # EMA update must run AFTER optimizer.step() and BEFORE scheduler.step_batch().
         if ema_stage2 is not None:
             ema_stage2.update_parameters(model.stage2)
 
@@ -249,20 +194,13 @@ def validate(
     top_k1: int,
     max_steps: int | None = None,
 ) -> tuple[dict[str, float], dict[str, float]]:
-    """Validate and compute recall@K metrics on the Stage 2 filtered set.
-
-    Metrics are computed on the K1-track filtered set, measuring how well
-    Stage 2 re-ranks within the candidates that Stage 1 selected.
-    """
     model.eval()
     loss_accumulators: dict[str, float] | None = None
     num_batches = 0
 
-    # Use smaller K values since we're ranking within K1 tracks, not 1100
     k_values = tuple(k for k in (10, 20, 30, 50, 100, 200) if k < top_k1)
     metrics_accumulator = MetricsAccumulator(k_values=k_values)
 
-    # Track Stage 1 recall@K1 across batches
     stage1_recall_sum = 0.0
     stage1_recall_count = 0
 
@@ -278,20 +216,12 @@ def validate(
             )
             points, features, lorentz_vectors, mask = model_inputs
 
-            # Denoising is force-disabled via the compute_loss kwarg so
-            # val/train losses stay directly comparable. Stage 1 BN has
-            # its running-stat buffers disabled by CascadeModel via
-            # disable_bn_running_stats, so forward always uses batch
-            # statistics regardless of train/eval state — no per-batch
-            # toggling is needed to keep R@K stable.
             loss_dict = model.compute_loss(
                 points, features, lorentz_vectors, mask, track_labels,
-                use_contrastive_denoising=False,
             )
 
             per_track_scores = loss_dict.pop('_scores').detach()
 
-            # Track Stage 1 R@K1
             if 'stage1_recall_at_k1' in loss_dict:
                 stage1_recall_sum += loss_dict.pop('stage1_recall_at_k1').item()
                 stage1_recall_count += 1
@@ -301,29 +231,16 @@ def validate(
             for key in loss_accumulators:
                 loss_accumulators[key] += loss_dict[key].item()
 
-            # End-to-end metrics: GT found in Stage 2's top-K / GT in FULL event.
-            # MetricsAccumulator counts GT based on the labels it receives.
-            # We pass the ORIGINAL labels (full event GT count as denominator)
-            # but with Stage 2 scores mapped back: tracks not in top-K1 get -inf.
-            #
-            # This makes R@200 = "fraction of all GT tracks that ended up in
-            # Stage 2's top-200" — the true end-to-end metric.
-            #
-            # Reuse selected_indices from the compute_loss call above (via
-            # _run_stage1) to avoid running Stage 1 again. The indices are
-            # deterministic for the same input.
+            # R@K = GT in Stage 2 top-K / GT in full event. Reuse
+            # _run_stage1 (deterministic for the same input) to map Stage 2
+            # scores back to full-event positions; non-selected tracks get -inf.
             with torch.no_grad():
                 filtered = model._run_stage1(
                     points, features, lorentz_vectors, mask, track_labels,
                 )
-            selected_indices = filtered['selected_indices']  # (B, K1)
+            selected_indices = filtered['selected_indices']
 
-            # Build full-event score tensor: (B, P) with -inf for tracks
-            # not selected by Stage 1, and Stage 2 scores for selected tracks.
-            full_scores = torch.full_like(
-                mask.squeeze(1), float('-inf'),
-            )  # (B, P)
-            # Scatter Stage 2 scores back to full-event positions
+            full_scores = torch.full_like(mask.squeeze(1), float('-inf'))
             full_scores.scatter_(1, selected_indices, per_track_scores)
 
             metrics_accumulator.update(full_scores, track_labels, mask)
@@ -347,142 +264,6 @@ def validate(
         metrics['stage1_recall_at_k1'] = stage1_recall_sum / stage1_recall_count
 
     return loss_averages, metrics
-
-
-# ---------------------------------------------------------------------------
-# EMA helpers (Stage 2 only — Stage 1 is frozen and never benefits from EMA)
-# ---------------------------------------------------------------------------
-
-
-def build_ema_stage2(
-    cascade_model: torch.nn.Module,
-    decay: float,
-    device: torch.device,
-):
-    """Construct an ``AveragedModel`` wrapping ``cascade_model.stage2``.
-
-    The EMA update rule is:
-        θ_ema ← decay · θ_ema + (1 − decay) · θ_live
-    applied to every parameter after each ``optimizer.step()``.
-
-    Returns ``None`` when ``decay <= 0.0`` so the disabled training path
-    is byte-for-byte identical to the pre-EMA code: no deepcopy, no extra
-    tensors, no extra GPU memory.
-
-    ``use_buffers=False`` ensures BatchNorm running statistics in the EMA
-    copy are NOT averaged by ``update_parameters`` — those buffers are
-    themselves an EMA (BN's own momentum), and double-smoothing them
-    would systematically lag the validation distribution. The validation
-    swap context manager copies live BN buffers into the EMA copy
-    directly before each validate pass.
-    """
-    if decay <= 0.0:
-        return None
-    from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-    return AveragedModel(
-        cascade_model.stage2,
-        device=device,
-        multi_avg_fn=get_ema_multi_avg_fn(decay=decay),
-        use_buffers=False,
-    )
-
-
-@contextmanager
-def use_ema_stage2_for_validation(
-    cascade_model: torch.nn.Module,
-    ema_stage2,
-):
-    """Temporarily replace ``cascade_model.stage2`` with the EMA copy.
-
-    Copies live Stage 2 BatchNorm running statistics into the EMA copy
-    so the validated module uses BN statistics consistent with the live
-    training distribution (BN buffers are themselves an EMA — they are
-    NOT re-averaged by ``AveragedModel(use_buffers=False)``).
-
-    The swap operates on ``cascade_model`` directly. Callers MUST pass
-    the pre-compile module (``original_model`` in ``main()``) — never
-    the ``torch.compile`` wrapper — and route validation through that
-    same pre-compile module so the compile cache never sees a swapped
-    submodule.
-
-    When ``ema_stage2 is None`` this context manager is a complete
-    no-op: no copies, no swaps, no state changes — the disabled path
-    stays bit-for-bit identical to the current code.
-
-    Args:
-        cascade_model: The pre-compile ``CascadeModel`` whose ``stage2``
-            attribute will be swapped.
-        ema_stage2: An ``AveragedModel`` whose ``.module`` is a deepcopy
-            of ``cascade_model.stage2``, or ``None`` to disable.
-    """
-    if ema_stage2 is None:
-        yield
-        return
-
-    live_stage2 = cascade_model.stage2
-
-    # Sync BN running stats live → EMA. Iterate ``named_buffers`` (NOT
-    # ``state_dict``) so we never overwrite the EMA-averaged parameters,
-    # only the buffers.
-    with torch.no_grad():
-        live_buffers = dict(live_stage2.named_buffers())
-        for buffer_name, ema_buffer in ema_stage2.module.named_buffers():
-            if buffer_name in live_buffers:
-                ema_buffer.copy_(live_buffers[buffer_name])
-
-    cascade_model.stage2 = ema_stage2.module
-    try:
-        yield
-    finally:
-        cascade_model.stage2 = live_stage2
-
-
-def resume_ema_state(
-    ema_stage2,
-    checkpoint: dict,
-    cascade_model: torch.nn.Module,
-    decay: float,
-    device: torch.device,
-):
-    """Handle EMA state on resume from a checkpoint.
-
-    Four cases:
-        (a) ``ema_stage2 is not None`` and ``checkpoint['ema_state_dict']``
-            is a non-None dict → load it into ``ema_stage2`` and return
-            the same object.
-        (b) ``ema_stage2 is not None`` but checkpoint missing/None →
-            warn, rebuild a fresh EMA from the post-resume live weights
-            (so validation post-resume uses the loaded weights, not the
-            pre-load init), and return the new EMA.
-        (c) ``ema_stage2 is None`` and checkpoint has ``ema_state_dict``
-            → silently ignore the saved EMA, return None.
-        (d) ``ema_stage2 is None`` and checkpoint has nothing → return
-            None.
-
-    The rebuild on case (b) is critical: without it, the EMA would still
-    hold a deepcopy of the freshly-initialized Stage 2 weights from
-    construction time, and the first few validation passes after resume
-    would use garbage instead of the loaded checkpoint.
-    """
-    if ema_stage2 is None:
-        return None
-
-    saved_ema_state = checkpoint.get('ema_state_dict')
-    if saved_ema_state is not None:
-        ema_stage2.load_state_dict(saved_ema_state)
-        logger.info(
-            f'Resumed EMA state from checkpoint '
-            f'(n_averaged={int(ema_stage2.n_averaged.item())})',
-        )
-        return ema_stage2
-
-    logger.warning(
-        f'Checkpoint has no ema_state_dict but this run has '
-        f'--ema-decay={decay}. Rebuilding EMA from the post-resume '
-        f'live weights — first ~{int(1.0 / max(1e-6, 1.0 - decay))} '
-        f'steps will be a warm-up.',
-    )
-    return build_ema_stage2(cascade_model, decay=decay, device=device)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -566,17 +347,6 @@ def _build_parser() -> argparse.ArgumentParser:
                         help='Loss function (default: pairwise)')
     parser.add_argument('--stage2-rs-at-k-target', type=int, default=200,
                         help='K target for RS@K and LambdaRank (default: 200)')
-    # Contrastive denoising — auxiliary regularizer on GT track features
-    parser.add_argument('--stage2-denoising', action='store_true',
-                        help='Enable contrastive denoising auxiliary loss '
-                             '(Zhang et al. ICLR 2023, DINO-style).')
-    parser.add_argument('--stage2-denoising-sigma-start', type=float, default=0.3,
-                        help='Noise sigma at training start (default: 0.3)')
-    parser.add_argument('--stage2-denoising-sigma-end', type=float, default=0.05,
-                        help='Noise sigma at training end (default: 0.05)')
-    parser.add_argument('--stage2-denoising-weight', type=float, default=0.5,
-                        help='Weight of the denoising term in total loss '
-                             '(default: 0.5)')
 
     return parser
 
@@ -722,10 +492,6 @@ def main():
         stage2_dropout=args.stage2_dropout,
         stage2_loss_mode=args.stage2_loss_mode,
         stage2_rs_at_k_target=args.stage2_rs_at_k_target,
-        stage2_use_contrastive_denoising=args.stage2_denoising,
-        stage2_denoising_sigma_start=args.stage2_denoising_sigma_start,
-        stage2_denoising_sigma_end=args.stage2_denoising_sigma_end,
-        stage2_denoising_loss_weight=args.stage2_denoising_weight,
     )
     model = model.to(device)
 
@@ -1019,7 +785,7 @@ def main():
                         loss_history[history_key] = []
                     loss_history[history_key].append(metric_value)
             save_loss_history(
-                loss_history, experiment_dir, metric_labels=METRIC_LABELS,
+                loss_history, experiment_dir,
             )
 
             # Per-epoch metrics JSON

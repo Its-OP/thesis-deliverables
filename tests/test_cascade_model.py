@@ -99,15 +99,7 @@ class DummyStage2(nn.Module):
         mask: torch.Tensor,
         track_labels: torch.Tensor,
         stage1_scores: torch.Tensor,
-        use_contrastive_denoising: bool = True,
     ) -> dict[str, torch.Tensor]:
-        """Compute a simple BCE loss for testing.
-
-        Accepts (and ignores) ``use_contrastive_denoising`` to match the
-        CascadeReranker interface so CascadeModel's compute_loss can forward
-        the kwarg to any Stage 2 implementation uniformly.
-        """
-        del use_contrastive_denoising  # unused in the dummy
         scores = self.forward(
             points, features, lorentz_vectors, mask, stage1_scores,
         )

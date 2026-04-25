@@ -17,8 +17,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from train_cascade import (
-    _build_parser,
+from train_cascade import _build_parser
+from utils.ema import (
     build_ema_stage2,
     resume_ema_state,
     use_ema_stage2_for_validation,
@@ -37,14 +37,7 @@ TOP_K1 = 10
 
 
 class TinyStage2(nn.Module):
-    """Minimal Stage 2 model for the EMA tests.
-
-    Has one ``BatchNorm1d`` (so the buffer-copy path is exercised) and one
-    ``Conv1d`` scoring head whose ``.weight`` is the easy thing to perturb
-    in the drift / swap tests below. Implements the Stage 2 interface
-    (``forward`` + ``compute_loss`` with ``use_contrastive_denoising`` kwarg)
-    so it can drop into ``CascadeModel`` without modification.
-    """
+    """Minimal Stage 2 fake: BatchNorm1d (buffer-copy exercise) + Conv1d head."""
 
     def __init__(self):
         super().__init__()
@@ -72,9 +65,7 @@ class TinyStage2(nn.Module):
         mask: torch.Tensor,
         track_labels: torch.Tensor,
         stage1_scores: torch.Tensor,
-        use_contrastive_denoising: bool = True,
     ) -> dict[str, torch.Tensor]:
-        del use_contrastive_denoising  # unused; matches CascadeReranker API
         scores = self.forward(
             points, features, lorentz_vectors, mask, stage1_scores,
         )

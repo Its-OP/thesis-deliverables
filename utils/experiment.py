@@ -53,34 +53,24 @@ class _TeeStream:
         return self.original_stream.isatty()
 
 
-class WarmupThenPlateauScheduler:
+class _WarmupBase:
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
         num_warmup_steps: int,
-        plateau_factor: float = 0.5,
-        plateau_patience: int = 5,
         min_lr: float = 1e-6,
     ):
         self.optimizer = optimizer
         self.num_warmup_steps = num_warmup_steps
+        self.min_lr = min_lr
         self.base_lrs = [group['lr'] for group in optimizer.param_groups]
         self.current_step = 0
         self.warmup_finished = False
-        self.plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=plateau_factor,
-            patience=plateau_patience,
-            min_lr=min_lr,
-        )
 
     def step_batch(self):
-        if self.warmup_finished:
-            self.current_step += 1
-            return
-
         self.current_step += 1
+        if self.warmup_finished:
+            return
         if self.current_step >= self.num_warmup_steps:
             for param_group, base_lr in zip(
                 self.optimizer.param_groups, self.base_lrs,
@@ -94,33 +84,60 @@ class WarmupThenPlateauScheduler:
             ):
                 param_group['lr'] = base_lr * warmup_fraction
 
-    def step_epoch(self, val_loss: float):
-        if self.warmup_finished:
-            self.plateau_scheduler.step(val_loss)
-
     def get_last_lr(self) -> list[float]:
         return [group['lr'] for group in self.optimizer.param_groups]
 
-    def state_dict(self) -> dict:
+    def _base_state(self) -> dict:
         return {
             'current_step': self.current_step,
             'warmup_finished': self.warmup_finished,
             'base_lrs': self.base_lrs,
             'num_warmup_steps': self.num_warmup_steps,
-            'plateau_scheduler_state': self.plateau_scheduler.state_dict(),
         }
 
-    def load_state_dict(self, state: dict):
+    def _load_base_state(self, state: dict):
         self.current_step = state['current_step']
         self.warmup_finished = state['warmup_finished']
         self.base_lrs = state['base_lrs']
         self.num_warmup_steps = state['num_warmup_steps']
+
+
+class WarmupThenPlateauScheduler(_WarmupBase):
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        num_warmup_steps: int,
+        plateau_factor: float = 0.5,
+        plateau_patience: int = 5,
+        min_lr: float = 1e-6,
+    ):
+        super().__init__(optimizer, num_warmup_steps, min_lr)
+        self.plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=plateau_factor,
+            patience=plateau_patience,
+            min_lr=min_lr,
+        )
+
+    def step_epoch(self, val_loss: float):
+        if self.warmup_finished:
+            self.plateau_scheduler.step(val_loss)
+
+    def state_dict(self) -> dict:
+        return {
+            **self._base_state(),
+            'plateau_scheduler_state': self.plateau_scheduler.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict):
+        self._load_base_state(state)
         self.plateau_scheduler.load_state_dict(
             state['plateau_scheduler_state'],
         )
 
 
-class WarmupThenCosineScheduler:
+class WarmupThenCosineScheduler(_WarmupBase):
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -129,13 +146,8 @@ class WarmupThenCosineScheduler:
         min_lr: float = 1e-6,
         cosine_power: float = 1.0,
     ):
-        self.optimizer = optimizer
-        self.num_warmup_steps = num_warmup_steps
-        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
-        self.current_step = 0
-        self.warmup_finished = False
+        super().__init__(optimizer, num_warmup_steps, min_lr)
         self.cosine_power = cosine_power
-        self.min_lr = min_lr
         self.t_max = max(1, num_post_warmup_epochs)
         self.cosine_epoch = 0
 
@@ -148,25 +160,6 @@ class WarmupThenCosineScheduler:
             self._use_builtin_cosine = False
             self.cosine_scheduler = None
 
-    def step_batch(self):
-        if self.warmup_finished:
-            self.current_step += 1
-            return
-
-        self.current_step += 1
-        if self.current_step >= self.num_warmup_steps:
-            for param_group, base_lr in zip(
-                self.optimizer.param_groups, self.base_lrs,
-            ):
-                param_group['lr'] = base_lr
-            self.warmup_finished = True
-        else:
-            warmup_fraction = self.current_step / self.num_warmup_steps
-            for param_group, base_lr in zip(
-                self.optimizer.param_groups, self.base_lrs,
-            ):
-                param_group['lr'] = base_lr * warmup_fraction
-
     def step_epoch(self, val_loss: float):
         if not self.warmup_finished:
             return
@@ -175,7 +168,6 @@ class WarmupThenCosineScheduler:
             self.cosine_scheduler.step()
             return
 
-        # lr = min_lr + 0.5 * (base_lr - min_lr) * (1 + cos(π * (t/T_max)^power))
         self.cosine_epoch += 1
         progress = min(self.cosine_epoch / self.t_max, 1.0)
         warped_progress = progress ** self.cosine_power
@@ -187,15 +179,9 @@ class WarmupThenCosineScheduler:
                 self.min_lr + (base_lr - self.min_lr) * cosine_factor
             )
 
-    def get_last_lr(self) -> list[float]:
-        return [group['lr'] for group in self.optimizer.param_groups]
-
     def state_dict(self) -> dict:
         result = {
-            'current_step': self.current_step,
-            'warmup_finished': self.warmup_finished,
-            'base_lrs': self.base_lrs,
-            'num_warmup_steps': self.num_warmup_steps,
+            **self._base_state(),
             'cosine_power': self.cosine_power,
             'cosine_epoch': self.cosine_epoch,
         }
@@ -204,10 +190,7 @@ class WarmupThenCosineScheduler:
         return result
 
     def load_state_dict(self, state: dict):
-        self.current_step = state['current_step']
-        self.warmup_finished = state['warmup_finished']
-        self.base_lrs = state['base_lrs']
-        self.num_warmup_steps = state['num_warmup_steps']
+        self._load_base_state(state)
         self.cosine_epoch = state.get('cosine_epoch', 0)
         if self._use_builtin_cosine and 'cosine_scheduler_state' in state:
             self.cosine_scheduler.load_state_dict(
