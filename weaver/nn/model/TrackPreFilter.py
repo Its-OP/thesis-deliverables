@@ -101,14 +101,14 @@ class TrackPreFilter(nn.Module):
 
         track_mlp_layers: list[nn.Module] = [
             nn.Conv1d(track_mlp_input_dim, hidden_dim, kernel_size=1, bias=False),
-            nn.BatchNorm1d(hidden_dim),
+            nn.BatchNorm1d(hidden_dim, track_running_stats=False),
             nn.ReLU(),
         ]
         if use_dropout:
             track_mlp_layers.append(nn.Dropout(p=dropout))
         track_mlp_layers += [
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
-            nn.BatchNorm1d(hidden_dim),
+            nn.BatchNorm1d(hidden_dim, track_running_stats=False),
             nn.ReLU(),
         ]
         if use_dropout:
@@ -121,7 +121,7 @@ class TrackPreFilter(nn.Module):
         def _build_neighbor_mlp() -> nn.Sequential:
             layers: list[nn.Module] = [
                 nn.Conv1d(neighbor_input_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
+                nn.BatchNorm1d(hidden_dim, track_running_stats=False),
                 nn.ReLU(),
             ]
             if use_dropout:
@@ -134,7 +134,7 @@ class TrackPreFilter(nn.Module):
 
         scorer_layers: list[nn.Module] = [
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
-            nn.BatchNorm1d(hidden_dim),
+            nn.BatchNorm1d(hidden_dim, track_running_stats=False),
             nn.ReLU(),
         ]
         if use_dropout:
