@@ -26,7 +26,7 @@ EXPERIMENT_NAME="$1"
 shift
 
 # ---- Check data split ----
-SCRIPT_DIR_CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR_CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TRAIN_PARQUET_COUNT=$(find "${SCRIPT_DIR_CHECK}/data/low-pt/train" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
 VAL_PARQUET_COUNT=$(find "${SCRIPT_DIR_CHECK}/data/low-pt/val" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
 if [ "$TRAIN_PARQUET_COUNT" -lt 10 ] || [ "$VAL_PARQUET_COUNT" -lt 10 ]; then
@@ -82,7 +82,7 @@ fi
 CONDA_INIT="source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate ${CONDA_ENV_NAME}"
 
 # ---- Resolve script directory ----
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # ---- Check Stage 1 checkpoint ----
 if [ ! -f "${SCRIPT_DIR}/${STAGE1_CHECKPOINT}" ]; then
@@ -92,7 +92,7 @@ if [ ! -f "${SCRIPT_DIR}/${STAGE1_CHECKPOINT}" ]; then
 fi
 
 # ---- Build training command ----
-TRAIN_CMD="${CONDA_INIT} && cd ${SCRIPT_DIR} && python train_cascade.py \
+TRAIN_CMD="${CONDA_INIT} && cd ${SCRIPT_DIR} && python -m scripts.python.train_cascade \
     --data-config ${DATA_CONFIG} \
     --data-dir ${DATA_DIR} \
     --val-data-dir ${VAL_DATA_DIR} \

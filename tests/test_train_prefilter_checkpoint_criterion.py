@@ -21,7 +21,7 @@ import torch
 
 class TestCheckpointCriterionFlag:
     def test_flag_accepts_perfect_at_256(self):
-        from train_prefilter import _build_argument_parser
+        from scripts.python.train_prefilter import _build_argument_parser
 
         parser = _build_argument_parser()
         args = parser.parse_args([
@@ -36,7 +36,7 @@ class TestCheckpointCriterionFlag:
         assert args.checkpoint_criterion == 'perfect_at_256'
 
     def test_flag_default_is_recall_at_200(self):
-        from train_prefilter import _build_argument_parser
+        from scripts.python.train_prefilter import _build_argument_parser
 
         parser = _build_argument_parser()
         args = parser.parse_args([
@@ -52,7 +52,7 @@ class TestCheckpointCriterionFlag:
     def test_flag_rejects_unsupported_criterion(self):
         import pytest
 
-        from train_prefilter import _build_argument_parser
+        from scripts.python.train_prefilter import _build_argument_parser
 
         parser = _build_argument_parser()
         with pytest.raises(SystemExit):
@@ -72,7 +72,7 @@ class TestK256InMetricsAccumulator:
         """The training script's val MetricsAccumulator must emit
         ``perfect_at_256`` so ``--checkpoint-criterion perfect_at_256``
         has a value to compare."""
-        from train_prefilter import VAL_METRICS_K_VALUES
+        from scripts.python.train_prefilter import VAL_METRICS_K_VALUES
 
         assert 256 in VAL_METRICS_K_VALUES, (
             f'K=256 missing from VAL_METRICS_K_VALUES '

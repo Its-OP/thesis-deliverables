@@ -24,10 +24,7 @@ dependencies = [
 test = ["pytest>=7"]
 condor = ["uproot>=5"]
 
-[tool.setuptools]
-py-modules = ["train_prefilter", "train_cascade", "train_couple_reranker"]
-
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["utils*", "weaver*", "networks*"]
+include = ["utils*", "weaver*", "networks*", "scripts*"]
 exclude = ["tests*", "condor*", "data*"]
