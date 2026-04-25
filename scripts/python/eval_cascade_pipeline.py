@@ -177,9 +177,7 @@ def _evaluate_batch(
         top_k2_stage2_scores=k2_s2,
         track_valid_mask=k2_valid,
     )
-    s3_scores = stage3(
-        couple_inputs['couple_features'], k2_features=k2_features,
-    )
+    s3_scores = stage3(couple_inputs['couple_features'])
 
     upper_i, upper_j = torch.triu_indices(
         top_k2, top_k2, offset=1, device=s3_scores.device,
