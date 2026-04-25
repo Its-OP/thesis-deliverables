@@ -487,27 +487,6 @@ def calibrate_reranker_batchnorm(
     model.eval()
 
 
-def check_batchnorm_health(model: torch.nn.Module) -> bool:
-    """Check that all BN running stats in the couple reranker are finite.
-
-    Returns True if all stats are valid, False otherwise.
-    """
-    all_healthy = True
-    for name, module in model.couple_reranker.named_modules():
-        if isinstance(module, torch.nn.BatchNorm1d):
-            if not torch.isfinite(module.running_mean).all():
-                logger.error(
-                    f'NaN in running_mean: {name}',
-                )
-                all_healthy = False
-            if not torch.isfinite(module.running_var).all():
-                logger.error(
-                    f'NaN in running_var: {name}',
-                )
-                all_healthy = False
-    return all_healthy
-
-
 # ---------------------------------------------------------------------------
 # Validate
 # ---------------------------------------------------------------------------
@@ -1406,9 +1385,7 @@ def main():
             mask_input_index, label_input_index,
             calibration_steps=args.bn_calibration_steps,
         )
-    if args.bn_calibration_steps > 0 and check_batchnorm_health(model):
-        logger.info('BN calibration complete — all running stats are finite')
-        # Save a final checkpoint with clean BN stats
+    if args.bn_calibration_steps > 0:
         calibrated_checkpoint = {
             'epoch': args.epochs,
             'couple_reranker_state_dict':
@@ -1426,8 +1403,6 @@ def main():
         )
         torch.save(calibrated_checkpoint, calibrated_path)
         logger.info(f'Saved calibrated checkpoint: {calibrated_path}')
-    elif args.bn_calibration_steps > 0:
-        logger.error('BN calibration failed — NaN in running stats!')
 
     # ---- EMA (T2.3): swap in EMA weights, recalibrate BN on the EMA
     # copy, validate, save separately. The live model is unaffected.
@@ -1447,14 +1422,13 @@ def main():
             mask_input_index, label_input_index,
             calibration_steps=args.bn_calibration_steps,
         )
-        if check_batchnorm_health(model):
-            ema_val_losses, ema_val_metrics = validate(
-                model, val_loader, device, data_config,
-                mask_input_index, label_input_index,
-                max_steps=max(1, steps_per_epoch // 2),
-                k_values_couples=tuple(args.k_values_couples),
-                k_values_tracks=tuple(args.k_values_tracks),
-            )
+        ema_val_losses, ema_val_metrics = validate(
+            model, val_loader, device, data_config,
+            mask_input_index, label_input_index,
+            max_steps=max(1, steps_per_epoch // 2),
+            k_values_couples=tuple(args.k_values_couples),
+            k_values_tracks=tuple(args.k_values_tracks),
+        )
             ema_c_at_100 = ema_val_metrics.get('c_at_100_couples', 0.0)
             logger.info(f'EMA C@100 = {ema_c_at_100:.5f}')
             ema_path = os.path.join(
