@@ -1429,25 +1429,23 @@ def main():
             k_values_couples=tuple(args.k_values_couples),
             k_values_tracks=tuple(args.k_values_tracks),
         )
-            ema_c_at_100 = ema_val_metrics.get('c_at_100_couples', 0.0)
-            logger.info(f'EMA C@100 = {ema_c_at_100:.5f}')
-            ema_path = os.path.join(
-                checkpoints_dir, 'best_model_ema_calibrated.pt',
-            )
-            torch.save(
-                {
-                    'epoch': args.epochs,
-                    'couple_reranker_state_dict':
-                        model.couple_reranker.state_dict(),
-                    'ema_c_at_100': ema_c_at_100,
-                    'ema_val_metrics': ema_val_metrics,
-                    'args': vars(args),
-                },
-                ema_path,
-            )
-            logger.info(f'Saved EMA-calibrated checkpoint: {ema_path}')
-        else:
-            logger.error('EMA BN calibration failed — NaN in running stats')
+        ema_c_at_100 = ema_val_metrics.get('c_at_100_couples', 0.0)
+        logger.info(f'EMA C@100 = {ema_c_at_100:.5f}')
+        ema_path = os.path.join(
+            checkpoints_dir, 'best_model_ema_calibrated.pt',
+        )
+        torch.save(
+            {
+                'epoch': args.epochs,
+                'couple_reranker_state_dict':
+                    model.couple_reranker.state_dict(),
+                'ema_c_at_100': ema_c_at_100,
+                'ema_val_metrics': ema_val_metrics,
+                'args': vars(args),
+            },
+            ema_path,
+        )
+        logger.info(f'Saved EMA-calibrated checkpoint: {ema_path}')
         # Restore the live (non-EMA) weights for downstream use.
         model.couple_reranker.load_state_dict(original_reranker_state)
 
