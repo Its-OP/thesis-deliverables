@@ -21,6 +21,7 @@ Usage:
 """
 import torch
 
+from networks.lowpt_tau_CascadeReranker import infer_stage1_kwargs
 from weaver.nn.model.CascadeModel import CascadeModel
 from weaver.nn.model.CascadeReranker import CascadeReranker
 from weaver.nn.model.CoupleCascadeModel import CoupleCascadeModel
@@ -48,32 +49,24 @@ def _build_frozen_cascade(
     cascade_state_dict = checkpoint['model_state_dict']
     saved_args = checkpoint.get('args', {})
 
-    # ---- Stage 1: infer hidden_dim from state dict shape ----
-    stage1_first_key = 'stage1.track_mlp.0.weight'
-    if stage1_first_key not in cascade_state_dict:
+    # Strip the "stage1." prefix so infer_stage1_kwargs (P1-aware) can read it.
+    stage1_state = {
+        key[len('stage1.'):]: value
+        for key, value in cascade_state_dict.items()
+        if key.startswith('stage1.')
+    }
+    if not stage1_state:
         raise ValueError(
-            f'Cannot infer Stage 1 dimensions: expected key '
-            f'"{stage1_first_key}" not found in {cascade_checkpoint_path}'
+            f'Cannot infer Stage 1: no stage1.* keys in {cascade_checkpoint_path}'
         )
-    stage1_first_weight = cascade_state_dict[stage1_first_key]
-    stage1_hidden_dim = stage1_first_weight.shape[0]
-    stage1_input_dim = stage1_first_weight.shape[1]
-    if stage1_input_dim != input_dim:
+    stage1_kwargs = infer_stage1_kwargs(stage1_state, stage1_num_neighbors=16)
+    if stage1_kwargs['input_dim'] != input_dim:
         raise ValueError(
-            f'Cascade checkpoint Stage 1 input_dim={stage1_input_dim} does '
-            f'not match data config input_dim={input_dim}.'
+            f'Cascade checkpoint Stage 1 input_dim={stage1_kwargs["input_dim"]} '
+            f'does not match data config input_dim={input_dim}.'
         )
-    _logger.info(
-        f'Stage 1 config: hidden_dim={stage1_hidden_dim}, '
-        f'input_dim={stage1_input_dim}'
-    )
-    stage1 = TrackPreFilter(
-        mode='mlp',
-        input_dim=stage1_input_dim,
-        hidden_dim=stage1_hidden_dim,
-        num_message_rounds=2,
-        num_neighbors=16,
-    )
+    _logger.info(f'Stage 1 config from checkpoint: {stage1_kwargs}')
+    stage1 = TrackPreFilter(**stage1_kwargs)
 
     # ---- Stage 2: rebuild from the saved args dict ----
     pair_embed_dims_raw = saved_args.get('stage2_pair_embed_dims', '64,64,64')
