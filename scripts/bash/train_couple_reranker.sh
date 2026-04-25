@@ -8,7 +8,7 @@ fi
 EXPERIMENT_NAME="$1"
 shift
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TRAIN_PARQUET_COUNT=$(find "${SCRIPT_DIR}/data/low-pt/train" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
 VAL_PARQUET_COUNT=$(find "${SCRIPT_DIR}/data/low-pt/val" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
 if [ "$TRAIN_PARQUET_COUNT" -lt 10 ] || [ "$VAL_PARQUET_COUNT" -lt 10 ]; then
@@ -55,7 +55,7 @@ if [ ! -f "${SCRIPT_DIR}/${CASCADE_CHECKPOINT}" ]; then
     exit 1
 fi
 
-TRAIN_CMD="source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate ${CONDA_ENV_NAME} && cd ${SCRIPT_DIR} && python train_couple_reranker.py \
+TRAIN_CMD="source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate ${CONDA_ENV_NAME} && cd ${SCRIPT_DIR} && python -m scripts.python.train_couple_reranker \
     --data-config ${DATA_CONFIG} \
     --data-dir ${DATA_DIR} \
     --val-data-dir ${VAL_DATA_DIR} \

@@ -17,7 +17,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from train_cascade import _build_parser
+from scripts.python.train_cascade import _build_parser
 from utils.ema import (
     build_ema_stage2,
     resume_ema_state,
