@@ -591,6 +591,7 @@ def run_training(
     log_metrics_summary: Callable | None = None,
     make_checkpoint_dict_fn: Callable,
     on_resume: Callable | None = None,
+    load_model_fn: Callable | None = None,
     final_cleanup_fn: Callable | None = None,
     extra_loss_history_keys: tuple[str, ...] = (),
     epoch_metrics_extras_fn: Callable | None = None,
@@ -676,9 +677,10 @@ def run_training(
         checkpoint = torch.load(
             args.resume, map_location=device, weights_only=False,
         )
-        original_model.load_state_dict(
-            checkpoint['model_state_dict'], strict=False,
-        )
+        if load_model_fn is None:
+            original_model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            load_model_fn(original_model, checkpoint)
         try:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         except (KeyError, ValueError) as exc:

@@ -129,7 +129,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_common_training_args(
         parser, default_lr=5e-4, default_batch_size=16, default_epochs=50,
     )
-    parser.add_argument('--cascade-checkpoint', type=str, required=True)
+    parser.add_argument('--stage1-checkpoint', type=str, required=True)
+    parser.add_argument('--stage2-checkpoint', type=str, required=True)
     parser.add_argument('--top-k2', type=int, default=50)
     parser.add_argument('--model-name', type=str, default='CoupleReranker')
     parser.add_argument('--cosine-power', type=float, default=2.0)
@@ -288,12 +289,19 @@ def main():
             weight_decay=args.weight_decay,
         )
 
+    def load_model_fn(model, checkpoint):
+        # Per-stage save: 'couple_reranker_state_dict' is bare CoupleReranker weights.
+        model.couple_reranker.load_state_dict(
+            checkpoint['couple_reranker_state_dict'],
+        )
+
     run_training(
         args=args,
         logger=logger,
         network_module_path=args.network,
         get_model_kwargs={
-            'cascade_checkpoint': args.cascade_checkpoint,
+            'stage1_checkpoint': args.stage1_checkpoint,
+            'stage2_checkpoint': args.stage2_checkpoint,
             'top_k2': args.top_k2,
             'k_values_tracks': tuple(args.k_values_tracks),
             'couple_hidden_dim': args.couple_hidden_dim,
@@ -322,6 +330,7 @@ def main():
         train_eval_steps_divisor=2,
         log_metrics_summary=log_summary,
         make_checkpoint_dict_fn=make_checkpoint_dict,
+        load_model_fn=load_model_fn,
         final_cleanup_fn=final_cleanup,
         epoch_metrics_extras_fn=epoch_metrics_extras,
         use_torch_compile=False,
