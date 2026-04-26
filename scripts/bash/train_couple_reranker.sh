@@ -23,14 +23,14 @@ DATA_CONFIG="data/low-pt/lowpt_tau_trackfinder.yaml"
 DATA_DIR="data/low-pt/train/"
 VAL_DATA_DIR="data/low-pt/val/"
 NETWORK="networks/lowpt_tau_CoupleReranker.py"
-CASCADE_CHECKPOINT="models/cascade_best.pt"
+STAGE1_CHECKPOINT="models/prefilter_best.pt"
+STAGE2_CHECKPOINT="models/stage2_best.pt"
 TOP_K2=50
 MODEL_NAME="${EXPERIMENT_NAME}_CoupleReranker"
 EXPERIMENTS_DIR="experiments"
 EPOCHS=100
 BATCH_SIZE=16
 LEARNING_RATE=5e-4
-SCHEDULER="cosine"
 DEVICE="cuda:0"
 STEPS_PER_EPOCH=500
 NUM_WORKERS=10
@@ -50,8 +50,12 @@ else
     exit 1
 fi
 
-if [ ! -f "${SCRIPT_DIR}/${CASCADE_CHECKPOINT}" ]; then
-    echo "ERROR: Cascade checkpoint not found: ${SCRIPT_DIR}/${CASCADE_CHECKPOINT}"
+if [ ! -f "${SCRIPT_DIR}/${STAGE1_CHECKPOINT}" ]; then
+    echo "ERROR: Stage 1 checkpoint not found: ${SCRIPT_DIR}/${STAGE1_CHECKPOINT}"
+    exit 1
+fi
+if [ ! -f "${SCRIPT_DIR}/${STAGE2_CHECKPOINT}" ]; then
+    echo "ERROR: Stage 2 checkpoint not found: ${SCRIPT_DIR}/${STAGE2_CHECKPOINT}"
     exit 1
 fi
 
@@ -60,7 +64,8 @@ TRAIN_CMD="source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate ${CONDA
     --data-dir ${DATA_DIR} \
     --val-data-dir ${VAL_DATA_DIR} \
     --network ${NETWORK} \
-    --cascade-checkpoint ${CASCADE_CHECKPOINT} \
+    --stage1-checkpoint ${STAGE1_CHECKPOINT} \
+    --stage2-checkpoint ${STAGE2_CHECKPOINT} \
     --top-k2 ${TOP_K2} \
     --model-name ${MODEL_NAME} \
     --experiments-dir ${EXPERIMENTS_DIR} \
@@ -68,7 +73,6 @@ TRAIN_CMD="source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate ${CONDA
     --batch-size ${BATCH_SIZE} \
     --steps-per-epoch ${STEPS_PER_EPOCH} \
     --lr ${LEARNING_RATE} \
-    --scheduler ${SCHEDULER} \
     --device ${DEVICE} \
     --num-workers ${NUM_WORKERS} \
     --keep-best-k ${KEEP_BEST_K} \

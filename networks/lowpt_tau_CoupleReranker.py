@@ -10,66 +10,82 @@ from weaver.nn.model.TrackPreFilter import TrackPreFilter
 from weaver.utils.logger import _logger
 
 
+def _strip_prefix(state_dict: dict, prefix: str) -> dict:
+    """Strip ``prefix.`` from every key. Falls back to the original dict
+    if no key has the prefix (i.e., already bare)."""
+    full_prefix = prefix if prefix.endswith('.') else f'{prefix}.'
+    stripped = {
+        key[len(full_prefix):]: value
+        for key, value in state_dict.items()
+        if key.startswith(full_prefix)
+    }
+    return stripped or state_dict
+
+
 def _build_frozen_cascade(
-    cascade_checkpoint_path: str,
+    stage1_checkpoint_path: str,
+    stage2_checkpoint_path: str,
     input_dim: int,
 ) -> CascadeModel:
-    """Rebuild Stage 1 + Stage 2 from a single bundled checkpoint."""
-    _logger.info(f'Loading cascade checkpoint: {cascade_checkpoint_path}')
-    checkpoint = torch.load(
-        cascade_checkpoint_path, map_location='cpu', weights_only=False,
-    )
-    cascade_state_dict = checkpoint['model_state_dict']
-    saved_args = checkpoint.get('args', {})
+    """Rebuild Stage 1 + Stage 2 from per-stage checkpoints.
 
-    # Strip the "stage1." prefix so infer_stage1_kwargs (P1-aware) can read it.
-    stage1_state = {
-        key[len('stage1.'):]: value
-        for key, value in cascade_state_dict.items()
-        if key.startswith('stage1.')
-    }
-    if not stage1_state:
-        raise ValueError(
-            f'Cannot infer Stage 1: no stage1.* keys in {cascade_checkpoint_path}'
-        )
+    Stage 1 ckpt: bare TrackPreFilter weights under ``model_state_dict``.
+    Stage 2 ckpt: bare CascadeReranker weights under ``model_state_dict``;
+    backwards-compat — bundled cascade ckpts (with ``stage2.*`` prefix)
+    are auto-stripped.
+    """
+    _logger.info(f'Loading Stage 1 checkpoint: {stage1_checkpoint_path}')
+    stage1_ckpt = torch.load(
+        stage1_checkpoint_path, map_location='cpu', weights_only=False,
+    )
+    stage1_state = _strip_prefix(stage1_ckpt['model_state_dict'], 'stage1')
     stage1_kwargs = infer_stage1_kwargs(stage1_state, stage1_num_neighbors=16)
     if stage1_kwargs['input_dim'] != input_dim:
         raise ValueError(
-            f'Cascade checkpoint Stage 1 input_dim={stage1_kwargs["input_dim"]} '
+            f'Stage 1 checkpoint input_dim={stage1_kwargs["input_dim"]} '
             f'does not match data config input_dim={input_dim}.'
         )
-    _logger.info(f'Stage 1 config from checkpoint: {stage1_kwargs}')
+    _logger.info(f'Stage 1 config: {stage1_kwargs}')
     stage1 = TrackPreFilter(**stage1_kwargs)
+    stage1.load_state_dict(stage1_state)
 
-    pair_embed_dims_raw = saved_args.get('stage2_pair_embed_dims', '64,64,64')
+    _logger.info(f'Loading Stage 2 checkpoint: {stage2_checkpoint_path}')
+    stage2_ckpt = torch.load(
+        stage2_checkpoint_path, map_location='cpu', weights_only=False,
+    )
+    stage2_args = stage2_ckpt.get('args', {}) or {}
+    stage2_state = _strip_prefix(stage2_ckpt['model_state_dict'], 'stage2')
+
+    pair_embed_dims_raw = stage2_args.get('stage2_pair_embed_dims', '64,64,64')
     if isinstance(pair_embed_dims_raw, str):
         pair_embed_dims = [int(x) for x in pair_embed_dims_raw.split(',')]
     else:
         pair_embed_dims = pair_embed_dims_raw
     stage2 = CascadeReranker(
         input_dim=input_dim,
-        embed_dim=saved_args.get('stage2_embed_dim', 512),
-        num_heads=saved_args.get('stage2_num_heads', 8),
-        num_layers=saved_args.get('stage2_num_layers', 2),
+        embed_dim=stage2_args.get('stage2_embed_dim', 512),
+        num_heads=stage2_args.get('stage2_num_heads', 8),
+        num_layers=stage2_args.get('stage2_num_layers', 2),
         pair_input_dim=4,
-        pair_extra_dim=saved_args.get('stage2_pair_extra_dim', 6),
+        pair_extra_dim=stage2_args.get('stage2_pair_extra_dim', 6),
         pair_embed_dims=pair_embed_dims,
-        pair_embed_mode=saved_args.get('stage2_pair_embed_mode', 'concat'),
-        ffn_ratio=saved_args.get('stage2_ffn_ratio', 4),
-        dropout=saved_args.get('stage2_dropout', 0.1),
-        loss_mode=saved_args.get('stage2_loss_mode', 'pairwise'),
-        rs_at_k_target=saved_args.get('stage2_rs_at_k_target', 200),
+        pair_embed_mode=stage2_args.get('stage2_pair_embed_mode', 'concat'),
+        ffn_ratio=stage2_args.get('stage2_ffn_ratio', 4),
+        dropout=stage2_args.get('stage2_dropout', 0.1),
+        loss_mode=stage2_args.get('stage2_loss_mode', 'pairwise'),
+        rs_at_k_target=stage2_args.get('stage2_rs_at_k_target', 200),
     )
+    stage2.load_state_dict(stage2_state)
 
-    top_k1 = saved_args.get('top_k1', 256)
+    top_k1 = stage2_args.get('top_k1', 256)
     cascade = CascadeModel(stage1=stage1, stage2=stage2, top_k1=top_k1)
-    cascade.load_state_dict(cascade_state_dict)
-    _logger.info(f'Cascade loaded (top_k1={top_k1})')
+    _logger.info(f'Cascade built (top_k1={top_k1})')
     return cascade
 
 
 def get_model(data_config, **kwargs):
-    cascade_checkpoint = kwargs.pop('cascade_checkpoint', None)
+    stage1_checkpoint = kwargs.pop('stage1_checkpoint', None)
+    stage2_checkpoint = kwargs.pop('stage2_checkpoint', None)
     top_k2 = kwargs.pop('top_k2', 50)
     k_values_tracks_raw = kwargs.pop('k_values_tracks', '30,50,75,100,200')
     if isinstance(k_values_tracks_raw, str):
@@ -87,15 +103,16 @@ def get_model(data_config, **kwargs):
     couple_label_smoothing = kwargs.pop('couple_label_smoothing', 0.10)
     couple_projector_dim = kwargs.pop('couple_projector_dim', 32)
 
-    if cascade_checkpoint is None:
+    if stage1_checkpoint is None or stage2_checkpoint is None:
         raise ValueError(
-            'cascade_checkpoint is required. Pass --cascade-checkpoint to '
-            'train_couple_reranker.py'
+            'Both --stage1-checkpoint and --stage2-checkpoint are required.'
         )
 
     input_dim = len(data_config.input_dicts['pf_features'])
 
-    cascade = _build_frozen_cascade(cascade_checkpoint, input_dim=input_dim)
+    cascade = _build_frozen_cascade(
+        stage1_checkpoint, stage2_checkpoint, input_dim=input_dim,
+    )
     cascade_params = sum(p.numel() for p in cascade.parameters())
     _logger.info(f'Frozen cascade: {cascade_params:,} params')
 

@@ -40,15 +40,25 @@ OUTPUT_SCHEMA = pa.schema([
 ])
 
 
+def _strip_prefix(state_dict: dict, prefix: str) -> dict:
+    full_prefix = prefix if prefix.endswith('.') else f'{prefix}.'
+    stripped = {
+        key[len(full_prefix):]: value
+        for key, value in state_dict.items()
+        if key.startswith(full_prefix)
+    }
+    return stripped or state_dict
+
+
 def _load_stage1(
     path: str, data_config, num_neighbors: int, device: str,
 ) -> TrackPreFilter:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    state_dict = checkpoint['model_state_dict']
+    state_dict = _strip_prefix(checkpoint['model_state_dict'], 'stage1')
     kwargs = infer_stage1_kwargs(state_dict, stage1_num_neighbors=num_neighbors)
     kwargs['input_dim'] = len(data_config.input_dicts['pf_features'])
     model = TrackPreFilter(**kwargs)
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict)
     return model.to(device).eval()
 
 
@@ -57,12 +67,7 @@ def _load_stage2(
 ) -> tuple[CascadeReranker, int]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     args = checkpoint.get('args', {}) or {}
-    full_state_dict = checkpoint['model_state_dict']
-    state_dict = {
-        key[len('stage2.'):]: value
-        for key, value in full_state_dict.items()
-        if key.startswith('stage2.')
-    } or full_state_dict
+    state_dict = _strip_prefix(checkpoint['model_state_dict'], 'stage2')
 
     pair_embed_dims = args.get('stage2_pair_embed_dims', '64,64,64')
     if isinstance(pair_embed_dims, str):
@@ -82,13 +87,7 @@ def _load_stage2(
         loss_mode=args.get('stage2_loss_mode', 'pairwise'),
         rs_at_k_target=args.get('stage2_rs_at_k_target', 200),
     )
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing or unexpected:
-        raise RuntimeError(
-            f'Stage 2 load mismatch — missing={len(missing)}, '
-            f'unexpected={len(unexpected)}. First missing: {missing[:3]}, '
-            f'first unexpected: {unexpected[:3]}',
-        )
+    model.load_state_dict(state_dict)
     return model.to(device).eval(), int(args.get('top_k1', 256))
 
 
@@ -107,7 +106,7 @@ def _load_stage3(path: str, device: str) -> tuple[CoupleReranker, int]:
         couple_projector_dim=args.get('couple_projector_dim', 32),
         rest_dim=rest_dim,
     )
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict)
     return model.to(device).eval(), int(args.get('top_k2', 50))
 
 

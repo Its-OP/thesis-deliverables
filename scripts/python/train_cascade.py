@@ -121,7 +121,7 @@ def main():
         ema_stage2 = state['ema_stage2']
         return {
             'epoch': epoch,
-            'model_state_dict': original_model.state_dict(),
+            'model_state_dict': original_model.stage2.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'ema_state_dict': (
                 ema_stage2.state_dict() if ema_stage2 is not None else None
@@ -134,6 +134,10 @@ def main():
             'val_metrics': val_metrics,
             'args': vars(args),
         }
+
+    def load_model_fn(model, checkpoint):
+        # Per-stage save: 'model_state_dict' is bare Stage 2 weights.
+        model.stage2.load_state_dict(checkpoint['model_state_dict'])
 
     def on_resume(checkpoint, original_model, optimizer, args, device, resume_state):
         state['ema_stage2'] = resume_ema_state(
@@ -180,6 +184,7 @@ def main():
         update_val_metrics_fn=update_val_metrics,
         make_checkpoint_dict_fn=make_checkpoint_dict,
         on_resume=on_resume,
+        load_model_fn=load_model_fn,
         epoch_metrics_extras_fn=lambda args, epoch: {'top_k1': args.top_k1},
         use_torch_compile=not args.no_compile,
         train_eval_steps_divisor=4,
