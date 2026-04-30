@@ -14,7 +14,6 @@ env/
 experiments/
 logs/
 runs/
-models/*.pt
 checkpoints/
 *.ckpt
 
