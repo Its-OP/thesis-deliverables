@@ -20,7 +20,7 @@ REPO_DIR="deliverables"
 CONDA_ENV_NAME="part"
 PYTHON_VERSION="3.13"
 # Google Drive file ID for the split parquet data archive (train/ + val/)
-GDRIVE_DATA_ZIP_ID="1RaKiErLJTNlM5Y4OSn0fOvKCc-Zh61FM"
+GDRIVE_DATA_ZIP_ID="1xupCmSJtjKtWB0jbemXfW4a9pW7Pl7Mj"
 
 echo "============================================"
 echo "  thesis-deliverables — Server Setup"
