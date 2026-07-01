@@ -12,17 +12,19 @@ import torch
 from tqdm import tqdm
 
 from utils.triplet_join import build_track_lorentz, candidates_for_tier, compression_stats
+from utils.triplet_split import load_split
 
+# VAL = "the eval set" (default). Cascade TEST set is reserved for a future final report; pass --dump/--src-glob to point at it.
 DEFAULT_DUMP = os.path.join(
-    os.path.dirname(__file__), "..", "..", "data", "low-pt", "eval", "stage3_dump_test.parquet",
+    os.path.dirname(__file__), "..", "..", "data", "low-pt", "eval", "perstage_couples_val.parquet",
 )
-DEFAULT_SRC_GLOB = "/Users/oleh/Downloads/test_dataset_unzipped/test_*.parquet"
+DEFAULT_SRC_GLOB = "/Users/oleh/Projects/masters/part/data/low-pt/val/val_*.parquet"
 
 BLUE = "#4466CC"
 CRIMSON = "#AA3355"
 GREY = "#888888"
 TIERS = ["A0", "H", "HS"]
-POOLS = ["P1", "P2"]
+POOLS = ["P2"]
 
 
 def _load(dump_path, src_glob, max_events):
@@ -41,7 +43,7 @@ def _sorted_rows(triplets):
     return set(map(tuple, triplets.sort(dim=1).values.tolist()))
 
 
-def evaluate(dump, src, n_events, top_c):
+def evaluate(dump, src, event_indices, top_c):
     s1 = dump["stage1_sorted_indices"].to_pylist()
     couples_all = dump["stage3_sorted_couples"].to_pylist()
     n_tracks_col = src["event_n_tracks"].to_pylist()
@@ -56,7 +58,7 @@ def evaluate(dump, src, n_events, top_c):
     acc = {p: {t: dict(n_full=0, n_survive=0, recon=0, survived=0, pe=[]) for t in TIERS} for p in POOLS}
     curve = {p: {t: [] for t in TIERS} for p in POOLS}  # (visible_pt, survived_bool)
 
-    for r in tqdm(range(n_events), desc="events"):
+    for r in tqdm([int(x) for x in event_indices], desc="events"):
         assert len(s1[r]) == n_tracks_col[r], f"alignment break at row {r}"
         labels = np.asarray(label_col[r])
         gt = np.where(labels > 0.5)[0]
@@ -80,8 +82,7 @@ def evaluate(dump, src, n_events, top_c):
         visible_pt = float(np.asarray(pt_col[r])[gt].sum()) if has_three else None
         has_gt_couple = any(set(c).issubset(gt_set) for c in couples_np.tolist())
 
-        pools = {"P1": torch.tensor(s1[r][:256], dtype=torch.long),
-                 "P2": torch.arange(n_tracks, dtype=torch.long)}
+        pools = {"P2": torch.arange(n_tracks, dtype=torch.long)}
 
         for pool_name, pool in pools.items():
             pool_set = set(pool.tolist())
@@ -191,13 +192,21 @@ def main():
     parser.add_argument("--src-glob", default=DEFAULT_SRC_GLOB)
     parser.add_argument("--top-c", type=int, default=100)
     parser.add_argument("--max-events", type=int, default=None)
+    parser.add_argument("--split-json", default=None,
+                        help="restrict to the held-out test events listed in this split file")
     parser.add_argument("--out-dir", default=os.path.join(os.path.dirname(__file__), "..", "..", "reports"))
     parser.add_argument("--pt-max", type=float, default=20.0)
     parser.add_argument("--bin-width", type=float, default=1.0)
     args = parser.parse_args()
 
-    dump, src, n_events = _load(args.dump, args.src_glob, args.max_events)
-    acc, curve = evaluate(dump, src, n_events, args.top_c)
+    dump, src, n = _load(args.dump, args.src_glob, args.max_events)
+    if args.split_json:
+        event_indices = load_split(args.split_json, "test")
+        event_indices = event_indices[event_indices < n]
+    else:
+        event_indices = np.arange(n)
+    n_events = len(event_indices)
+    acc, curve = evaluate(dump, src, event_indices, args.top_c)
     rows = _table(acc, n_events)
     _print_table(rows)
 

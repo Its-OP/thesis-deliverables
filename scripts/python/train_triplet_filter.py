@@ -12,7 +12,7 @@ from sklearn.tree import DecisionTreeClassifier, export_text
 
 from utils.triplet_join import FEATURE_NAMES, GATE4_NAMES
 
-POOLS = ["P1", "P2"]
+POOLS = ["P2"]
 FLOORS = [0.99, 0.97, 0.95]
 FEATURESETS = {"rich": FEATURE_NAMES, "gate4": GATE4_NAMES}
 BLUE, CRIMSON, GREEN, BLACK = "#4466CC", "#AA3355", "#229977", "#222222"

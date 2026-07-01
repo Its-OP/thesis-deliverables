@@ -15,6 +15,7 @@ experiments/
 logs/
 runs/
 checkpoints/
+reports/
 *.ckpt
 
 # editor

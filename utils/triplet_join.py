@@ -53,6 +53,9 @@ def _enumerate(couples: torch.Tensor, pool: torch.Tensor):
 
 
 def _dz_dist(dz, i, j, k):
+    # dz holds the longitudinal impact-parameter significance dz/sigma_dz per track.
+    # Distance of the third track's significance from the couple midpoint: small when
+    # all three share one production vertex, large when k comes from elsewhere.
     return (dz[k] - 0.5 * (dz[i] + dz[j])).abs()
 
 
@@ -78,8 +81,8 @@ def _pt(lorentz, *index_groups):
 FEATURE_NAMES = [
     "dz_dist", "dr_min", "m_ijk", "rho_dist",
     "couple_rank", "is_same_sign", "m_ij", "pt_ij",
-    "pt_k", "abs_eta_k", "dz_sig_k", "dxy_sig_k", "dca_sig_k", "n_pixel_k", "norm_chi2_k",
-    "m_ik", "m_jk", "dr_ij", "dz_spread", "pt_ijk",
+    "pt_k", "abs_eta_k", "dz_sig_k", "dxy_sig_k", "dca_sig_k", "n_pixel_k", "norm_chi2_k", "rel_pt_err_k",
+    "m_ik", "m_jk", "dr_ij", "dr_ik", "dr_jk", "pt_frac_k", "dz_spread", "pt_ijk",
 ]
 GATE4_NAMES = FEATURE_NAMES[:4]
 
@@ -180,11 +183,12 @@ def triplet_candidate_features(
     dca_sig: torch.Tensor,
     n_pixel: torch.Tensor,
     norm_chi2: torch.Tensor,
+    pt_error: torch.Tensor,
     gt_sorted: tuple[int, int, int] | None = None,
 ) -> tuple[torch.Tensor, list[str], torch.Tensor, torch.Tensor]:
     """couples: (C, 2) long. pool: (P,) long. lorentz: (4, N). per-track inputs: (N,).
 
-    Per Tier-H-surviving candidate: (X (M_H, 20) features in FEATURE_NAMES order,
+    Per Tier-H-surviving candidate: (X (M_H, 24) features in FEATURE_NAMES order,
     FEATURE_NAMES, is_gt (M_H,), couple_row (M_H,)). Columns 0:4 equal triplet_gate_quantities.
     """
     track_i, track_j, track_k, couple_row, base = _enumerate(couples, pool)
@@ -197,6 +201,8 @@ def triplet_candidate_features(
     dz_ij = (dz[i] - dz[j]).abs()
     dz_ik = (dz[i] - dz[k]).abs()
     dz_jk = (dz[j] - dz[k]).abs()
+    pt_k = _pt(lorentz, k)
+    pt_ijk = _pt(lorentz, i, j, k)
     columns = [
         _dz_dist(dz, i, j, k),
         _dr_min(eta, phi, i, j, k),
@@ -206,18 +212,22 @@ def triplet_candidate_features(
         (charge[i] == charge[j]).float(),
         _mass(lorentz, i, j),
         _pt(lorentz, i, j),
-        _pt(lorentz, k),
+        pt_k,
         eta[k].abs(),
         dz[k],
         dxy_sig[k],
         dca_sig[k],
         n_pixel[k],
         norm_chi2[k],
+        pt_error[k] / torch.clamp_min(pt_k, 1e-6),
         _mass(lorentz, i, k),
         _mass(lorentz, j, k),
         _delta_r_squared(eta[i], phi[i], eta[j], phi[j]).sqrt(),
+        _delta_r_squared(eta[i], phi[i], eta[k], phi[k]).sqrt(),
+        _delta_r_squared(eta[j], phi[j], eta[k], phi[k]).sqrt(),
+        pt_k / torch.clamp_min(pt_ijk, 1e-6),
         torch.maximum(torch.maximum(dz_ij, dz_ik), dz_jk),
-        _pt(lorentz, i, j, k),
+        pt_ijk,
     ]
     features = torch.stack(columns, dim=1)
 

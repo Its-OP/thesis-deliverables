@@ -12,16 +12,21 @@ import torch
 from tqdm import tqdm
 
 from utils.triplet_join import FEATURE_NAMES, build_track_lorentz, triplet_candidate_features
+from utils.triplet_split import write_split
 
-POOLS = ["P1", "P2"]
-TEST_DUMP = os.path.join(os.path.dirname(__file__), "..", "..", "data", "low-pt", "eval", "stage3_dump_test.parquet")
+EVAL_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "low-pt", "eval")
+# VAL = "the eval set": train + held-out for the triplet filter (split 80/20).
+DUMP = os.path.join(EVAL_DIR, "perstage_couples_val.parquet")
+SRC = "/Users/oleh/Projects/masters/part/data/low-pt/val/val_*.parquet"
+# Cascade TEST set — reserved for a future final-performance report; not used by default.
+TEST_DUMP = os.path.join(EVAL_DIR, "stage3_dump_test.parquet")
 TEST_SRC = "/Users/oleh/Downloads/test_dataset_unzipped/test_*.parquet"
-VAL_DUMP = os.path.join(os.path.dirname(__file__), "..", "..", "data", "low-pt", "eval", "perstage_couples_val.parquet")
-VAL_SRC = "/Users/oleh/Projects/masters/part/data/low-pt/val/val_*.parquet"
+SPLIT_JSON = os.path.join(EVAL_DIR, "triplet_split.json")
+POOL = "P2"
 
 SRC_COLS = ["event_n_tracks", "track_pt", "track_eta", "track_phi", "track_charge",
             "track_dz_significance", "track_dxy_significance", "track_dca_significance",
-            "track_n_valid_pixel_hits", "track_norm_chi2", "track_label_from_tau"]
+            "track_n_valid_pixel_hits", "track_norm_chi2", "track_pt_error", "track_label_from_tau"]
 
 
 def _load(dump_path, src_glob, max_events):
@@ -44,25 +49,21 @@ def _event_features(r, dump_cols, src_cols, top_c):
     kw = dict(lorentz=lorentz, charge=t("track_charge"), eta=t("track_eta"), phi=t("track_phi"),
               dz=t("track_dz_significance"), dxy_sig=t("track_dxy_significance"),
               dca_sig=t("track_dca_significance"), n_pixel=t("track_n_valid_pixel_hits"),
-              norm_chi2=t("track_norm_chi2"))
+              norm_chi2=t("track_norm_chi2"), pt_error=t("track_pt_error"))
     labels = np.asarray(cols["track_label_from_tau"][r])
     gt = np.where(labels > 0.5)[0]
     couples_np = np.asarray(couples_all[r][:top_c], dtype=np.int64).reshape(-1, 2)
     couples = torch.tensor(couples_np, dtype=torch.long)
     gt_set = set(gt.tolist())
     has_gt_couple = any(set(c).issubset(gt_set) for c in couples_np.tolist())
-    pools = {"P1": torch.tensor(s1[r][:256], dtype=torch.long),
-             "P2": torch.arange(n_tracks, dtype=torch.long)}
-    out = {}
-    for name, pool in pools.items():
-        pool_set = set(pool.tolist())
-        reconstructable = gt.size == 3 and gt_set.issubset(pool_set) and has_gt_couple
-        gt_sorted = tuple(sorted(gt.tolist())) if reconstructable else None
-        members = sum((int(c[0]) in pool_set) + (int(c[1]) in pool_set) for c in couples_np)
-        n_full = couples.shape[0] * pool.shape[0] - members
-        X, _, is_gt, _ = triplet_candidate_features(couples, pool, gt_sorted=gt_sorted, **kw)
-        out[name] = dict(X=X.numpy(), is_gt=is_gt.numpy(), reconstructable=reconstructable, n_full=n_full)
-    return out
+    pool = torch.arange(n_tracks, dtype=torch.long)  # P2: entire input track set
+    pool_set = set(pool.tolist())
+    reconstructable = gt.size == 3 and gt_set.issubset(pool_set) and has_gt_couple
+    gt_sorted = tuple(sorted(gt.tolist())) if reconstructable else None
+    members = sum((int(c[0]) in pool_set) + (int(c[1]) in pool_set) for c in couples_np)
+    n_full = couples.shape[0] * pool.shape[0] - members
+    X, _, is_gt, _ = triplet_candidate_features(couples, pool, gt_sorted=gt_sorted, **kw)
+    return dict(X=X.numpy(), is_gt=is_gt.numpy(), reconstructable=reconstructable, n_full=n_full)
 
 
 def _to_table(rows, extra):
@@ -71,87 +72,87 @@ def _to_table(rows, extra):
     return pa.table(arrays)
 
 
-def build(mode, dump, src, n_events, top_c, neg_per_event, subsample, seed, out_path):
-    s1 = dump["stage1_sorted_indices"].to_pylist()
-    couples_all = dump["stage3_sorted_couples"].to_pylist()
-    src_cols = {c: src[c].to_pylist() for c in SRC_COLS}
-    gen = np.random.default_rng(seed)
+def build_train(dump_cols, src_cols, event_idx, top_c, neg_per_event, gen, out_path):
+    train_rows, train_label = [], []
+    for r in tqdm(event_idx, desc="train"):
+        f = _event_features(int(r), dump_cols, src_cols, top_c)
+        X, is_gt = f["X"], f["is_gt"]
+        pos = X[is_gt]
+        neg_all = X[~is_gt]
+        if len(neg_all):
+            take = min(neg_per_event, len(neg_all))
+            neg = neg_all[gen.choice(len(neg_all), take, replace=False)]
+        else:
+            neg = neg_all
+        for block, lab in ((pos, 1), (neg, 0)):
+            if len(block):
+                train_rows.append(block)
+                train_label.append(np.full(len(block), lab, np.int8))
+    rows = np.concatenate(train_rows)
+    tbl = _to_table(rows, {"is_gt": pa.array(np.concatenate(train_label)),
+                           "pool": pa.array(np.full(rows.shape[0], POOL))})
+    pq.write_table(tbl, out_path)
+    print(f"wrote {out_path} ({tbl.num_rows} rows)")
 
-    train_rows, train_label, train_pool = [], [], []
+
+def build_eval(dump_cols, src_cols, event_idx, top_c, subsample, gen, out_path):
     gt_rows, gt_pool, sub_rows, sub_w, sub_pool = [], [], [], [], []
-    meta = {p: dict(recon=0, n_full=0, n_events=n_events) for p in POOLS}
+    meta = {POOL: dict(recon=0, n_full=0, n_events=len(event_idx))}
+    for r in tqdm(event_idx, desc="eval"):
+        f = _event_features(int(r), dump_cols, src_cols, top_c)
+        X, is_gt = f["X"], f["is_gt"]
+        if f["reconstructable"]:
+            meta[POOL]["recon"] += 1
+        meta[POOL]["n_full"] += f["n_full"]
+        if f["reconstructable"] and is_gt.any():
+            gt_rows.append(X[is_gt][0])
+            gt_pool.append(POOL)
+        n_h = len(X)
+        if n_h:
+            take = min(subsample, n_h)
+            idx = gen.choice(n_h, take, replace=False)
+            sub_rows.append(X[idx])
+            sub_w.append(np.full(take, n_h / take))
+            sub_pool.append(np.full(take, POOL))
 
-    for r in tqdm(range(n_events), desc=mode):
-        feats = _event_features(r, (s1, couples_all), src_cols, top_c)
-        for p in POOLS:
-            f = feats[p]
-            X, is_gt = f["X"], f["is_gt"]
-            if mode == "train":
-                pos = X[is_gt]
-                neg_all = X[~is_gt]
-                if len(neg_all):
-                    take = min(neg_per_event, len(neg_all))
-                    neg = neg_all[gen.choice(len(neg_all), take, replace=False)]
-                else:
-                    neg = neg_all
-                for block, lab in ((pos, 1), (neg, 0)):
-                    if len(block):
-                        train_rows.append(block)
-                        train_label.append(np.full(len(block), lab, np.int8))
-                        train_pool.append(np.full(len(block), p))
-            else:
-                if f["reconstructable"]:
-                    meta[p]["recon"] += 1
-                meta[p]["n_full"] += f["n_full"]
-                if f["reconstructable"] and is_gt.any():
-                    gt_rows.append(X[is_gt][0])
-                    gt_pool.append(p)
-                n_h = len(X)
-                if n_h:
-                    take = min(subsample, n_h)
-                    idx = gen.choice(n_h, take, replace=False)
-                    sub_rows.append(X[idx])
-                    sub_w.append(np.full(take, n_h / take))
-                    sub_pool.append(np.full(take, p))
-
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    if mode == "train":
-        rows = np.concatenate(train_rows)
-        tbl = _to_table(rows, {"is_gt": pa.array(np.concatenate(train_label)),
-                               "pool": pa.array(np.concatenate(train_pool))})
-        pq.write_table(tbl, out_path)
-        print(f"wrote {out_path} ({tbl.num_rows} rows)")
-    else:
-        gt_tbl = _to_table(np.stack(gt_rows), {"pool": pa.array(gt_pool)})
-        sub_tbl = _to_table(np.concatenate(sub_rows),
-                            {"weight": pa.array(np.concatenate(sub_w)), "pool": pa.array(np.concatenate(sub_pool))})
-        pq.write_table(gt_tbl, out_path.replace(".parquet", "_gt.parquet"))
-        pq.write_table(sub_tbl, out_path.replace(".parquet", "_sub.parquet"))
-        with open(out_path.replace(".parquet", "_meta.json"), "w") as fh:
-            json.dump(meta, fh, indent=2)
-        print(f"wrote {out_path.replace('.parquet', '_{gt,sub}.parquet')} + _meta.json "
-              f"(gt {gt_tbl.num_rows}, sub {sub_tbl.num_rows})")
+    gt_tbl = _to_table(np.stack(gt_rows), {"pool": pa.array(gt_pool)})
+    sub_tbl = _to_table(np.concatenate(sub_rows),
+                        {"weight": pa.array(np.concatenate(sub_w)), "pool": pa.array(np.concatenate(sub_pool))})
+    pq.write_table(gt_tbl, out_path.replace(".parquet", "_gt.parquet"))
+    pq.write_table(sub_tbl, out_path.replace(".parquet", "_sub.parquet"))
+    with open(out_path.replace(".parquet", "_meta.json"), "w") as fh:
+        json.dump(meta, fh, indent=2)
+    print(f"wrote {out_path.replace('.parquet', '_{gt,sub}.parquet')} + _meta.json "
+          f"(gt {gt_tbl.num_rows}, sub {sub_tbl.num_rows})")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--split", choices=["val", "test"], required=True)
+    ap.add_argument("--dump", default=DUMP, help="cascade dump (default: VAL)")
+    ap.add_argument("--src-glob", default=SRC, help="per-track source parquet glob (default: VAL)")
     ap.add_argument("--top-c", type=int, default=100)
     ap.add_argument("--max-events", type=int, default=None)
     ap.add_argument("--neg-per-event", type=int, default=80)
     ap.add_argument("--subsample", type=int, default=100)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--out-dir", default=os.path.join(os.path.dirname(__file__), "..", "..", "data", "low-pt", "eval"))
+    ap.add_argument("--frac-train", type=float, default=0.8)
+    ap.add_argument("--out-dir", default=EVAL_DIR)
+    ap.add_argument("--split-json", default=SPLIT_JSON)
     args = ap.parse_args()
 
-    if args.split == "val":
-        dump_path, src_glob, mode, out = VAL_DUMP, VAL_SRC, "train", "triplet_filter_train.parquet"
-    else:
-        dump_path, src_glob, mode, out = TEST_DUMP, TEST_SRC, "eval", "triplet_filter_eval.parquet"
+    dump, src, n = _load(args.dump, args.src_glob, args.max_events)
+    train_idx, test_idx = write_split(args.split_json, n, frac_train=args.frac_train, seed=args.seed)
+    print(f"split: {n} events -> {len(train_idx)} train / {len(test_idx)} test "
+          f"(seed {args.seed}) -> {args.split_json}")
 
-    dump, src, n = _load(dump_path, src_glob, args.max_events)
-    build(mode, dump, src, n, args.top_c, args.neg_per_event, args.subsample, args.seed,
-          os.path.join(args.out_dir, out))
+    dump_cols = (dump["stage1_sorted_indices"].to_pylist(), dump["stage3_sorted_couples"].to_pylist())
+    src_cols = {c: src[c].to_pylist() for c in SRC_COLS}
+    gen = np.random.default_rng(args.seed)
+
+    build_train(dump_cols, src_cols, train_idx, args.top_c, args.neg_per_event, gen,
+                os.path.join(args.out_dir, "triplet_filter_train.parquet"))
+    build_eval(dump_cols, src_cols, test_idx, args.top_c, args.subsample, gen,
+               os.path.join(args.out_dir, "triplet_filter_eval.parquet"))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import torch
 from tqdm import tqdm
 
 from utils.triplet_join import build_track_lorentz, triplet_gate_quantities
+from utils.triplet_split import load_split
 from scripts.python.eval_triplet_join import _load, DEFAULT_DUMP, DEFAULT_SRC_GLOB, BLUE, CRIMSON, POOLS
 
 # Sweep grids (np.inf = gate off).
@@ -21,12 +22,11 @@ TAU_RHO = [0.10, 0.15, 0.30, 0.50, np.inf]
 FLOORS = [0.99, 0.97, 0.95]
 
 
-def _event_pools(s1_row, n_tracks):
-    return {"P1": torch.tensor(s1_row[:256], dtype=torch.long),
-            "P2": torch.arange(n_tracks, dtype=torch.long)}
+def _event_pools(n_tracks):
+    return {"P2": torch.arange(n_tracks, dtype=torch.long)}
 
 
-def collect(dump, src, n_events, top_c, subsample, seed):
+def collect(dump, src, event_indices, top_c, subsample, seed):
     s1 = dump["stage1_sorted_indices"].to_pylist()
     couples_all = dump["stage3_sorted_couples"].to_pylist()
     n_tracks_col = src["event_n_tracks"].to_pylist()
@@ -37,7 +37,7 @@ def collect(dump, src, n_events, top_c, subsample, seed):
 
     store = {p: dict(gt=[], sub=[], weight=[], recon=0, n_full=0) for p in POOLS}
 
-    for r in tqdm(range(n_events), desc="events"):
+    for r in tqdm([int(x) for x in event_indices], desc="events"):
         assert len(s1[r]) == n_tracks_col[r]
         labels = np.asarray(label_col[r])
         gt = np.where(labels > 0.5)[0]
@@ -55,7 +55,7 @@ def collect(dump, src, n_events, top_c, subsample, seed):
         has_three = gt.size == 3
         has_gt_couple = any(set(c).issubset(gt_set) for c in couples_np.tolist())
 
-        for pool_name, pool in _event_pools(s1[r], n_tracks).items():
+        for pool_name, pool in _event_pools(n_tracks).items():
             st = store[pool_name]
             pool_set = set(pool.tolist())
             members = sum((int(c[0]) in pool_set) + (int(c[1]) in pool_set) for c in couples_np)
@@ -245,13 +245,21 @@ def main():
     parser.add_argument("--src-glob", default=DEFAULT_SRC_GLOB)
     parser.add_argument("--top-c", type=int, default=100)
     parser.add_argument("--max-events", type=int, default=None)
+    parser.add_argument("--split-json", default=None,
+                        help="restrict to the held-out test events listed in this split file")
     parser.add_argument("--subsample", type=int, default=120)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", default=os.path.join(os.path.dirname(__file__), "..", "..", "reports"))
     args = parser.parse_args()
 
-    dump, src, n_events = _load(args.dump, args.src_glob, args.max_events)
-    store = collect(dump, src, n_events, args.top_c, args.subsample, args.seed)
+    dump, src, n = _load(args.dump, args.src_glob, args.max_events)
+    if args.split_json:
+        event_indices = load_split(args.split_json, "test")
+        event_indices = event_indices[event_indices < n]
+    else:
+        event_indices = np.arange(n)
+    n_events = len(event_indices)
+    store = collect(dump, src, event_indices, args.top_c, args.subsample, args.seed)
     points = sweep(store)
     for p in POOLS:
         h = [d for d in points[p] if d["dz"] == np.inf and d["dr"] == np.inf

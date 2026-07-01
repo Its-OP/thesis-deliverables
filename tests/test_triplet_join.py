@@ -10,6 +10,7 @@ import torch
 from utils.couple_features import M_TAU_GEV, RHO_MASS_GEV
 from utils.triplet_join import (
     FEATURE_NAMES,
+    GATE4_NAMES,
     PION_MASS_GEV,
     build_track_lorentz,
     build_triplet_candidates,
@@ -41,6 +42,7 @@ def _event():
         dca_sig=torch.tensor([1.0, 1.1, 1.2, 1.3, 1.4]),
         n_pixel=torch.tensor([4.0, 4.0, 3.0, 5.0, 2.0]),
         norm_chi2=torch.tensor([1.0, 1.2, 0.9, 1.1, 2.0]),
+        pt_error=torch.tensor([0.01, 0.02, 0.03, 0.04, 0.05]),
     )
 
 
@@ -325,7 +327,7 @@ def _features(ev, couples, pool, gt_sorted=None):
         couples, pool, lorentz=ev["lorentz"], charge=ev["charge"],
         eta=ev["eta"], phi=ev["phi"], dz=ev["dz"], dxy_sig=ev["dxy_sig"],
         dca_sig=ev["dca_sig"], n_pixel=ev["n_pixel"], norm_chi2=ev["norm_chi2"],
-        gt_sorted=gt_sorted,
+        pt_error=ev["pt_error"], gt_sorted=gt_sorted,
     )
 
 
@@ -335,7 +337,7 @@ def test_candidate_features_shape_and_gate4_columns():
     pool = torch.arange(5)
     X, names, is_gt, cr = _features(ev, couples, pool)
     assert names == FEATURE_NAMES
-    assert X.shape[1] == len(FEATURE_NAMES) == 20
+    assert X.shape[1] == len(FEATURE_NAMES) == 24
     assert X.shape[0] == cr.shape[0] == is_gt.shape[0]
     # Columns 0:4 reproduce the gate quantities.
     q = triplet_gate_quantities(couples, pool, lorentz=ev["lorentz"], charge=ev["charge"],
@@ -361,12 +363,33 @@ def test_candidate_features_is_gt():
     assert is_gt.sum().item() == 1
 
 
+def test_gate4_names_are_first_four():
+    assert GATE4_NAMES == FEATURE_NAMES[:4]
+    assert GATE4_NAMES == ["dz_dist", "dr_min", "m_ijk", "rho_dist"]
+
+
+def test_candidate_features_new_columns_manual():
+    ev = _event()
+    X, names, _, _ = _features(ev, torch.tensor([[0, 1]]), torch.tensor([2]))
+    idx = {n: c for c, n in enumerate(names)}
+    # rel_pt_err_k = pt_error[k] / pt_k = 0.03 / 0.9
+    assert torch.allclose(X[0, idx["rel_pt_err_k"]], torch.tensor(0.03 / 0.9), atol=1e-5)
+    # dr_ik = sqrt((0.10-0.12)^2 + (0.05-0.08)^2); dr_jk = sqrt((0.15-0.12)^2 + (0.10-0.08)^2)
+    assert torch.allclose(X[0, idx["dr_ik"]], torch.tensor(math.sqrt(0.0004 + 0.0009)), atol=1e-5)
+    assert torch.allclose(X[0, idx["dr_jk"]], torch.tensor(math.sqrt(0.0009 + 0.0004)), atol=1e-5)
+    # pt_frac_k = pt_k / pt_ijk, both transverse magnitudes from the 4-vectors
+    p4 = ev["lorentz"]
+    rows = [0, 1, 2]
+    pt_ijk = torch.sqrt(p4[0, rows].sum() ** 2 + p4[1, rows].sum() ** 2)
+    assert torch.allclose(X[0, idx["pt_frac_k"]], torch.tensor(0.9) / pt_ijk, atol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # Real-data integration: Tier-H is lossless on the test split
 # ---------------------------------------------------------------------------
 
-_DUMP = "/Users/oleh/Projects/masters/deliverables/data/low-pt/eval/stage3_dump_test.parquet"
-_SRC_GLOB = "/Users/oleh/Downloads/test_dataset_unzipped/test_*.parquet"
+_DUMP = "/Users/oleh/Projects/masters/deliverables/data/low-pt/eval/perstage_couples_val.parquet"
+_SRC_GLOB = "/Users/oleh/Projects/masters/part/data/low-pt/val/val_*.parquet"
 
 
 @pytest.mark.skipif(
