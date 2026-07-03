@@ -26,7 +26,8 @@ POOL = "P2"
 
 SRC_COLS = ["event_n_tracks", "track_pt", "track_eta", "track_phi", "track_charge",
             "track_dz_significance", "track_dxy_significance", "track_dca_significance",
-            "track_n_valid_pixel_hits", "track_norm_chi2", "track_pt_error", "track_label_from_tau"]
+            "track_n_valid_pixel_hits", "track_norm_chi2", "track_pt_error",
+            "track_covariance_phi_phi", "track_covariance_lambda_lambda", "track_label_from_tau"]
 
 
 def _load(dump_path, src_glob, max_events):
@@ -49,7 +50,9 @@ def _event_features(r, dump_cols, src_cols, top_c):
     kw = dict(lorentz=lorentz, charge=t("track_charge"), eta=t("track_eta"), phi=t("track_phi"),
               dz=t("track_dz_significance"), dxy_sig=t("track_dxy_significance"),
               dca_sig=t("track_dca_significance"), n_pixel=t("track_n_valid_pixel_hits"),
-              norm_chi2=t("track_norm_chi2"), pt_error=t("track_pt_error"))
+              norm_chi2=t("track_norm_chi2"), pt_error=t("track_pt_error"),
+              cov_phi_phi=t("track_covariance_phi_phi"),
+              cov_lambda_lambda=t("track_covariance_lambda_lambda"))
     labels = np.asarray(cols["track_label_from_tau"][r])
     gt = np.where(labels > 0.5)[0]
     couples_np = np.asarray(couples_all[r][:top_c], dtype=np.int64).reshape(-1, 2)

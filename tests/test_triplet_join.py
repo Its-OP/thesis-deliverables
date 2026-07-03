@@ -7,11 +7,16 @@ import os
 import pytest
 import torch
 
-from utils.couple_features import M_TAU_GEV, RHO_MASS_GEV
+from utils.couple_features import M_TAU_GEV, RHO_MASS_GEV, RHO_SIGMA_GEV
 from utils.triplet_join import (
+    COUPLE_UNIT_NAMES,
     FEATURE_NAMES,
     GATE4_NAMES,
     PION_MASS_GEV,
+    RICH_NAMES,
+    TRACK_I_NAMES,
+    TRACK_J_NAMES,
+    TRACK_K_NAMES,
     build_track_lorentz,
     build_triplet_candidates,
     candidates_for_tier,
@@ -43,6 +48,8 @@ def _event():
         n_pixel=torch.tensor([4.0, 4.0, 3.0, 5.0, 2.0]),
         norm_chi2=torch.tensor([1.0, 1.2, 0.9, 1.1, 2.0]),
         pt_error=torch.tensor([0.01, 0.02, 0.03, 0.04, 0.05]),
+        cov_phi_phi=torch.tensor([0.001, 0.002, 0.003, 0.004, 0.005]),
+        cov_lambda_lambda=torch.tensor([0.0011, 0.0021, 0.0031, 0.0041, 0.0051]),
     )
 
 
@@ -327,7 +334,8 @@ def _features(ev, couples, pool, gt_sorted=None):
         couples, pool, lorentz=ev["lorentz"], charge=ev["charge"],
         eta=ev["eta"], phi=ev["phi"], dz=ev["dz"], dxy_sig=ev["dxy_sig"],
         dca_sig=ev["dca_sig"], n_pixel=ev["n_pixel"], norm_chi2=ev["norm_chi2"],
-        pt_error=ev["pt_error"], gt_sorted=gt_sorted,
+        pt_error=ev["pt_error"], cov_phi_phi=ev["cov_phi_phi"],
+        cov_lambda_lambda=ev["cov_lambda_lambda"], gt_sorted=gt_sorted,
     )
 
 
@@ -337,7 +345,7 @@ def test_candidate_features_shape_and_gate4_columns():
     pool = torch.arange(5)
     X, names, is_gt, cr = _features(ev, couples, pool)
     assert names == FEATURE_NAMES
-    assert X.shape[1] == len(FEATURE_NAMES) == 24
+    assert X.shape[1] == len(FEATURE_NAMES) == 89
     assert X.shape[0] == cr.shape[0] == is_gt.shape[0]
     # Columns 0:4 reproduce the gate quantities.
     q = triplet_gate_quantities(couples, pool, lorentz=ev["lorentz"], charge=ev["charge"],
@@ -382,6 +390,54 @@ def test_candidate_features_new_columns_manual():
     rows = [0, 1, 2]
     pt_ijk = torch.sqrt(p4[0, rows].sum() ** 2 + p4[1, rows].sum() ** 2)
     assert torch.allclose(X[0, idx["pt_frac_k"]], torch.tensor(0.9) / pt_ijk, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Per-track (i,j,k) blocks + couple-unit physics block
+# ---------------------------------------------------------------------------
+
+def test_feature_blocks_layout():
+    assert FEATURE_NAMES == RICH_NAMES + TRACK_I_NAMES + TRACK_J_NAMES + TRACK_K_NAMES + COUPLE_UNIT_NAMES
+    assert len(RICH_NAMES) == 24
+    assert len(TRACK_I_NAMES) == len(TRACK_J_NAMES) == len(TRACK_K_NAMES) == 16
+    assert len(COUPLE_UNIT_NAMES) == 17
+    assert len(FEATURE_NAMES) == 89
+    assert GATE4_NAMES == FEATURE_NAMES[:4]
+    assert TRACK_I_NAMES[0] == "ti_px" and TRACK_K_NAMES[5] == "tk_charge"
+
+
+def test_track16_block_manual():
+    ev = _event()
+    X, names, _, _ = _features(ev, torch.tensor([[0, 1]]), torch.tensor([2]))
+    idx = {n: c for c, n in enumerate(names)}
+    # track_i = track 0
+    assert torch.allclose(X[0, idx["ti_px"]], torch.tensor(1.0) * math.cos(0.05), atol=1e-5)
+    assert torch.allclose(X[0, idx["ti_pt"]], torch.tensor(1.0), atol=1e-5)
+    assert torch.allclose(X[0, idx["ti_rel_pt_err"]], torch.tensor(0.01 / 1.0), atol=1e-5)
+    # track_j = track 1
+    assert torch.allclose(X[0, idx["tj_rel_pt_err"]], torch.tensor(0.02 / 1.2), atol=1e-5)
+    assert X[0, idx["tj_charge"]].item() == 1.0
+    # track_k = track 2
+    assert X[0, idx["tk_charge"]].item() == -1.0
+    assert torch.allclose(X[0, idx["tk_pt"]], torch.tensor(0.9), atol=1e-5)
+    assert torch.allclose(X[0, idx["tk_dz_sig"]], torch.tensor(0.22), atol=1e-5)
+    assert torch.allclose(X[0, idx["tk_cov_lambda_lambda"]], torch.tensor(0.0031), atol=1e-6)
+    assert torch.allclose(X[0, idx["tk_cov_phi_phi"]], torch.tensor(0.003), atol=1e-6)
+
+
+def test_couple_unit_features_manual():
+    ev = _event()
+    X, names, _, _ = _features(ev, torch.tensor([[0, 1]]), torch.tensor([2]))
+    idx = {n: c for c, n in enumerate(names)}
+    # couple (0,1): both +1
+    assert X[0, idx["charge_prod"]].item() == 1.0
+    assert torch.allclose(X[0, idx["dz_diff"]], torch.tensor(0.05), atol=1e-5)
+    assert torch.allclose(X[0, idx["cpl_deta"]], torch.tensor(0.10 - 0.15), atol=1e-5)
+    assert torch.allclose(X[0, idx["dca_sum"]], torch.tensor(1.0 + 1.1), atol=1e-5)
+    m_ij = _np_mass(ev["lorentz"].numpy(), 0, 1)
+    assert torch.allclose(X[0, idx["ln_m2"]], torch.tensor(math.log(m_ij ** 2)), atol=1e-4)
+    rho_ind = math.exp(-0.5 * ((m_ij - RHO_MASS_GEV) / RHO_SIGMA_GEV) ** 2)
+    assert torch.allclose(X[0, idx["rho_ind"]], torch.tensor(rho_ind), atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

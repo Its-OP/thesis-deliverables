@@ -10,12 +10,17 @@ import pyarrow.parquet as pq
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.tree import DecisionTreeClassifier, export_text
 
-from utils.triplet_join import FEATURE_NAMES, GATE4_NAMES
+from utils.triplet_join import FEATURE_NAMES, GATE4_NAMES, RICH_NAMES
 
 POOLS = ["P2"]
 FLOORS = [0.99, 0.97, 0.95]
-FEATURESETS = {"rich": FEATURE_NAMES, "gate4": GATE4_NAMES}
+FEATURESETS = {"gate4": GATE4_NAMES, "rich": RICH_NAMES, "full": FEATURE_NAMES}
+MODEL_NAMES = ["tree", "gbdt", "gbdt8"]
+REPORT_KEYS = [f"{m}-{fs}" for fs in ["rich", "full", "gate4"] for m in MODEL_NAMES]
 BLUE, CRIMSON, GREEN, BLACK = "#4466CC", "#AA3355", "#229977", "#222222"
+ORANGE = "#DD8800"
+MODEL_COLOR = {"tree": BLUE, "gbdt": GREEN, "gbdt8": ORANGE}
+FS_STYLE = {"rich": "-", "full": ":", "gate4": "--"}
 EVAL = os.path.join(os.path.dirname(__file__), "..", "..", "data", "low-pt", "eval")
 REPORTS = os.path.join(os.path.dirname(__file__), "..", "..", "reports")
 MODELS = os.path.join(os.path.dirname(__file__), "..", "..", "models")
@@ -28,8 +33,10 @@ def _cols(table, names):
 def _models():
     return {
         "tree": DecisionTreeClassifier(max_depth=6, class_weight="balanced", random_state=0),
-        "gbdt": HistGradientBoostingClassifier(max_depth=6, learning_rate=0.1,
+        "gbdt": HistGradientBoostingClassifier(max_leaf_nodes=31, max_depth=6, learning_rate=0.1,
                                                max_iter=200, class_weight="balanced", random_state=0),
+        "gbdt8": HistGradientBoostingClassifier(max_leaf_nodes=63, max_depth=8, learning_rate=0.1,
+                                                max_iter=300, class_weight="balanced", random_state=0),
     }
 
 
@@ -88,7 +95,7 @@ def main():
                              meta[pool]["recon"], meta[pool]["n_full"])
                 curves[pool][f"{m_name}-{fs_name}"] = pts
                 joblib.dump(model, os.path.join(MODELS, f"third_pion_filter_{m_name}_{fs_name}_{pool}.joblib"))
-                if fs_name == "rich" and m_name == "tree":
+                if fs_name == "full" and m_name == "tree":
                     importances[pool] = dict(sorted(zip(fs, model.feature_importances_),
                                                     key=lambda kv: -kv[1]))
                     tree_text[pool] = export_text(model, feature_names=list(fs), max_depth=2)
@@ -107,16 +114,14 @@ def _plot(curves, manual, path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    styles = {"tree-rich": (BLUE, "-"), "gbdt-rich": (GREEN, "-"),
-              "tree-gate4": (BLUE, "--"), "gbdt-gate4": (GREEN, "--")}
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), sharey=True)
     for ax, pool in zip(axes, POOLS):
         for key, pts in curves[pool].items():
             pts = sorted(pts)
             rec = [p[0] for p in pts]
             fac = [1.0 / p[1] if p[1] > 0 else np.nan for p in pts]
-            c, ls = styles[key]
-            ax.plot(rec, fac, ls, color=c, label=key, lw=1.8)
+            model_name, fs_name = key.split("-")
+            ax.plot(rec, fac, FS_STYLE[fs_name], color=MODEL_COLOR[model_name], label=key, lw=1.8)
         mf = _manual_front(manual, pool)
         if mf:
             ax.plot([r for r, _ in mf], [1.0 / x for _, x in mf], "-o", color=CRIMSON, ms=3, label="manual Pareto")
@@ -140,22 +145,22 @@ def _write_outputs(curves, manual, importances, tree_text, out_dir, n_train):
     lines = ["# Learned Soft-Filter — Held-out Test Frontier (tree vs manual)", "",
              f"Training rows: {n_train}. Held-out test; recall exact from GT candidates, compression from subsample.", ""]
     for pool in POOLS:
-        lines += [f"## Pool {pool}", "",
-                  "| floor | manual× | tree-rich× | gbdt-rich× | tree-gate4× | gbdt-gate4× |",
-                  "|---|---|---|---|---|---|"]
+        header = "| floor | manual× | " + " | ".join(f"{k}×" for k in REPORT_KEYS) + " |"
+        sep = "|" + "---|" * (2 + len(REPORT_KEYS))
+        lines += [f"## Pool {pool}", "", header, sep]
         summary[pool] = {}
         for f in FLOORS:
             man = _factor_at_floor([(r, x) for r, x in _manual_front(manual, pool)], f) if manual else None
             row = [f"{f}"]
             row.append(f"{man:.1f}" if man else "—")
-            for key in ["tree-rich", "gbdt-rich", "tree-gate4", "gbdt-gate4"]:
+            for key in REPORT_KEYS:
                 fac = _factor_at_floor(curves[pool][key], f)
                 row.append(f"{fac:.1f}" if fac else "—")
                 summary[pool].setdefault(key, {})[f] = fac
             lines.append("| " + " | ".join(row) + " |")
         lines.append("")
-        lines.append(f"**Top features (tree-rich, {pool}):** "
-                     + ", ".join(f"{k} {v:.2f}" for k, v in list(importances[pool].items())[:8]))
+        lines.append(f"**Top features (tree-full, {pool}):** "
+                     + ", ".join(f"{k} {v:.2f}" for k, v in list(importances[pool].items())[:10]))
         lines += ["", "```", tree_text[pool].strip(), "```", ""]
     path_md = os.path.join(out_dir, "triplet_filter_tree_20260628.md")
     with open(path_md, "w") as fh:

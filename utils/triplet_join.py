@@ -4,7 +4,14 @@ import math
 
 import torch
 
-from utils.couple_features import M_TAU_GEV, RHO_MASS_GEV
+from utils.couple_features import (
+    A1_MASS_GEV,
+    A1_WIDTH_GEV,
+    M_TAU_GEV,
+    RHO_MASS_GEV,
+    RHO_SIGMA_GEV,
+    RHO_WIDTH_GEV,
+)
 
 PION_MASS_GEV = 0.13957
 
@@ -78,13 +85,111 @@ def _pt(lorentz, *index_groups):
     return torch.sqrt(summed[0] ** 2 + summed[1] ** 2)
 
 
-FEATURE_NAMES = [
+RICH_NAMES = [
     "dz_dist", "dr_min", "m_ijk", "rho_dist",
     "couple_rank", "is_same_sign", "m_ij", "pt_ij",
     "pt_k", "abs_eta_k", "dz_sig_k", "dxy_sig_k", "dca_sig_k", "n_pixel_k", "norm_chi2_k", "rel_pt_err_k",
     "m_ik", "m_jk", "dr_ij", "dr_ik", "dr_jk", "pt_frac_k", "dz_spread", "pt_ijk",
 ]
+
+# Per-track 16-block: raw analogue of couple_features.py Block 1 (standardization dropped —
+# trees are scale-invariant). Emitted for tracks i, j (the couple) and k (the third track).
+TRACK16_NAMES = [
+    "px", "py", "pz", "eta", "phi", "charge", "dxy_sig", "dz_sig",
+    "norm_chi2", "pt_error", "n_pixel", "dca_sig", "cov_phi_phi", "cov_lambda_lambda",
+    "pt", "rel_pt_err",
+]
+TRACK_I_NAMES = [f"ti_{name}" for name in TRACK16_NAMES]
+TRACK_J_NAMES = [f"tj_{name}" for name in TRACK16_NAMES]
+TRACK_K_NAMES = [f"tk_{name}" for name in TRACK16_NAMES]
+
+# Couple-unit physics: couple_features.py Blocks 2+3(new)+5, treating the couple as a unit
+# (no per-track split, no cascade scores). All derived from raw inputs.
+COUPLE_UNIT_NAMES = [
+    "ln_kt", "ln_z", "ln_dr", "ln_m2", "charge_prod", "dz_diff", "rho_ind", "rho_os",
+    "dxy_phi", "lorentz_dot", "cpl_deta", "cpl_dphi", "kalman", "dca_sum", "helicity",
+    "logbw_rho", "logbw_a1",
+]
+
+FEATURE_NAMES = RICH_NAMES + TRACK_I_NAMES + TRACK_J_NAMES + TRACK_K_NAMES + COUPLE_UNIT_NAMES
 GATE4_NAMES = FEATURE_NAMES[:4]
+
+
+def _track16(idx, *, lorentz, charge, eta, phi, dxy_sig, dz, norm_chi2,
+             pt_error, n_pixel, dca_sig, cov_phi_phi, cov_lambda_lambda):
+    # Raw per-track block in TRACK16_NAMES order for the tracks selected by idx (M,).
+    px, py, pz = lorentz[0, idx], lorentz[1, idx], lorentz[2, idx]
+    pt = torch.sqrt(px ** 2 + py ** 2)
+    columns = [
+        px, py, pz, eta[idx], phi[idx], charge[idx], dxy_sig[idx], dz[idx],
+        norm_chi2[idx], pt_error[idx], n_pixel[idx], dca_sig[idx],
+        cov_phi_phi[idx], cov_lambda_lambda[idx], pt,
+        pt_error[idx] / torch.clamp_min(pt, 1e-6),
+    ]
+    return torch.stack(columns, dim=1)
+
+
+def _log_bw(m_squared, m_res, width):
+    numerator = m_res ** 2 * width ** 2
+    denominator = (m_squared - m_res ** 2) ** 2 + m_res ** 2 * width ** 2
+    return math.log(numerator) - torch.log(torch.clamp_min(denominator, 1e-20))
+
+
+def _couple_unit(i, j, *, lorentz, charge, eta, phi, dz, dxy_sig, dca_sig,
+                 cov_phi_phi, cov_lambda_lambda):
+    # Couple-unit physics in COUPLE_UNIT_NAMES order. Formulas ported from
+    # couple_features.build_couple_feature_vector (Blocks 2, 3, v3), computed from raw inputs.
+    px_i, py_i, pz_i, e_i = lorentz[0, i], lorentz[1, i], lorentz[2, i], lorentz[3, i]
+    px_j, py_j, pz_j, e_j = lorentz[0, j], lorentz[1, j], lorentz[2, j], lorentz[3, j]
+
+    sum_px, sum_py, sum_pz, sum_e = px_i + px_j, py_i + py_j, pz_i + pz_j, e_i + e_j
+    m_squared = sum_e ** 2 - sum_px ** 2 - sum_py ** 2 - sum_pz ** 2
+    m_ij = torch.sqrt(torch.clamp_min(m_squared, 1e-10))
+    ln_m2 = torch.log(torch.clamp_min(m_squared, 1e-10))
+
+    pt_i = torch.sqrt(px_i ** 2 + py_i ** 2 + 1e-10)
+    pt_j = torch.sqrt(px_j ** 2 + py_j ** 2 + 1e-10)
+    pt_min = torch.minimum(pt_i, pt_j)
+    pt_sum = pt_i + pt_j
+
+    delta_eta = eta[i] - eta[j]
+    delta_phi = (phi[i] - phi[j] + math.pi) % (2 * math.pi) - math.pi
+    delta_r = torch.sqrt(delta_eta ** 2 + delta_phi ** 2 + 1e-10)
+
+    ln_kt = torch.log(torch.clamp_min(pt_min * delta_r, 1e-10))
+    ln_z = torch.log(torch.clamp_min(pt_min / torch.clamp_min(pt_sum, 1e-10), 1e-10))
+    ln_dr = torch.log(torch.clamp_min(delta_r, 1e-10))
+
+    charge_prod = charge[i] * charge[j]
+    dz_diff = (dz[i] - dz[j]).abs()
+    rho_ind = torch.exp(-0.5 * ((m_ij - RHO_MASS_GEV) / RHO_SIGMA_GEV) ** 2)
+    rho_os = (charge_prod < 0).float() * rho_ind
+
+    dxy_diff = (dxy_sig[i] - dxy_sig[j]).abs()
+    sin_half_dphi = torch.abs(torch.sin(delta_phi / 2.0))
+    dxy_phi = dxy_diff / torch.clamp_min(2.0 * sin_half_dphi, 0.05)
+    lorentz_dot = e_i * e_j - px_i * px_j - py_i * py_j - pz_i * pz_j
+
+    kalman = (torch.log(torch.clamp_min(cov_phi_phi[i], 1e-10))
+              + torch.log(torch.clamp_min(cov_phi_phi[j], 1e-10))
+              + torch.log(torch.clamp_min(cov_lambda_lambda[i], 1e-10))
+              + torch.log(torch.clamp_min(cov_lambda_lambda[j], 1e-10)))
+    dca_sum = dca_sig[i] + dca_sig[j]
+
+    sum_p_mag = torch.sqrt(sum_px ** 2 + sum_py ** 2 + sum_pz ** 2 + 1e-10)
+    pi_mag = torch.sqrt(px_i ** 2 + py_i ** 2 + pz_i ** 2 + 1e-10)
+    helicity = (px_i * sum_px + py_i * sum_py + pz_i * sum_pz) / (pi_mag * sum_p_mag)
+
+    m_squared_safe = torch.clamp_min(m_ij ** 2, 1e-8)
+    logbw_rho = _log_bw(m_squared_safe, RHO_MASS_GEV, RHO_WIDTH_GEV)
+    logbw_a1 = _log_bw(m_squared_safe, A1_MASS_GEV, A1_WIDTH_GEV)
+
+    columns = [
+        ln_kt, ln_z, ln_dr, ln_m2, charge_prod, dz_diff, rho_ind, rho_os,
+        dxy_phi, lorentz_dot, delta_eta, delta_phi, kalman, dca_sum, helicity,
+        logbw_rho, logbw_a1,
+    ]
+    return torch.stack(columns, dim=1)
 
 
 def build_triplet_candidates(
@@ -170,9 +275,11 @@ def triplet_gate_quantities(
     return result
 
 
-def triplet_candidate_features(
-    couples: torch.Tensor,
-    pool: torch.Tensor,
+def triplet_feature_columns(
+    i: torch.Tensor,
+    j: torch.Tensor,
+    k: torch.Tensor,
+    couple_rank: torch.Tensor,
     *,
     lorentz: torch.Tensor,
     charge: torch.Tensor,
@@ -184,20 +291,14 @@ def triplet_candidate_features(
     n_pixel: torch.Tensor,
     norm_chi2: torch.Tensor,
     pt_error: torch.Tensor,
-    gt_sorted: tuple[int, int, int] | None = None,
-) -> tuple[torch.Tensor, list[str], torch.Tensor, torch.Tensor]:
-    """couples: (C, 2) long. pool: (P,) long. lorentz: (4, N). per-track inputs: (N,).
+    cov_phi_phi: torch.Tensor,
+    cov_lambda_lambda: torch.Tensor,
+) -> torch.Tensor:
+    """i, j, k, couple_rank: (M,) long. lorentz: (4, N). per-track inputs: (N,).
 
-    Per Tier-H-surviving candidate: (X (M_H, 24) features in FEATURE_NAMES order,
-    FEATURE_NAMES, is_gt (M_H,), couple_row (M_H,)). Columns 0:4 equal triplet_gate_quantities.
+    Returns (M, 89) features in FEATURE_NAMES order for the given candidates.
     """
-    track_i, track_j, track_k, couple_row, base = _enumerate(couples, pool)
-    h_keep = base.clone()
-    h_keep &= (charge[track_i] + charge[track_j] + charge[track_k]).abs().round() == 1
-    h_keep &= _mass(lorentz, track_i, track_j, track_k) <= M_TAU_GEV
-
-    i, j, k = track_i[h_keep], track_j[h_keep], track_k[h_keep]
-    cr = couple_row[h_keep]
+    cr = couple_rank
     dz_ij = (dz[i] - dz[j]).abs()
     dz_ik = (dz[i] - dz[k]).abs()
     dz_jk = (dz[j] - dz[k]).abs()
@@ -229,7 +330,56 @@ def triplet_candidate_features(
         torch.maximum(torch.maximum(dz_ij, dz_ik), dz_jk),
         pt_ijk,
     ]
-    features = torch.stack(columns, dim=1)
+    track_kw = dict(lorentz=lorentz, charge=charge, eta=eta, phi=phi, dxy_sig=dxy_sig,
+                    dz=dz, norm_chi2=norm_chi2, pt_error=pt_error, n_pixel=n_pixel,
+                    dca_sig=dca_sig, cov_phi_phi=cov_phi_phi, cov_lambda_lambda=cov_lambda_lambda)
+    return torch.cat([
+        torch.stack(columns, dim=1),
+        _track16(i, **track_kw),
+        _track16(j, **track_kw),
+        _track16(k, **track_kw),
+        _couple_unit(i, j, lorentz=lorentz, charge=charge, eta=eta, phi=phi, dz=dz,
+                     dxy_sig=dxy_sig, dca_sig=dca_sig, cov_phi_phi=cov_phi_phi,
+                     cov_lambda_lambda=cov_lambda_lambda),
+    ], dim=1)
+
+
+def triplet_candidate_features(
+    couples: torch.Tensor,
+    pool: torch.Tensor,
+    *,
+    lorentz: torch.Tensor,
+    charge: torch.Tensor,
+    eta: torch.Tensor,
+    phi: torch.Tensor,
+    dz: torch.Tensor,
+    dxy_sig: torch.Tensor,
+    dca_sig: torch.Tensor,
+    n_pixel: torch.Tensor,
+    norm_chi2: torch.Tensor,
+    pt_error: torch.Tensor,
+    cov_phi_phi: torch.Tensor,
+    cov_lambda_lambda: torch.Tensor,
+    gt_sorted: tuple[int, int, int] | None = None,
+) -> tuple[torch.Tensor, list[str], torch.Tensor, torch.Tensor]:
+    """couples: (C, 2) long. pool: (P,) long. lorentz: (4, N). per-track inputs: (N,).
+
+    Per Tier-H-surviving candidate: (X (M_H, 89) features in FEATURE_NAMES order,
+    FEATURE_NAMES, is_gt (M_H,), couple_row (M_H,)). Columns 0:4 equal triplet_gate_quantities;
+    the RICH_NAMES block (24) is followed by ti/tj/tk 16-blocks and the couple-unit block (17).
+    """
+    track_i, track_j, track_k, couple_row, base = _enumerate(couples, pool)
+    h_keep = base.clone()
+    h_keep &= (charge[track_i] + charge[track_j] + charge[track_k]).abs().round() == 1
+    h_keep &= _mass(lorentz, track_i, track_j, track_k) <= M_TAU_GEV
+
+    i, j, k = track_i[h_keep], track_j[h_keep], track_k[h_keep]
+    cr = couple_row[h_keep]
+    features = triplet_feature_columns(
+        i, j, k, cr, lorentz=lorentz, charge=charge, eta=eta, phi=phi, dz=dz,
+        dxy_sig=dxy_sig, dca_sig=dca_sig, n_pixel=n_pixel, norm_chi2=norm_chi2,
+        pt_error=pt_error, cov_phi_phi=cov_phi_phi, cov_lambda_lambda=cov_lambda_lambda,
+    )
 
     if gt_sorted is not None:
         sorted_rows = torch.stack([i, j, k], dim=1).sort(dim=1).values

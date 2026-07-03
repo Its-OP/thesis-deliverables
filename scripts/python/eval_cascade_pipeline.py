@@ -27,6 +27,8 @@ from weaver.utils.dataset import SimpleIterDataset
 
 logger = logging.getLogger('eval_cascade_pipeline')
 
+# Score columns are parallel to their index columns: stageN_scores[m] is the score of
+# stageN_sorted_indices[m] (stage3_couple_scores[m] of stage3_sorted_couples[m]), descending.
 OUTPUT_SCHEMA = pa.schema([
     pa.field('event_run', pa.int32()),
     pa.field('event_id', pa.int64()),
@@ -37,6 +39,9 @@ OUTPUT_SCHEMA = pa.schema([
     pa.field('stage1_sorted_indices', pa.list_(pa.int32())),
     pa.field('stage2_sorted_indices', pa.list_(pa.int32())),
     pa.field('stage3_sorted_couples', pa.list_(pa.list_(pa.int32()))),
+    pa.field('stage1_scores', pa.list_(pa.float32())),
+    pa.field('stage2_scores', pa.list_(pa.float32())),
+    pa.field('stage3_couple_scores', pa.list_(pa.float32())),
 ])
 
 
@@ -133,14 +138,22 @@ def _evaluate_batch(
     s1_sorted = torch.argsort(s1_masked, dim=1, descending=True)
     batch_size = s1_scores.size(0)
 
+    def _stage1_row(b):
+        n_valid = int(valid_mask[b].sum())
+        sorted_indices = s1_sorted[b, :n_valid]
+        return {
+            'stage1_sorted_indices': sorted_indices.tolist(),
+            'stage1_scores': s1_masked[b, sorted_indices].tolist(),
+        }
+
     if stage == 'stage1':
         return [
             {
-                'stage1_sorted_indices': s1_sorted[
-                    b, :int(valid_mask[b].sum())
-                ].tolist(),
+                **_stage1_row(b),
                 'stage2_sorted_indices': [],
                 'stage3_sorted_couples': [],
+                'stage2_scores': [],
+                'stage3_couple_scores': [],
             }
             for b in range(batch_size)
         ]
@@ -156,16 +169,20 @@ def _evaluate_batch(
     s2_sorted_k1 = torch.argsort(s2_scores, dim=1, descending=True)
     s2_sorted_orig = selected_k1.gather(1, s2_sorted_k1)
 
+    def _stage2_row(b):
+        n_valid_k1 = int(torch.isfinite(s2_scores[b]).sum())
+        return {
+            'stage2_sorted_indices': s2_sorted_orig[b, :n_valid_k1].tolist(),
+            'stage2_scores': s2_scores[b, s2_sorted_k1[b, :n_valid_k1]].tolist(),
+        }
+
     if stage == 'part':
         return [
             {
-                'stage1_sorted_indices': s1_sorted[
-                    b, :int(valid_mask[b].sum())
-                ].tolist(),
-                'stage2_sorted_indices': s2_sorted_orig[
-                    b, :int(torch.isfinite(s2_scores[b]).sum())
-                ].tolist(),
+                **_stage1_row(b),
+                **_stage2_row(b),
                 'stage3_sorted_couples': [],
+                'stage3_couple_scores': [],
             }
             for b in range(batch_size)
         ]
@@ -195,7 +212,6 @@ def _evaluate_batch(
 
     rows = []
     for b in range(batch_size):
-        n_valid_k1 = int(torch.isfinite(s2_scores[b]).sum())
         scores_b = s3_scores[b].clone()
         scores_b[~couple_inputs['filter_a_mask'][b]] = float('-inf')
         order = torch.argsort(scores_b, descending=True)[:num_couples]
@@ -204,11 +220,10 @@ def _evaluate_batch(
         i_orig = k2_orig[b, upper_i[order]].tolist()
         j_orig = k2_orig[b, upper_j[order]].tolist()
         rows.append({
-            'stage1_sorted_indices': s1_sorted[
-                b, :int(valid_mask[b].sum())
-            ].tolist(),
-            'stage2_sorted_indices': s2_sorted_orig[b, :n_valid_k1].tolist(),
+            **_stage1_row(b),
+            **_stage2_row(b),
             'stage3_sorted_couples': [[i, j] for i, j in zip(i_orig, j_orig)],
+            'stage3_couple_scores': scores_b[order].tolist(),
         })
     return rows
 
