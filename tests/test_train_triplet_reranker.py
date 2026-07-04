@@ -202,6 +202,49 @@ def test_evaluate_parallel_loader_matches_reference(real_artifact):
         assert workers[key] == value, f'workers {key}: {workers[key]} != {value}'
 
 
+def test_trainer_hierarchical_weaver_track_blocks_warm_start_fidelity(real_artifact, tmp_path):
+    import torch
+    import train_triplet_reranker
+    from train_triplet_reranker import main as train_main
+    from weaver.nn.model.TripletReranker import TripletReranker
+
+    couple_checkpoint_path = os.path.join(_DELIVERABLES, 'models', 'couple_reranker_best.pt')
+    experiments = str(tmp_path / 'experiments_weaver')
+    train_main([
+        '--candidates', os.path.join(real_artifact, 'candidates_val.parquet'),
+        '--tracks', os.path.join(real_artifact, 'tracks_val.parquet'),
+        '--norm-stats', os.path.join(real_artifact, 'norm_stats.json'),
+        '--experiments-dir', experiments,
+        '--input-mode', 'hierarchical',
+        '--weaver-track-blocks',
+        '--warm-start-projector', couple_checkpoint_path,
+        '--tau', '0.0',
+        '--epochs', '1',
+        '--batch-size', '4',
+        '--num-negatives', '10',
+        '--device', 'cpu',
+        '--norm-stats-events', '20',
+    ])
+    run_dirs = glob.glob(os.path.join(experiments, '*'))
+    assert len(run_dirs) == 1
+    checkpoint_path = os.path.join(run_dirs[0], 'checkpoints', 'best_model.pt')
+    assert os.path.exists(checkpoint_path)
+
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    assert checkpoint['args']['weaver_track_blocks'] is True
+
+    # Rebuild a FRESH (untrained) model and warm-start it again: the trained
+    # checkpoint's own projector weights have moved under gradient steps, so they
+    # cannot be compared directly against the couple checkpoint.
+    fresh_model = TripletReranker(input_mode='hierarchical', projector_dim=32,
+                                  feature_names=checkpoint['feature_names'])
+    train_triplet_reranker._warm_start_projector(fresh_model, couple_checkpoint_path)
+
+    couple_checkpoint = torch.load(couple_checkpoint_path, map_location='cpu', weights_only=False)
+    expected_weight = couple_checkpoint['couple_reranker_state_dict']['couple_projector.0.weight']
+    torch.testing.assert_close(fresh_model.track_projector[0].weight, expected_weight)
+
+
 def test_trainer_resume_continues_epochs(real_artifact, tmp_path):
     from train_triplet_reranker import main as train_main
 

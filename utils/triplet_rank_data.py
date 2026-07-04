@@ -269,7 +269,7 @@ class TripletRankDataset(Dataset):
     def __init__(self, candidates_path: str, tracks_path: str, *, tau: float,
                  score_column: str = 'gbdt6_score', num_negatives: int = 50,
                  mode: str = 'train', norm_stats: dict | None = None, seed: int = 0,
-                 extra_features: str = 'none'):
+                 extra_features: str = 'none', weaver_track_blocks: bool = False):
         assert mode in ('train', 'eval')
         self.table = _EventTable(candidates_path, tracks_path)
         self.tau = tau
@@ -279,6 +279,17 @@ class TripletRankDataset(Dataset):
         self.norm_stats = norm_stats
         self.generator = np.random.default_rng(seed)
         self.feature_names = resolve_feature_names(self.table, extra_features)
+        self.weaver_track_blocks = weaver_track_blocks
+        if weaver_track_blocks:
+            self.track16_params = load_track16_params()
+            self.track_block_columns = torch.tensor(
+                [index for index, name in enumerate(self.feature_names)
+                 if name.startswith(('ti_', 'tj_', 'tk_'))], dtype=torch.long)
+            assert self.track_block_columns.numel() == 48, (
+                f'expected 48 ti_/tj_/tk_ feature columns, found '
+                f'{self.track_block_columns.numel()}')
+            self.track_block_mask = torch.zeros(len(self.feature_names), dtype=torch.bool)
+            self.track_block_mask[self.track_block_columns] = True
 
         scores = self.table.candidates[score_column]
         flat_survive = np.asarray(scores.values) >= tau
@@ -318,8 +329,22 @@ class TripletRankDataset(Dataset):
 
         features, i, j, k = build_candidate_features(
             self.table, int(r), arrays, selected, self.feature_names)
+        if self.weaver_track_blocks:
+            kw = self.table.track_kw(int(r))
+            pt = torch.sqrt(kw['lorentz'][0] ** 2 + kw['lorentz'][1] ** 2)
+            track16 = track16_std(
+                pt=pt, eta=kw['eta'], phi=kw['phi'], charge=kw['charge'],
+                dxy_sig=kw['dxy_sig'], dz_sig=kw['dz'], norm_chi2=kw['norm_chi2'],
+                pt_error=kw['pt_error'], n_pixel=kw['n_pixel'], dca_sig=kw['dca_sig'],
+                cov_phi_phi=kw['cov_phi_phi'], cov_lambda_lambda=kw['cov_lambda_lambda'],
+                params=self.track16_params)
+            features[:, self.track_block_columns] = torch.cat(
+                [track16[i], track16[j], track16[k]], dim=1)
         if self.norm_stats is not None:
-            features = standardize_features(features, self.feature_names, self.norm_stats)
+            standardized = standardize_features(features, self.feature_names, self.norm_stats)
+            if self.weaver_track_blocks:
+                standardized = torch.where(self.track_block_mask, features, standardized)
+            features = standardized
         item = {'features': features, 'pos_mask': torch.from_numpy(pos_mask)}
         if self.mode == 'eval':
             item['keys'] = torch.stack([i, j, k], dim=1).sort(dim=1).values

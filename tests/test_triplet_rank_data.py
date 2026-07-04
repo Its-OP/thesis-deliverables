@@ -12,7 +12,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts', 'python'))
 
-from utils.triplet_join import FEATURE_NAMES
+from utils.triplet_join import FEATURE_NAMES, build_track_lorentz
 from utils.triplet_rank_data import (
     CASCADE_EXTRA_NAMES,
     GBDT_EXTRA_NAMES,
@@ -358,3 +358,91 @@ def test_collate_triplet_rank_eval_carries_keys_and_counts(tmp_path):
     assert len(batch['keys']) == 2
     torch.testing.assert_close(batch['keys'][0], items[0]['keys'])
     torch.testing.assert_close(batch['keys'][1], items[1]['keys'])
+
+
+def _expected_track16_for_event(tracks_path, event_index):
+    # Mirrors the dataset's own pt reconstruction (sqrt(px^2+py^2) off the Lorentz
+    # vector, not the raw track_pt column) so track16_std sees identical inputs.
+    track_row = pq.read_table(tracks_path).slice(event_index, 1).to_pylist()[0]
+    column = lambda name: torch.tensor(track_row[name], dtype=torch.float32)
+    lorentz = build_track_lorentz(column('track_pt'), column('track_eta'), column('track_phi'))
+    reconstructed_pt = torch.sqrt(lorentz[0] ** 2 + lorentz[1] ** 2)
+    params = load_track16_params()
+    return track16_std(
+        pt=reconstructed_pt, eta=column('track_eta'), phi=column('track_phi'),
+        charge=column('track_charge'), dxy_sig=column('track_dxy_significance'),
+        dz_sig=column('track_dz_significance'), norm_chi2=column('track_norm_chi2'),
+        pt_error=column('track_pt_error'), n_pixel=column('track_n_valid_pixel_hits'),
+        dca_sig=column('track_dca_significance'),
+        cov_phi_phi=column('track_covariance_phi_phi'),
+        cov_lambda_lambda=column('track_covariance_lambda_lambda'),
+        params=params,
+    )
+
+
+def _feature_columns_with_prefix(feature_names, prefix):
+    return [index for index, name in enumerate(feature_names) if name.startswith(prefix)]
+
+
+def test_weaver_track_blocks_matches_track16_std_and_shields_other_columns(tmp_path):
+    candidates_path, tracks_path, raw = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    weaver_dataset = TripletRankDataset(
+        candidates_path, tracks_path, tau=0.0, mode='eval', extra_features='all',
+        weaver_track_blocks=True)
+    baseline_dataset = TripletRankDataset(
+        candidates_path, tracks_path, tau=0.0, mode='eval', extra_features='all')
+    weaver_item = weaver_dataset[0]
+    baseline_item = baseline_dataset[0]
+
+    expected_track16 = _expected_track16_for_event(tracks_path, 0)
+    cand_i = torch.tensor(raw['cand_i'][0], dtype=torch.long)
+    cand_j = torch.tensor(raw['cand_j'][0], dtype=torch.long)
+    cand_k = torch.tensor(raw['cand_k'][0], dtype=torch.long)
+
+    feature_names = weaver_dataset.feature_names
+    ti_columns = _feature_columns_with_prefix(feature_names, 'ti_')
+    tj_columns = _feature_columns_with_prefix(feature_names, 'tj_')
+    tk_columns = _feature_columns_with_prefix(feature_names, 'tk_')
+    torch.testing.assert_close(weaver_item['features'][:, ti_columns], expected_track16[cand_i])
+    torch.testing.assert_close(weaver_item['features'][:, tj_columns], expected_track16[cand_j])
+    torch.testing.assert_close(weaver_item['features'][:, tk_columns], expected_track16[cand_k])
+
+    non_track_columns = [index for index, name in enumerate(feature_names)
+                         if not name.startswith(('ti_', 'tj_', 'tk_'))]
+    torch.testing.assert_close(weaver_item['features'][:, non_track_columns],
+                               baseline_item['features'][:, non_track_columns],
+                               rtol=0.0, atol=0.0, equal_nan=True)
+
+
+def test_weaver_track_blocks_with_norm_stats_keeps_raw_track16_values(tmp_path):
+    candidates_path, tracks_path, raw = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    names = list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES
+    stats = fit_norm_stats(candidates_path, tracks_path, feature_names=names, n_events=2, per_event=10)
+
+    weaver_dataset = TripletRankDataset(
+        candidates_path, tracks_path, tau=0.0, mode='eval', extra_features='all',
+        weaver_track_blocks=True, norm_stats=stats)
+    baseline_dataset = TripletRankDataset(
+        candidates_path, tracks_path, tau=0.0, mode='eval', extra_features='all',
+        norm_stats=stats)
+    weaver_item = weaver_dataset[0]
+    baseline_item = baseline_dataset[0]
+
+    expected_track16 = _expected_track16_for_event(tracks_path, 0)
+    cand_i = torch.tensor(raw['cand_i'][0], dtype=torch.long)
+    cand_j = torch.tensor(raw['cand_j'][0], dtype=torch.long)
+    cand_k = torch.tensor(raw['cand_k'][0], dtype=torch.long)
+
+    feature_names = weaver_dataset.feature_names
+    ti_columns = _feature_columns_with_prefix(feature_names, 'ti_')
+    tj_columns = _feature_columns_with_prefix(feature_names, 'tj_')
+    tk_columns = _feature_columns_with_prefix(feature_names, 'tk_')
+    torch.testing.assert_close(weaver_item['features'][:, ti_columns], expected_track16[cand_i])
+    torch.testing.assert_close(weaver_item['features'][:, tj_columns], expected_track16[cand_j])
+    torch.testing.assert_close(weaver_item['features'][:, tk_columns], expected_track16[cand_k])
+
+    non_track_columns = [index for index, name in enumerate(feature_names)
+                         if not name.startswith(('ti_', 'tj_', 'tk_'))]
+    torch.testing.assert_close(weaver_item['features'][:, non_track_columns],
+                               baseline_item['features'][:, non_track_columns],
+                               rtol=0.0, atol=0.0, equal_nan=True)

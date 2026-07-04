@@ -65,6 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--tau', type=float, default=None,
                         help='override the operating-point threshold')
     parser.add_argument('--input-mode', choices=('flat', 'hierarchical'), default='flat')
+    parser.add_argument('--weaver-track-blocks', action='store_true',
+                        help='weaver-standardized ti_/tj_/tk_ blocks for hierarchical '
+                             'warm-start fidelity')
     parser.add_argument('--extra-features', choices=('none', 'gbdt', 'all', 'auto'), default='auto',
                         help='inputs beyond the 89 geometry features (gbdt scores, cascade scores)')
     parser.add_argument('--loss-mode', choices=('sampled', 'full'), default='sampled')
@@ -214,7 +217,8 @@ def main(argv=None) -> None:
     train_dataset = TripletRankDataset(
         args.candidates, args.tracks, tau=tau, score_column=score_column,
         num_negatives=args.num_negatives, mode='train', seed=args.seed,
-        extra_features=args.extra_features)
+        extra_features=args.extra_features,
+        weaver_track_blocks=args.weaver_track_blocks)
     feature_names = train_dataset.feature_names
     norm_stats = _norm_stats(args, feature_names, train_events)
     train_dataset.norm_stats = norm_stats
@@ -223,7 +227,8 @@ def main(argv=None) -> None:
         eval_dataset = TripletRankDataset(
             args.eval_candidates, args.eval_tracks, tau=tau, score_column=score_column,
             mode='eval', norm_stats=norm_stats, seed=args.seed,
-            extra_features=args.extra_features)
+            extra_features=args.extra_features,
+            weaver_track_blocks=args.weaver_track_blocks)
         if eval_dataset.feature_names != feature_names:
             raise SystemExit('eval artifact resolves different feature names than the '
                              'train artifact (extra columns mismatch)')
@@ -231,7 +236,8 @@ def main(argv=None) -> None:
         eval_dataset = TripletRankDataset(
             args.candidates, args.tracks, tau=tau, score_column=score_column,
             mode='eval', norm_stats=norm_stats, seed=args.seed,
-            extra_features=args.extra_features)
+            extra_features=args.extra_features,
+            weaver_track_blocks=args.weaver_track_blocks)
 
     n_rows = train_dataset.table.num_rows
     if args.split_json:
