@@ -311,6 +311,36 @@ def test_parallel_workers_match_single_process(tmp_path):
                            parallel['track_s2'].to_pylist()):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
     assert not glob.glob(str(parallel_dir / 'candidates_val.parquet.chunk*'))
+    # Per-worker pre-sliced dump/src files (the OOM-avoidance mechanism) must not
+    # leak once the run completes.
+    assert not glob.glob(str(parallel_dir / 'candidates_val.parquet.worker_slices*'))
+
+
+@pytest.mark.skipif(
+    not (_HAVE_MODELS and os.path.exists(_DUMP) and glob.glob(_SRC_GLOB)),
+    reason='VAL dump, source parquet, or GBDT joblibs not present',
+)
+def test_worker_slices_are_small_self_contained_files(tmp_path):
+    # Each worker must read a file scoped to its OWN event range, not a zero-copy
+    # slice of the FULL dump/src (that pins the whole file's buffers in memory for
+    # the worker's lifetime -- the actual root cause of the TRAIN-scale OOM).
+    from build_triplet_rank_candidates import _load_prefix, _worker_ranges, _write_worker_slices
+
+    dump, src, n = _load_prefix(_DUMP, _SRC_GLOB, 40)
+    dump_path = str(tmp_path / 'dump.parquet')
+    src_path = str(tmp_path / 'src.parquet')
+    pq.write_table(dump, dump_path)
+    pq.write_table(src, src_path)
+
+    ranges = _worker_ranges(n, chunk_size=10, workers=4)
+    tmp_dir = str(tmp_path / 'slices')
+    os.makedirs(tmp_dir)
+    slice_paths = _write_worker_slices(dump_path, src_path.replace('src.parquet', 'src*.parquet'),
+                                       ranges, tmp_dir)
+    assert len(slice_paths) == len(ranges)
+    for (start, end), (dump_slice_path, src_slice_path) in zip(ranges, slice_paths):
+        assert pq.read_metadata(dump_slice_path).num_rows == end - start
+        assert pq.read_metadata(src_slice_path).num_rows == end - start
 
 
 @pytest.mark.skipif(

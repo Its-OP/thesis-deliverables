@@ -22,6 +22,8 @@ fi
 
 if [ -f /venv/part/bin/activate ]; then
     ACTIVATE="source /venv/part/bin/activate"
+elif [ -x /venv/part/bin/python ]; then
+    ACTIVATE="export PATH=/venv/part/bin:\${PATH}"   # venv without an activate script
 else
     if command -v conda &>/dev/null; then
         CONDA_BASE=$(conda info --base)
@@ -70,7 +72,7 @@ if screen -list 2>/dev/null | grep -q "${SESSION_TRAIN}"; then
     echo "Screen '${SESSION_TRAIN}' already running. Kill: screen -S ${SESSION_TRAIN} -X quit"
     exit 1
 fi
-screen -list 2>/dev/null | grep "\.${SESSION_GPU}" | awk '{print $1}' | while read -r s; do screen -S "$s" -X quit 2>/dev/null || true; done
+screen -list 2>/dev/null | grep "\.${SESSION_GPU}" | awk '{print $1}' | while read -r s; do screen -S "$s" -X quit 2>/dev/null || true; done || true
 
 screen -dmS "${SESSION_TRAIN}" bash -c "script -efq -c \"${TRAIN_CMD}\" ${LOG_FILE}; echo \$? > ${SENTINEL}; echo '--- finished. Enter to close. ---'; read"
 screen -dmS "${SESSION_GPU}" bash -c "watch -n 1 nvidia-smi"

@@ -121,6 +121,87 @@ def test_trainer_two_artifact_full_loss_and_final_eval(real_artifact, tmp_path):
     assert 0.0 <= final['T@10'] <= 1.0
 
 
+def test_eval_every_skips_intermediate_epochs(real_artifact, tmp_path):
+    from train_triplet_reranker import main as train_main
+
+    run_dir = str(tmp_path / 'eval_every_run')
+    train_main([
+        '--candidates', os.path.join(real_artifact, 'candidates_val.parquet'),
+        '--tracks', os.path.join(real_artifact, 'tracks_val.parquet'),
+        '--norm-stats', os.path.join(real_artifact, 'norm_stats.json'),
+        '--experiment-dir', run_dir,
+        '--tau', '0.0',
+        '--epochs', '4',
+        '--eval-every', '2',
+        '--batch-size', '4',
+        '--num-negatives', '10',
+        '--device', 'cpu',
+        '--norm-stats-events', '20',
+    ])
+    with open(os.path.join(run_dir, 'metrics_history.json')) as fh:
+        history = json.load(fh)
+    assert [entry['epoch'] for entry in history] == [0, 1, 2, 3]
+    for entry in history:
+        assert 'train_loss' in entry and 'lr' in entry
+        if entry['epoch'] in (1, 3):
+            assert 'T@10' in entry
+        else:
+            assert 'T@10' not in entry
+    assert os.path.exists(os.path.join(run_dir, 'checkpoints', 'best_model.pt'))
+    assert os.path.exists(os.path.join(run_dir, 'final_eval.json'))
+
+
+def test_evaluate_parallel_loader_matches_reference(real_artifact):
+    import numpy as np
+    import torch
+    from eval_triplet_rank_baselines import K_VALUES, deduped_gt_rank
+    from train_triplet_reranker import evaluate
+    from utils.triplet_rank_data import TripletRankDataset
+    from weaver.nn.model.TripletReranker import TripletReranker
+
+    dataset = TripletRankDataset(
+        os.path.join(real_artifact, 'candidates_val.parquet'),
+        os.path.join(real_artifact, 'tracks_val.parquet'),
+        tau=0.0, mode='eval', extra_features='auto')
+    torch.manual_seed(0)
+    model = TripletReranker(input_mode='flat', feature_names=dataset.feature_names)
+    model.eval()
+    device = torch.device('cpu')
+    event_indices = np.arange(40)
+
+    # Reference: the original unbatched per-event loop, inlined verbatim.
+    hits = {k: 0 for k in K_VALUES}
+    gt_ranks = []
+    with torch.no_grad():
+        for r in event_indices:
+            item = dataset[int(r)]
+            if item['features'].shape[0] == 0:
+                continue
+            scores = model(item['features'].T.unsqueeze(0).to(device)).squeeze(0).cpu()
+            order = torch.argsort(scores, descending=True).numpy()
+            rank = deduped_gt_rank(item['keys'].numpy()[order],
+                                   item['pos_mask'].numpy()[order])
+            if rank is None:
+                continue
+            gt_ranks.append(rank)
+            for k in K_VALUES:
+                if rank <= k:
+                    hits[k] += 1
+    reference = {f'T@{k}': hits[k] / len(event_indices) for k in K_VALUES}
+    reference['gt_rank_median'] = float(np.median(gt_ranks))
+    reference['n_gt_surviving'] = len(gt_ranks)
+
+    result = evaluate(model, dataset, event_indices, device)
+    for key, value in reference.items():
+        assert result[key] == value, f'{key}: {result[key]} != {value}'
+    assert result['n_eval_events'] == 40
+
+    # Worker processes must not change the metrics either.
+    workers = evaluate(model, dataset, event_indices, device, num_workers=2)
+    for key, value in reference.items():
+        assert workers[key] == value, f'workers {key}: {workers[key]} != {value}'
+
+
 def test_trainer_resume_continues_epochs(real_artifact, tmp_path):
     from train_triplet_reranker import main as train_main
 

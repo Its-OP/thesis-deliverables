@@ -10,7 +10,7 @@ import traceback
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, SubsetRandomSampler
+from torch.utils.data import DataLoader, Subset, SubsetRandomSampler
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts', 'python'))
 
@@ -21,6 +21,7 @@ from utils.training import build_warmup_scheduler
 from utils.triplet_rank_data import (
     TripletRankDataset,
     collate_triplet_rank,
+    collate_triplet_rank_eval,
     fit_norm_stats,
     load_norm_stats,
     save_norm_stats,
@@ -45,6 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--eval-events', type=int, default=20000,
                         help='fixed-seed eval subsample per epoch; the final eval always '
                              'runs on the full eval side')
+    parser.add_argument('--eval-batch-size', type=int, default=1,
+                        help='events per eval forward; >1 changes BatchNorm batch '
+                             'statistics and lets padding leak into them — keep 1 '
+                             'for exact per-event scoring')
+    parser.add_argument('--eval-every', type=int, default=1,
+                        help='run the per-epoch eval every Nth epoch (the last epoch '
+                             'and the final full eval always run)')
     parser.add_argument('--norm-stats', default=os.path.join(TRIPLET_RANK_DIR, 'norm_stats_train.json'))
     parser.add_argument('--norm-stats-events', type=int, default=2000)
     parser.add_argument('--split-json', default=None,
@@ -119,24 +127,36 @@ def _warm_start_projector(model: TripletReranker, checkpoint_path: str) -> None:
 
 
 @torch.no_grad()
-def evaluate(model, dataset, event_indices, device) -> dict:
+def evaluate(model, dataset, event_indices, device, *, batch_size: int = 1,
+             num_workers: int = 0) -> dict:
+    """Feature building parallelizes across `num_workers`; scoring stays exact at
+    batch_size=1 (NanSafeBatchNorm1d uses batch statistics even in eval mode, so
+    batching events together or padding would change per-candidate scores)."""
     model.eval()
+    subset = Subset(dataset, [int(r) for r in event_indices])
+    loader = DataLoader(subset, batch_size=batch_size, num_workers=num_workers,
+                        collate_fn=collate_triplet_rank_eval)
     hits = {k: 0 for k in K_VALUES}
     gt_ranks = []
-    for r in event_indices:
-        item = dataset[int(r)]
-        if item['features'].shape[0] == 0:
+    for batch in loader:
+        counts = batch['counts']
+        if int(counts.max()) == 0:
             continue
-        scores = model(item['features'].T.unsqueeze(0).to(device)).squeeze(0).cpu()
-        order = torch.argsort(scores, descending=True).numpy()
-        rank = deduped_gt_rank(item['keys'].numpy()[order],
-                               item['pos_mask'].numpy()[order])
-        if rank is None:
-            continue
-        gt_ranks.append(rank)
-        for k in K_VALUES:
-            if rank <= k:
-                hits[k] += 1
+        scores = model(batch['features'].to(device))
+        scores = scores.masked_fill(~batch['valid_mask'].to(device), float('-inf')).cpu()
+        for b in range(scores.shape[0]):
+            n = int(counts[b])
+            if n == 0:
+                continue
+            order = torch.argsort(scores[b, :n], descending=True).numpy()
+            rank = deduped_gt_rank(batch['keys'][b].numpy()[order],
+                                   batch['pos_mask'][b, :n].numpy()[order])
+            if rank is None:
+                continue
+            gt_ranks.append(rank)
+            for k in K_VALUES:
+                if rank <= k:
+                    hits[k] += 1
     n_events = len(event_indices)
     ranks = np.asarray(gt_ranks) if gt_ranks else np.asarray([0])
     metrics = {f'T@{k}': hits[k] / n_events for k in K_VALUES}
@@ -174,6 +194,8 @@ def main(argv=None) -> None:
         raise SystemExit('--eval-candidates and --split-json are mutually exclusive')
     if bool(args.eval_candidates) != bool(args.eval_tracks):
         raise SystemExit('--eval-candidates and --eval-tracks must be given together')
+    if args.eval_every < 1:
+        raise SystemExit('--eval-every must be >= 1')
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device(args.device)
@@ -230,10 +252,13 @@ def main(argv=None) -> None:
     logger.info(f'{len(trainable)} trainable events, {len(eval_side)} eval events '
                 f'per epoch, {len(full_eval)} in the final eval')
 
+    loader_kwargs = {}
+    if args.num_workers > 0:
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
     loader = DataLoader(train_dataset, batch_size=args.batch_size,
                         sampler=SubsetRandomSampler([int(x) for x in trainable]),
                         collate_fn=collate_triplet_rank, num_workers=args.num_workers,
-                        drop_last=True)
+                        drop_last=True, **loader_kwargs)
     steps_per_epoch = max(1, len(trainable) // args.batch_size)
 
     model = TripletReranker(
@@ -306,21 +331,30 @@ def main(argv=None) -> None:
                                 f'| lr {scheduler.get_last_lr()[0]:.2e} '
                                 f'| {rate:.2f} batch/s | ETA {eta_min:.1f} min')
 
-            metrics = evaluate(model, eval_dataset, eval_side, device)
-            metrics['train_loss'] = float(np.mean(losses)) if losses else float('nan')
-            metrics['epoch'] = epoch
-            metrics['lr'] = scheduler.get_last_lr()[0]
-            history.append(metrics)
-            logger.info(f"epoch {epoch}: loss {metrics['train_loss']:.4f} "
-                        f"T@10 {metrics['T@10']:.4f} median rank {metrics['gt_rank_median']}")
-            scheduler.step_epoch(metrics['train_loss'])
-
-            is_best = metrics['T@10'] > best_criterion
-            best_criterion = max(best_criterion, metrics['T@10'])
-            manager.save_checkpoint(
-                _checkpoint_payload(model, optimizer, args, metrics, epoch, best_criterion,
-                                    feature_names, norm_stats, score_column, tau),
-                epoch, metrics['T@10'], is_best)
+            train_loss = float(np.mean(losses)) if losses else float('nan')
+            current_lr = scheduler.get_last_lr()[0]
+            run_eval = (epoch % args.eval_every == args.eval_every - 1
+                        or epoch == args.epochs - 1)
+            if run_eval:
+                metrics = evaluate(model, eval_dataset, eval_side, device,
+                                   batch_size=args.eval_batch_size,
+                                   num_workers=args.num_workers)
+                metrics['train_loss'] = train_loss
+                metrics['epoch'] = epoch
+                metrics['lr'] = current_lr
+                history.append(metrics)
+                logger.info(f"epoch {epoch}: loss {train_loss:.4f} "
+                            f"T@10 {metrics['T@10']:.4f} median rank {metrics['gt_rank_median']}")
+                is_best = metrics['T@10'] > best_criterion
+                best_criterion = max(best_criterion, metrics['T@10'])
+                manager.save_checkpoint(
+                    _checkpoint_payload(model, optimizer, args, metrics, epoch, best_criterion,
+                                        feature_names, norm_stats, score_column, tau),
+                    epoch, metrics['T@10'], is_best)
+            else:
+                history.append({'train_loss': train_loss, 'epoch': epoch, 'lr': current_lr})
+                logger.info(f'epoch {epoch}: loss {train_loss:.4f} (eval skipped)')
+            scheduler.step_epoch(train_loss)
             _flush_history(experiment_dir, history)
     except BaseException:
         logger.error(f'training crashed at epoch {epoch}:\n{traceback.format_exc()}')
@@ -332,8 +366,9 @@ def main(argv=None) -> None:
         logger.error(f'saved emergency checkpoint {crash_path}')
         raise
 
-    if history:
-        best = max(history, key=lambda m: m['T@10'])
+    evaluated = [entry for entry in history if 'T@10' in entry]
+    if evaluated:
+        best = max(evaluated, key=lambda m: m['T@10'])
         logger.info(f"best epoch {best['epoch']}: " +
                     ' '.join(f"T@{k} {best[f'T@{k}']:.4f}" for k in K_VALUES))
 
@@ -344,7 +379,9 @@ def main(argv=None) -> None:
         model.to(device)
         logger.info(f'final full eval on {len(full_eval)} events '
                     f'(best epoch {checkpoint["epoch"]})')
-        final = evaluate(model, eval_dataset, full_eval, device)
+        final = evaluate(model, eval_dataset, full_eval, device,
+                         batch_size=args.eval_batch_size,
+                         num_workers=args.num_workers)
         final['best_epoch'] = checkpoint['epoch']
         with open(os.path.join(experiment_dir, 'final_eval.json'), 'w') as fh:
             json.dump(final, fh, indent=2)

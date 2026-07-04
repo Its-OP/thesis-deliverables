@@ -94,14 +94,12 @@ def standardize_features(X: torch.Tensor, names: list[str], stats: dict) -> torc
     """X: (M, F) in `names` order. Returns (M, F) sign-log1p + affine, clipped to +-10.
     NaN inputs (e.g. Stage-2 scores outside the top-K1) standardize to 0; their
     companion *_isvalid flag channel carries the missingness."""
-    columns = []
-    for column, name in zip(X.unbind(dim=1), names):
-        s = stats[name]
-        if s['log1p']:
-            column = torch.sign(column) * torch.log1p(column.abs())
-        column = torch.clamp((column - s['center']) / s['scale'], -10.0, 10.0)
-        columns.append(torch.nan_to_num(column, nan=0.0))
-    return torch.stack(columns, dim=1)
+    log1p_mask = torch.tensor([stats[name]['log1p'] for name in names])
+    center = torch.tensor([stats[name]['center'] for name in names], dtype=X.dtype)
+    scale = torch.tensor([stats[name]['scale'] for name in names], dtype=X.dtype)
+    transformed = torch.where(log1p_mask, torch.sign(X) * torch.log1p(X.abs()), X)
+    return torch.nan_to_num(torch.clamp((transformed - center) / scale, -10.0, 10.0),
+                            nan=0.0)
 
 
 def save_norm_stats(stats: dict, path: str) -> None:
@@ -342,3 +340,12 @@ def collate_triplet_rank(items: list[dict]) -> dict[str, torch.Tensor]:
         pos_mask[b, :n] = item['pos_mask']
         valid_mask[b, :n] = True
     return {'features': features, 'pos_mask': pos_mask, 'valid_mask': valid_mask}
+
+
+def collate_triplet_rank_eval(items: list[dict]) -> dict:
+    """collate_triplet_rank plus each item's dedup keys (variable-length) and its
+    true candidate count."""
+    batch = collate_triplet_rank(items)
+    batch['keys'] = [item['keys'] for item in items]
+    batch['counts'] = torch.tensor([item['features'].shape[0] for item in items])
+    return batch

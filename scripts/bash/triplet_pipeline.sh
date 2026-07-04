@@ -31,6 +31,8 @@ VAL_DATA_DIR="${VAL_DATA_DIR:-${SCRIPT_DIR}/../part/data/low-pt/val}"
 
 if [ -f /venv/part/bin/activate ]; then
     source /venv/part/bin/activate
+elif [ -x /venv/part/bin/python ]; then
+    export PATH="/venv/part/bin:${PATH}"   # venv without an activate script
 else
     if command -v conda &>/dev/null; then
         CONDA_BASE=$(conda info --base)

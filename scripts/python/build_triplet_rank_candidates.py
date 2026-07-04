@@ -4,6 +4,7 @@ import argparse
 import glob
 import multiprocessing
 import os
+import shutil
 import traceback
 
 import joblib
@@ -105,23 +106,6 @@ def _event_views(dump, src):
     src_cols = {name: (src[name].to_numpy(zero_copy_only=False) if name == 'event_n_tracks'
                        else _list_views(src, name)) for name in SRC_COLS}
     return dump_cols, src_cols
-
-
-def _load_slice(dump_path, src_glob, start, end):
-    # Read only the source files overlapping [start, end) so each worker holds
-    # its slice, never the full dataset.
-    dump = pq.read_table(dump_path, columns=DUMP_COLS)
-    dump = dump.slice(start, end - start)
-    parts, row0 = [], 0
-    for path in sorted(glob.glob(src_glob)):
-        n_rows = pq.read_metadata(path).num_rows
-        lo, hi = max(start, row0), min(end, row0 + n_rows)
-        if lo < hi:
-            parts.append(pq.read_table(path, columns=SRC_COLS).slice(lo - row0, hi - lo))
-        row0 += n_rows
-    src = pa.concat_tables(parts)
-    assert src.num_rows == end - start, f'src slice {src.num_rows} != {end - start}'
-    return dump, src
 
 
 def event_features(r, dump_cols, src_cols, *, top_c):
@@ -325,9 +309,34 @@ def _worker_ranges(n, chunk_size, workers):
             if boundaries[w] < boundaries[w + 1]]
 
 
-def _worker_main(dump_path, src_glob, start, end, top_c, chunk_size, out_path, worker_id):
+def _write_worker_slices(dump_path, src_glob, ranges, tmp_dir):
+    """Read the dump + full source glob ONCE in the main process and write each
+    worker's [start, end) row range to its own small self-contained parquet pair.
+
+    Table.slice() is zero-copy: a worker that reads the FULL file and slices it
+    keeps the entire file's Arrow buffers resident for its whole lifetime, so N
+    concurrent workers each pin a full copy -- fine at VAL scale, OOMs at TRAIN
+    scale (5.7x more events). Pre-slicing here means each worker's own read is
+    already bounded to its assigned range.
+    """
+    dump = pq.read_table(dump_path, columns=DUMP_COLS)
+    src = pa.concat_tables([pq.read_table(s, columns=SRC_COLS) for s in sorted(glob.glob(src_glob))])
+    paths = []
+    for w, (start, end) in enumerate(ranges):
+        dump_path_w = os.path.join(tmp_dir, f'dump_{w:04d}.parquet')
+        src_path_w = os.path.join(tmp_dir, f'src_{w:04d}.parquet')
+        pq.write_table(dump.slice(start, end - start), dump_path_w)
+        pq.write_table(src.slice(start, end - start), src_path_w)
+        paths.append((dump_path_w, src_path_w))
+    del dump, src
+    return paths
+
+
+def _worker_main(dump_slice_path, src_slice_path, start, end, top_c, chunk_size, out_path,
+                 worker_id):
     torch.set_num_threads(1)
-    dump, src = _load_slice(dump_path, src_glob, start, end)
+    dump = pq.read_table(dump_slice_path, columns=DUMP_COLS)
+    src = pq.read_table(src_slice_path, columns=SRC_COLS)
     dump_cols, src_cols = _event_views(dump, src)
     gbdt_models = load_gbdt_models()
     events = list(range(start, end))
@@ -348,17 +357,25 @@ def _run_workers(args, n, out_path):
     if _finalize_if_complete(out_path, n):
         return
     os.environ['OMP_NUM_THREADS'] = str(max(1, (os.cpu_count() or 8) // max(1, args.workers)))
-    context = multiprocessing.get_context('spawn')
     ranges = _worker_ranges(n, args.chunk_size, args.workers)
     print(f'launching {len(ranges)} workers over {n} events...', flush=True)
-    processes = [context.Process(target=_worker_main,
-                                 args=(args.dump, args.src_glob, start, end, args.top_c,
-                                       args.chunk_size, out_path, w))
-                 for w, (start, end) in enumerate(ranges)]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join()
+
+    tmp_dir = out_path + '.worker_slices'
+    os.makedirs(tmp_dir, exist_ok=True)
+    try:
+        slice_paths = _write_worker_slices(args.dump, args.src_glob, ranges, tmp_dir)
+        context = multiprocessing.get_context('spawn')
+        processes = [context.Process(target=_worker_main,
+                                     args=(dump_path_w, src_path_w, start, end, args.top_c,
+                                           args.chunk_size, out_path, w))
+                     for w, ((start, end), (dump_path_w, src_path_w))
+                     in enumerate(zip(ranges, slice_paths))]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     bad = [process.exitcode for process in processes if process.exitcode != 0]
     if bad:
         raise RuntimeError(f'{len(bad)} workers exited nonzero: {bad}')

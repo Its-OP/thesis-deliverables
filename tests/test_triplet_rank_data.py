@@ -19,6 +19,7 @@ from utils.triplet_rank_data import (
     LOG1P_MARKERS,
     TripletRankDataset,
     collate_triplet_rank,
+    collate_triplet_rank_eval,
     fit_norm_stats,
     load_norm_stats,
     load_track16_params,
@@ -315,3 +316,45 @@ def test_train_item_zero_negatives_guard(tmp_path):
     item = ds[1]  # event 1: both candidates are GT -> zero negatives
     assert item['features'].shape[0] == 2
     assert item['pos_mask'].all()
+
+
+def test_standardize_features_vectorized_matches_column_loop():
+    # The vectorized implementation must reproduce the original per-column loop
+    # exactly (values AND NaN handling).
+    generator = torch.Generator().manual_seed(3)
+    names = ['plain_a', 'heavy_dz', 'plain_b', 'cov_xy', 'flag_isvalid']
+    stats = {
+        'plain_a': {'log1p': False, 'center': 0.5, 'scale': 2.0},
+        'heavy_dz': {'log1p': True, 'center': -1.0, 'scale': 0.25},
+        'plain_b': {'log1p': False, 'center': 100.0, 'scale': 1e-3},
+        'cov_xy': {'log1p': True, 'center': 0.0, 'scale': 5.0},
+        'flag_isvalid': {'log1p': False, 'center': 0.0, 'scale': 1.0},
+    }
+    X = torch.randn(64, len(names), generator=generator) * 50.0
+    X[3, 1] = float('nan')
+    X[10, 3] = float('nan')
+
+    reference_columns = []
+    for column, name in zip(X.unbind(dim=1), names):
+        s = stats[name]
+        if s['log1p']:
+            column = torch.sign(column) * torch.log1p(column.abs())
+        column = torch.clamp((column - s['center']) / s['scale'], -10.0, 10.0)
+        reference_columns.append(torch.nan_to_num(column, nan=0.0))
+    reference = torch.stack(reference_columns, dim=1)
+
+    torch.testing.assert_close(standardize_features(X, names, stats), reference,
+                               rtol=0.0, atol=0.0)
+
+
+def test_collate_triplet_rank_eval_carries_keys_and_counts(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    ds = TripletRankDataset(cand, tracks, tau=0.0, mode='eval', extra_features='all')
+    items = [ds[0], ds[1]]
+    batch = collate_triplet_rank_eval(items)
+    assert batch['features'].shape == (2, 99, 3)   # event 0 has 3 candidates, event 1 has 2
+    assert batch['valid_mask'].tolist() == [[True, True, True], [True, True, False]]
+    assert batch['counts'].tolist() == [3, 2]
+    assert len(batch['keys']) == 2
+    torch.testing.assert_close(batch['keys'][0], items[0]['keys'])
+    torch.testing.assert_close(batch['keys'][1], items[1]['keys'])
