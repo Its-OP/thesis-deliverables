@@ -53,7 +53,56 @@ CANDIDATE_SCHEMA = pa.schema([
     pa.field('track_s1', pa.list_(pa.float32())),
     pa.field('track_s2', pa.list_(pa.float32())),
     pa.field('couple_scores', pa.list_(pa.float32())),
+    pa.field('n_decomp', pa.list_(pa.int16())),
 ])
+
+_DEDUPE_LIST_KEYS = ['cand_i', 'cand_j', 'cand_k', 'couple_rank',
+                     'gbdt6_score', 'gbdt8_score', 'is_gt']
+
+
+def dedupe_event_candidates(row: dict) -> dict:
+    """row: candidate row dict with parallel per-candidate lists. Returns the row
+    with one entry per physical unordered 3-set {i,j,k}: the max-gbdt6 decomposition
+    is kept (tie -> first occurrence), is_gt is group-any, and n_decomp counts the
+    collapsed decompositions. All other keys pass through untouched."""
+    count = len(row['cand_i'])
+    prior_decomp = np.asarray(row['n_decomp'], dtype=np.int64) if 'n_decomp' in row \
+        else np.ones(count, dtype=np.int64)
+    if count == 0:
+        return {**row, 'n_candidates': 0, 'n_decomp': []}
+
+    keys = np.sort(np.stack([np.asarray(row['cand_i'], dtype=np.int64),
+                             np.asarray(row['cand_j'], dtype=np.int64),
+                             np.asarray(row['cand_k'], dtype=np.int64)], axis=1), axis=1)
+    _, group_of = np.unique(keys, axis=0, return_inverse=True)
+    n_groups = int(group_of.max()) + 1
+    scores = np.asarray(row['gbdt6_score'], dtype=np.float64)
+    is_gt = np.asarray(row['is_gt'], dtype=bool)
+    positions = np.arange(count)
+
+    # Sort by (group, score desc, position asc): the first row of each group is the
+    # kept one — max score, first occurrence on ties.
+    order = np.lexsort((positions, -scores, group_of))
+    first_of_group = np.ones(count, dtype=bool)
+    first_of_group[1:] = group_of[order][1:] != group_of[order][:-1]
+    best_position = order[first_of_group]           # indexed by group id
+
+    group_any_gt = np.zeros(n_groups, dtype=bool)
+    np.logical_or.at(group_any_gt, group_of, is_gt)
+    group_decomp = np.zeros(n_groups, dtype=np.int64)
+    np.add.at(group_decomp, group_of, prior_decomp)
+    first_seen = np.full(n_groups, count, dtype=np.int64)
+    np.minimum.at(first_seen, group_of, positions)
+
+    emit_order = np.argsort(first_seen, kind='stable')  # first-seen order, stable
+    kept = best_position[emit_order]
+    deduped = dict(row)
+    for key in _DEDUPE_LIST_KEYS:
+        deduped[key] = np.asarray(row[key])[kept].tolist()
+    deduped['is_gt'] = group_any_gt[emit_order].tolist()
+    deduped['n_decomp'] = group_decomp[emit_order].tolist()
+    deduped['n_candidates'] = int(kept.shape[0])
+    return deduped
 
 
 def _load_prefix(dump_path, src_glob, max_events):
@@ -195,7 +244,7 @@ def event_candidates(r, dump_cols, src_cols, *, top_c, gbdt_models):
     row, X = event_features(r, dump_cols, src_cols, top_c=top_c)
     row['gbdt6_score'] = _predict(gbdt_models['gbdt6'], X).tolist()
     row['gbdt8_score'] = _predict(gbdt_models['gbdt8'], X).tolist()
-    return row
+    return dedupe_event_candidates(row)
 
 
 def _empty_row(src_cols, r):
@@ -207,7 +256,8 @@ def _empty_row(src_cols, r):
             'cand_i': [], 'cand_j': [], 'cand_k': [], 'couple_rank': [],
             'gbdt6_score': [], 'gbdt8_score': [], 'is_gt': [],
             'gt_i': -1, 'gt_j': -1, 'gt_k': -1, 'recon': False,
-            'track_s1': [], 'track_s2': [], 'couple_scores': []}
+            'track_s1': [], 'track_s2': [], 'couple_scores': [],
+            'n_decomp': []}
 
 
 def _valid_rows(path):
@@ -246,6 +296,8 @@ def _process_chunk(chunk_events, offset, dump_cols, src_cols, top_c, gbdt_models
             for row, ok in zip(rows, succeeded):
                 if ok:
                     row[f'{name}_score'] = next(split).tolist()
+        rows = [dedupe_event_candidates(row) if ok else row
+                for row, ok in zip(rows, succeeded)]
     return rows, succeeded.count(False)
 
 

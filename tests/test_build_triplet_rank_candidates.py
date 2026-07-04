@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts', 'pyt
 
 from build_triplet_rank_candidates import (
     CANDIDATE_SCHEMA,
+    dedupe_event_candidates,
     event_candidates,
     load_gbdt_models,
     main,
@@ -26,7 +27,7 @@ _DUMP = os.path.join(_DELIVERABLES, 'data', 'low-pt', 'eval', 'perstage_couples_
 _SRC_GLOB = '/Users/oleh/Projects/masters/part/data/low-pt/val/val_*.parquet'
 
 _LIST_FIELDS = ['cand_i', 'cand_j', 'cand_k', 'couple_rank',
-                'gbdt6_score', 'gbdt8_score', 'is_gt']
+                'gbdt6_score', 'gbdt8_score', 'is_gt', 'n_decomp']
 
 _HAVE_MODELS = os.path.exists(_GBDT6) and os.path.exists(_GBDT8)
 
@@ -91,7 +92,9 @@ def test_event_candidates_synthetic():
     for field_name in _LIST_FIELDS:
         assert len(row[field_name]) == n
 
-    # Candidate indices reproduce the Tier-H enumeration exactly.
+    # The output is the DEDUPED Tier-H enumeration: every kept row is one of the
+    # enumerated decompositions, each physical 3-set appears exactly once, and
+    # n_decomp accounts for every enumerated row.
     lorentz = build_track_lorentz(torch.tensor(src_cols['track_pt'][0]),
                                   torch.tensor(src_cols['track_eta'][0]),
                                   torch.tensor(src_cols['track_phi'][0]))
@@ -99,15 +102,20 @@ def test_event_candidates_synthetic():
         'H', torch.tensor([[0, 1], [0, 2]]), torch.arange(5),
         lorentz=lorentz, charge=torch.tensor(src_cols['track_charge'][0]),
     )
-    assert row['cand_i'] == triplets[:, 0].tolist()
-    assert row['cand_j'] == triplets[:, 1].tolist()
-    assert row['cand_k'] == triplets[:, 2].tolist()
-    assert row['couple_rank'] == couple_row.tolist()
+    enumerated = list(zip(triplets[:, 0].tolist(), triplets[:, 1].tolist(),
+                          triplets[:, 2].tolist(), couple_row.tolist()))
+    kept = list(zip(row['cand_i'], row['cand_j'], row['cand_k'], row['couple_rank']))
+    assert set(kept) <= set(enumerated)
+    kept_keys = [tuple(sorted((i, j, k))) for i, j, k, _ in kept]
+    enumerated_keys = {tuple(sorted((i, j, k))) for i, j, k, _ in enumerated}
+    assert len(kept_keys) == len(set(kept_keys))
+    assert set(kept_keys) == enumerated_keys
+    assert sum(row['n_decomp']) == len(enumerated)
 
-    # is_gt marks decompositions of the GT 3-set {0,1,2} only.
-    for flag, i, j, k in zip(row['is_gt'], row['cand_i'], row['cand_j'], row['cand_k']):
-        assert flag == (sorted((i, j, k)) == [0, 1, 2])
-    assert sum(row['is_gt']) >= 1
+    # is_gt marks the (single, deduped) GT 3-set {0,1,2} only.
+    for flag, key in zip(row['is_gt'], kept_keys):
+        assert flag == (key == (0, 1, 2))
+    assert sum(row['is_gt']) == 1
     assert all(0.0 <= s <= 1.0 for s in row['gbdt6_score'])
     assert all(0.0 <= s <= 1.0 for s in row['gbdt8_score'])
 
@@ -188,6 +196,105 @@ def test_couple_scores_truncated_to_top_c():
     row = event_candidates(0, dump_cols, src_cols, top_c=1, gbdt_models=models)
     assert row['couple_scores'] == pytest.approx([0.95])
     assert max(row['couple_rank']) == 0
+
+
+def _duplicated_row():
+    # Rows 0-2 are the three decompositions of the 3-set {0,1,2}: (0,1)+2, (0,2)+1,
+    # (1,2)+0. Rows 3-4 are unique 3-sets. gbdt6 picks row 1 as the kept duplicate.
+    return {
+        'n_tracks': 5,
+        'n_candidates': 5,
+        'cand_i': [0, 0, 1, 0, 1],
+        'cand_j': [1, 2, 2, 3, 3],
+        'cand_k': [2, 1, 0, 4, 4],
+        'couple_rank': [0, 1, 2, 0, 1],
+        'gbdt6_score': [0.5, 0.9, 0.7, 0.4, 0.3],
+        'gbdt8_score': [0.1, 0.2, 0.3, 0.4, 0.5],
+        'is_gt': [False, False, True, False, False],
+        'gt_i': 0, 'gt_j': 1, 'gt_k': 2,
+        'recon': True,
+        'track_s1': [0.9, 0.8, 0.7, 0.6, 0.5],
+        'track_s2': [0.5, 0.4, 0.3, 0.2, 0.1],
+        'couple_scores': [1.0, 0.9, 0.8],
+    }
+
+
+def test_dedupe_keeps_max_gbdt6_and_counts():
+    row = dedupe_event_candidates(_duplicated_row())
+    assert row['n_candidates'] == 3
+    triples = [tuple(sorted((i, j, k)))
+               for i, j, k in zip(row['cand_i'], row['cand_j'], row['cand_k'])]
+    assert len(set(triples)) == 3
+    # kept duplicate = the gbdt6=0.9 decomposition (couple_rank 1)
+    gt_position = triples.index((0, 1, 2))
+    assert row['gbdt6_score'][gt_position] == 0.9
+    assert row['couple_rank'][gt_position] == 1
+    assert row['n_decomp'] == [3, 1, 1]
+    # per-event columns pass through untouched
+    assert row['track_s1'] == [0.9, 0.8, 0.7, 0.6, 0.5]
+    assert row['couple_scores'] == [1.0, 0.9, 0.8]
+    assert row['n_tracks'] == 5 and row['recon'] is True
+
+
+def test_dedupe_group_any_is_gt():
+    # GT flag sits on a NON-kept duplicate (gbdt6=0.7, row 2) -> kept row inherits it.
+    row = dedupe_event_candidates(_duplicated_row())
+    triples = [tuple(sorted((i, j, k)))
+               for i, j, k in zip(row['cand_i'], row['cand_j'], row['cand_k'])]
+    gt_position = triples.index((0, 1, 2))
+    assert row['is_gt'][gt_position] is True or row['is_gt'][gt_position] == True
+    assert sum(row['is_gt']) == 1
+
+
+def test_dedupe_idempotent():
+    once = dedupe_event_candidates(_duplicated_row())
+    twice = dedupe_event_candidates(once)
+    assert twice == once
+    assert twice['n_decomp'] == [3, 1, 1]
+
+
+def test_dedupe_empty_row():
+    import build_triplet_rank_candidates as builder
+    empty = builder._empty_row({'event_n_tracks': [0]}, 0)
+    deduped = dedupe_event_candidates(dict(empty))
+    assert deduped['n_candidates'] == 0
+    assert deduped['n_decomp'] == []
+
+
+def test_candidate_schema_has_n_decomp():
+    assert CANDIDATE_SCHEMA.field('n_decomp').type == pa.list_(pa.int16())
+    import build_triplet_rank_candidates as builder
+    assert builder._empty_row({'event_n_tracks': [3]}, 0)['n_decomp'] == []
+
+
+def test_dedupe_post_processing_script(tmp_path):
+    import dedupe_triplet_candidates
+
+    row_a = _duplicated_row()
+    row_b = _duplicated_row()
+    row_b['is_gt'] = [False] * 5   # second event: no GT
+    row_b['recon'] = False
+    row_b['gt_i'] = row_b['gt_j'] = row_b['gt_k'] = -1
+    columns = {key: [row_a[key], row_b[key]] for key in row_a}
+    old_schema = pa.schema([f for f in CANDIDATE_SCHEMA if f.name != 'n_decomp'])
+    source = str(tmp_path / 'candidates_old.parquet')
+    output = str(tmp_path / 'candidates_dedup.parquet')
+    pq.write_table(pa.table(columns, schema=old_schema), source)
+
+    dedupe_triplet_candidates.main(['--candidates', source, '--out', output])
+    table = pq.read_table(output)
+    assert table.num_rows == 2
+    assert table.schema.field('n_decomp').type == pa.list_(pa.int16())
+    rows = table.to_pylist()
+    assert rows[0]['n_candidates'] == 3 and rows[0]['n_decomp'] == [3, 1, 1]
+    assert sum(rows[0]['is_gt']) == 1
+    assert rows[0]['track_s1'] == pytest.approx(row_a['track_s1'])  # per-event columns untouched
+    assert rows[1]['n_candidates'] == 3 and sum(rows[1]['is_gt']) == 0
+
+    # idempotence: re-running on the deduped output is a no-op
+    output2 = str(tmp_path / 'candidates_dedup2.parquet')
+    dedupe_triplet_candidates.main(['--candidates', output, '--out', output2])
+    assert pq.read_table(output2).to_pylist() == rows
 
 
 def _write_prefix_fixtures(directory, dump_rows, src_rows):
