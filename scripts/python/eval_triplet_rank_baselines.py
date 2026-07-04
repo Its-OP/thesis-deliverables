@@ -15,12 +15,12 @@ TRIPLET_RANK_DIR = os.path.join(os.path.dirname(__file__), '..', '..',
 REPORTS_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'reports')
 K_VALUES = [1, 5, 10, 20, 50, 100]
 
-# tau values frozen from the GBDT soft-filter pass (recall floors on held-out VAL-20);
-# tierH applies no learned filter.
+# tau values from the TRAIN-trained GBDT soft-filters (recall floors on a held-out 60k
+# TRAIN slice; VAL never seen by the filter -> no leakage); tierH applies no learned filter.
 OPERATING_POINTS = {
     'tierH': ('gbdt6_score', 0.0),
-    'd6@0.99': ('gbdt6_score', 0.003824),
-    'd8@0.95': ('gbdt8_score', 0.090546),
+    'd6@0.99': ('gbdt6_score', 0.025128),
+    'd8@0.95': ('gbdt8_score', 0.158525),
 }
 ORDERINGS = ['gbdt', 'couple_rank_lex', 'random']
 

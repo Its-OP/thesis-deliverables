@@ -48,8 +48,9 @@ def test_deduped_gt_rank_manual():
 
 
 def test_operating_points_frozen():
-    assert OPERATING_POINTS['d6@0.99'] == ('gbdt6_score', pytest.approx(0.003824))
-    assert OPERATING_POINTS['d8@0.95'] == ('gbdt8_score', pytest.approx(0.090546))
+    # tau canon: TRAIN-trained filters, recall floors on a held-out 60k TRAIN slice.
+    assert OPERATING_POINTS['d6@0.99'] == ('gbdt6_score', pytest.approx(0.025128))
+    assert OPERATING_POINTS['d8@0.95'] == ('gbdt8_score', pytest.approx(0.158525))
     assert OPERATING_POINTS['tierH'][1] == 0.0
 
 

@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import logging
 import os
+import resource
+import sys
+import time
+import traceback
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -270,7 +275,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--max-events', type=int, default=None)
+    parser.add_argument('--start-event', type=int, default=0,
+                        help='skip the first N source events (resume a crashed dump '
+                             'into a fresh --output part file)')
+    parser.add_argument('--log-every', type=int, default=20,
+                        help='progress log cadence in batches')
     return parser
+
+
+def _rss_gb() -> float:
+    max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # ru_maxrss is bytes on macOS, kilobytes on Linux.
+    return max_rss / 2**30 if sys.platform == 'darwin' else max_rss / 2**20
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -330,34 +346,71 @@ def main(argv: list[str] | None = None) -> None:
             top_k2 = args.top_k2
         logger.info(f'top_k2 = {top_k2}')
 
-    rows: list[dict] = []
-    events_done = 0
-    for batch_index, (X, _, observers) in enumerate(loader):
-        inputs = [X[k].to(device) for k in input_names]
-        inputs = trim_to_max_valid_tracks(inputs, mask_idx)
-        model_inputs, _ = extract_label_from_inputs(inputs, label_idx)
-        points, features, lorentz, mask = model_inputs
+    total_source_events = sum(pq.read_metadata(path).num_rows for path in parquet_files)
+    total_to_write = max(total_source_events - args.start_event, 0)
+    if args.max_events is not None:
+        total_to_write = min(total_to_write, args.max_events)
+    logger.info(f'{total_source_events} source events; writing {total_to_write} '
+                f'starting at event {args.start_event}')
 
-        batch_rows = _evaluate_batch(
-            stage=args.stage,
-            stage1=stage1, stage2=stage2, stage3=stage3,
-            points=points, features=features, lorentz=lorentz, mask=mask,
-            top_k1=top_k1, top_k2=top_k2, num_couples=args.num_couples,
-        )
-        for b, row in enumerate(batch_rows):
-            row.update(_composite_key(observers, b))
-            row['stage'] = args.stage
-            rows.append(row)
-            events_done += 1
+    rows: list[dict] = []
+    events_done = 0   # rows written (after --start-event)
+    events_seen = 0   # source rows consumed (including skipped)
+    crash: BaseException | None = None
+    loop_start = time.time()
+    try:
+        for batch_index, (X, _, observers) in enumerate(loader):
+            batch_events = len(observers['event_run'])
+            if events_seen + batch_events <= args.start_event:
+                events_seen += batch_events   # whole batch below the resume point
+                continue
+            inputs = [X[k].to(device) for k in input_names]
+            inputs = trim_to_max_valid_tracks(inputs, mask_idx)
+            model_inputs, _ = extract_label_from_inputs(inputs, label_idx)
+            points, features, lorentz, mask = model_inputs
+
+            batch_rows = _evaluate_batch(
+                stage=args.stage,
+                stage1=stage1, stage2=stage2, stage3=stage3,
+                points=points, features=features, lorentz=lorentz, mask=mask,
+                top_k1=top_k1, top_k2=top_k2, num_couples=args.num_couples,
+            )
+            for b, row in enumerate(batch_rows):
+                events_seen += 1
+                if events_seen <= args.start_event:
+                    continue
+                row.update(_composite_key(observers, b))
+                row['stage'] = args.stage
+                rows.append(row)
+                events_done += 1
+                if args.max_events is not None and events_done >= args.max_events:
+                    break
             if args.max_events is not None and events_done >= args.max_events:
                 break
-        if args.max_events is not None and events_done >= args.max_events:
-            break
-        if batch_index % 20 == 0:
-            logger.info(f'Batch {batch_index} | events processed: {events_done}')
-
-    logger.info(f'Total events: {len(rows)} → {args.output}')
-    _write_parquet(rows, args.output)
+            if batch_index % args.log_every == 0:
+                elapsed = max(time.time() - loop_start, 1e-9)
+                rate = events_done / elapsed
+                eta_min = ((total_to_write - events_done) / rate / 60) if rate > 0 else float('inf')
+                logger.info(f'Batch {batch_index} | {events_done}/{total_to_write} events '
+                            f'| {rate:.1f} ev/s | ETA {eta_min:.1f} min | RSS {_rss_gb():.1f} GB')
+    except BaseException as error:   # salvage partial work on ANY failure, incl. Ctrl-C
+        logger.error(f'event loop crashed after {events_done} events:\n{traceback.format_exc()}')
+        crash = error
+    finally:
+        if rows:
+            logger.info(f'Total events: {len(rows)} → {args.output}')
+            _write_parquet(rows, args.output)
+        marker = args.output + '.INCOMPLETE'
+        if crash is not None:
+            with open(marker, 'w') as fh:
+                json.dump({'start_event': args.start_event, 'events_written': events_done,
+                           'next_start_event': args.start_event + events_done}, fh, indent=2)
+            logger.error(f'partial dump: wrote {marker}; resume with '
+                         f'--start-event {args.start_event + events_done}')
+        elif os.path.exists(marker):
+            os.remove(marker)
+    if crash is not None:
+        raise crash
 
 
 if __name__ == '__main__':

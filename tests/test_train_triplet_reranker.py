@@ -80,5 +80,68 @@ def test_trainer_checkpoint_is_slim_and_loadable(real_artifact, tmp_path):
     checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     assert 'triplet_reranker_state_dict' in checkpoint
     assert 'args' in checkpoint and 'val_metrics' in checkpoint
-    model = TripletReranker(input_mode='flat', feature_dim=89)
+    # Single-file deploy: the checkpoint carries everything needed to rebuild.
+    assert checkpoint['feature_names'][:89] and 'norm_stats' in checkpoint
+    assert checkpoint['operating_point'] == {'score_column': 'gbdt6_score', 'tau': 0.0}
+    model = TripletReranker(input_mode='flat', feature_names=checkpoint['feature_names'])
     model.load_state_dict(checkpoint['triplet_reranker_state_dict'])
+
+
+def test_trainer_two_artifact_full_loss_and_final_eval(real_artifact, tmp_path):
+    from train_triplet_reranker import main as train_main
+
+    run_dir = str(tmp_path / 'two_artifact_run')
+    train_main([
+        '--candidates', os.path.join(real_artifact, 'candidates_val.parquet'),
+        '--tracks', os.path.join(real_artifact, 'tracks_val.parquet'),
+        '--eval-candidates', os.path.join(real_artifact, 'candidates_val.parquet'),
+        '--eval-tracks', os.path.join(real_artifact, 'tracks_val.parquet'),
+        '--norm-stats', os.path.join(real_artifact, 'norm_stats.json'),
+        '--experiment-dir', run_dir,
+        '--input-mode', 'flat',
+        '--loss-mode', 'full',
+        '--tau', '0.0',
+        '--eval-events', '10',
+        '--epochs', '2',
+        '--batch-size', '4',
+        '--num-negatives', '10',
+        '--device', 'cpu',
+        '--norm-stats-events', '20',
+    ])
+    # Explicit --experiment-dir is honored verbatim (the .sh owns run-dir naming).
+    with open(os.path.join(run_dir, 'metrics_history.json')) as fh:
+        history = json.load(fh)
+    assert len(history) == 2
+    for entry in history:
+        assert entry['n_eval_events'] == 10
+        assert 0.0 <= entry['T@10'] <= 1.0
+    with open(os.path.join(run_dir, 'final_eval.json')) as fh:
+        final = json.load(fh)
+    assert final['n_eval_events'] == 40
+    assert 0.0 <= final['T@10'] <= 1.0
+
+
+def test_trainer_resume_continues_epochs(real_artifact, tmp_path):
+    from train_triplet_reranker import main as train_main
+
+    run_dir = str(tmp_path / 'resume_run')
+    common = [
+        '--candidates', os.path.join(real_artifact, 'candidates_val.parquet'),
+        '--tracks', os.path.join(real_artifact, 'tracks_val.parquet'),
+        '--norm-stats', os.path.join(real_artifact, 'norm_stats.json'),
+        '--experiment-dir', run_dir,
+        '--input-mode', 'flat',
+        '--tau', '0.0',
+        '--batch-size', '4',
+        '--num-negatives', '10',
+        '--device', 'cpu',
+        '--norm-stats-events', '20',
+    ]
+    train_main(common + ['--epochs', '1'])
+    ckpt = os.path.join(run_dir, 'checkpoints', 'best_model.pt')
+    assert os.path.exists(ckpt)
+    train_main(common + ['--epochs', '2', '--resume', ckpt])
+    with open(os.path.join(run_dir, 'metrics_history.json')) as fh:
+        history = json.load(fh)
+    # The resumed run continues at epoch 1 and keeps the prior history entry.
+    assert [entry['epoch'] for entry in history] == [0, 1]

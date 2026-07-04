@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import sys
+import time
+import traceback
 
 import numpy as np
 import torch
@@ -12,7 +14,7 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts', 'python'))
 
-from eval_triplet_rank_baselines import K_VALUES, deduped_gt_rank
+from eval_triplet_rank_baselines import K_VALUES, OPERATING_POINTS, deduped_gt_rank
 from utils.checkpointing import CheckpointManager
 from utils.experiment import build_experiment_directory
 from utils.training import build_warmup_scheduler
@@ -36,15 +38,29 @@ def build_parser() -> argparse.ArgumentParser:
                                                  '(offline candidate artifacts, InfoNCE top-1).')
     parser.add_argument('--candidates', default=os.path.join(TRIPLET_RANK_DIR, 'candidates_val.parquet'))
     parser.add_argument('--tracks', default=os.path.join(TRIPLET_RANK_DIR, 'tracks_val.parquet'))
-    parser.add_argument('--norm-stats', default=os.path.join(TRIPLET_RANK_DIR, 'norm_stats.json'))
+    parser.add_argument('--eval-candidates', default=None,
+                        help='separate eval-side candidates (train-on-train / eval-on-val); '
+                             'mutually exclusive with --split-json')
+    parser.add_argument('--eval-tracks', default=None)
+    parser.add_argument('--eval-events', type=int, default=20000,
+                        help='fixed-seed eval subsample per epoch; the final eval always '
+                             'runs on the full eval side')
+    parser.add_argument('--norm-stats', default=os.path.join(TRIPLET_RANK_DIR, 'norm_stats_train.json'))
     parser.add_argument('--norm-stats-events', type=int, default=2000)
     parser.add_argument('--split-json', default=None,
                         help='train on the train side, evaluate on the test side; '
                              'omit to train on all trainable events and evaluate on all')
-    parser.add_argument('--score-column', default='gbdt6_score')
-    parser.add_argument('--tau', type=float, default=0.003824,
-                        help='operating-point threshold (default: d6@0.99)')
+    parser.add_argument('--operating-point', default='d6@0.99', choices=sorted(OPERATING_POINTS),
+                        help='survivor mask tau/score column (both sides)')
+    parser.add_argument('--score-column', default=None,
+                        help='override the operating-point score column')
+    parser.add_argument('--tau', type=float, default=None,
+                        help='override the operating-point threshold')
     parser.add_argument('--input-mode', choices=('flat', 'hierarchical'), default='flat')
+    parser.add_argument('--extra-features', choices=('none', 'gbdt', 'all', 'auto'), default='auto',
+                        help='inputs beyond the 89 geometry features (gbdt scores, cascade scores)')
+    parser.add_argument('--loss-mode', choices=('sampled', 'full'), default='sampled')
+    parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--num-negatives', type=int, default=50)
     parser.add_argument('--hidden-dim', type=int, default=256)
     parser.add_argument('--num-residual-blocks', type=int, default=4)
@@ -64,18 +80,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument('--log-every', type=int, default=50,
+                        help='in-epoch progress log cadence in batches (0 disables)')
+    parser.add_argument('--resume', default=None,
+                        help='checkpoint to continue from (model + optimizer + epoch)')
     parser.add_argument('--experiments-dir', default=os.path.join(os.path.dirname(__file__), 'experiments'))
+    parser.add_argument('--experiment-dir', default=None,
+                        help='exact run directory (overrides the timestamped default)')
     parser.add_argument('--run-name', default='triplet_reranker')
     return parser
 
 
-def _norm_stats(args, train_events) -> dict:
+def _norm_stats(args, feature_names, train_events) -> dict:
     if os.path.exists(args.norm_stats):
         logger.info(f'loading norm stats from {args.norm_stats}')
-        return load_norm_stats(args.norm_stats)
+        stats = load_norm_stats(args.norm_stats)
+        missing = [name for name in feature_names if name not in stats]
+        if missing:
+            raise SystemExit(f'{args.norm_stats} lacks {len(missing)} feature keys '
+                             f'(e.g. {missing[:3]}); delete it to refit')
+        return stats
     logger.info('fitting norm stats on the train side')
-    stats = fit_norm_stats(args.candidates, args.tracks, n_events=args.norm_stats_events,
-                           seed=args.seed, events=train_events)
+    stats = fit_norm_stats(args.candidates, args.tracks, feature_names=feature_names,
+                           n_events=args.norm_stats_events, seed=args.seed,
+                           events=train_events)
     save_norm_stats(stats, args.norm_stats)
     logger.info(f'wrote {args.norm_stats}')
     return stats
@@ -115,38 +143,92 @@ def evaluate(model, dataset, event_indices, device) -> dict:
     metrics['gt_rank_median'] = float(np.median(ranks))
     metrics['gt_rank_p90'] = float(np.percentile(ranks, 90))
     metrics['n_gt_surviving'] = len(gt_ranks)
+    metrics['n_eval_events'] = n_events
     return metrics
+
+
+def _checkpoint_payload(model, optimizer, args, metrics, epoch, best_criterion,
+                        feature_names, norm_stats, score_column, tau) -> dict:
+    return {
+        'triplet_reranker_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'args': vars(args),
+        'val_metrics': metrics,
+        'epoch': epoch,
+        'best_criterion': best_criterion,
+        'feature_names': feature_names,
+        'norm_stats': norm_stats,
+        'operating_point': {'score_column': score_column, 'tau': tau},
+    }
+
+
+def _flush_history(experiment_dir: str, history: list) -> None:
+    with open(os.path.join(experiment_dir, 'metrics_history.json'), 'w') as fh:
+        json.dump(history, fh, indent=2)
 
 
 def main(argv=None) -> None:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     args = build_parser().parse_args(argv)
+    if args.eval_candidates and args.split_json:
+        raise SystemExit('--eval-candidates and --split-json are mutually exclusive')
+    if bool(args.eval_candidates) != bool(args.eval_tracks):
+        raise SystemExit('--eval-candidates and --eval-tracks must be given together')
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device(args.device)
 
+    score_column, tau = OPERATING_POINTS[args.operating_point]
+    if args.score_column is not None:
+        score_column = args.score_column
+    if args.tau is not None:
+        tau = args.tau
+    logger.info(f'operating point {args.operating_point}: {score_column} >= {tau}')
+
     train_events = None
     if args.split_json:
         train_events = load_split(args.split_json, 'train')
-    norm_stats = _norm_stats(args, train_events)
 
     train_dataset = TripletRankDataset(
-        args.candidates, args.tracks, tau=args.tau, score_column=args.score_column,
-        num_negatives=args.num_negatives, mode='train', norm_stats=norm_stats, seed=args.seed)
-    eval_dataset = TripletRankDataset(
-        args.candidates, args.tracks, tau=args.tau, score_column=args.score_column,
-        mode='eval', norm_stats=norm_stats, seed=args.seed)
+        args.candidates, args.tracks, tau=tau, score_column=score_column,
+        num_negatives=args.num_negatives, mode='train', seed=args.seed,
+        extra_features=args.extra_features)
+    feature_names = train_dataset.feature_names
+    norm_stats = _norm_stats(args, feature_names, train_events)
+    train_dataset.norm_stats = norm_stats
+
+    if args.eval_candidates:
+        eval_dataset = TripletRankDataset(
+            args.eval_candidates, args.eval_tracks, tau=tau, score_column=score_column,
+            mode='eval', norm_stats=norm_stats, seed=args.seed,
+            extra_features=args.extra_features)
+        if eval_dataset.feature_names != feature_names:
+            raise SystemExit('eval artifact resolves different feature names than the '
+                             'train artifact (extra columns mismatch)')
+    else:
+        eval_dataset = TripletRankDataset(
+            args.candidates, args.tracks, tau=tau, score_column=score_column,
+            mode='eval', norm_stats=norm_stats, seed=args.seed,
+            extra_features=args.extra_features)
 
     n_rows = train_dataset.table.num_rows
     if args.split_json:
         train_side = np.asarray(load_split(args.split_json, 'train'))
-        eval_side = np.asarray(load_split(args.split_json, 'test'))
-        train_side, eval_side = train_side[train_side < n_rows], eval_side[eval_side < n_rows]
+        full_eval = np.asarray(load_split(args.split_json, 'test'))
+        train_side, full_eval = train_side[train_side < n_rows], full_eval[full_eval < n_rows]
         trainable = np.intersect1d(train_dataset.trainable_indices, train_side)
     else:
         trainable = train_dataset.trainable_indices
-        eval_side = np.arange(n_rows)
-    logger.info(f'{len(trainable)} trainable events, {len(eval_side)} eval events')
+        full_eval = np.arange(eval_dataset.table.num_rows)
+    if args.eval_events and args.eval_events < len(full_eval):
+        # Fixed-seed subsample: the SAME events every epoch, so across-epoch T@K
+        # comparisons (checkpoint selection) are paired.
+        eval_side = np.random.default_rng(args.seed).choice(
+            full_eval, args.eval_events, replace=False)
+    else:
+        eval_side = full_eval
+    logger.info(f'{len(trainable)} trainable events, {len(eval_side)} eval events '
+                f'per epoch, {len(full_eval)} in the final eval')
 
     loader = DataLoader(train_dataset, batch_size=args.batch_size,
                         sampler=SubsetRandomSampler([int(x) for x in trainable]),
@@ -157,8 +239,9 @@ def main(argv=None) -> None:
     model = TripletReranker(
         input_mode=args.input_mode, hidden_dim=args.hidden_dim,
         num_residual_blocks=args.num_residual_blocks, dropout=args.dropout,
-        ranking_num_samples=args.num_negatives, label_smoothing=args.label_smoothing,
-        projector_dim=args.projector_dim,
+        ranking_num_samples=args.num_negatives, ranking_temperature=args.temperature,
+        label_smoothing=args.label_smoothing, projector_dim=args.projector_dim,
+        feature_names=feature_names, loss_mode=args.loss_mode,
     ).to(device)
     if args.warm_start_projector:
         _warm_start_projector(model, args.warm_start_projector)
@@ -167,50 +250,105 @@ def main(argv=None) -> None:
     scheduler = build_warmup_scheduler(optimizer, args, steps_per_epoch, logger)
 
     experiment_dir, checkpoints_dir, _ = build_experiment_directory(
-        args.experiments_dir, args.run_name, None)
+        args.experiments_dir, args.run_name, args.experiment_dir)
     manager = CheckpointManager(checkpoints_dir, keep_best_k=3,
                                 criterion_mode='max', criterion_name='T@10')
     with open(os.path.join(experiment_dir, 'args.json'), 'w') as fh:
         json.dump(vars(args), fh, indent=2)
 
     history = []
+    start_epoch = 0
     best_criterion = -1.0
-    for epoch in range(args.epochs):
-        model.train()
-        losses = []
-        for batch in loader:
-            features = batch['features'].to(device)
-            pos_mask = batch['pos_mask'].to(device)
-            valid_mask = batch['valid_mask'].to(device)
-            out = model.compute_loss(features, pos_mask, valid_mask)
-            optimizer.zero_grad(set_to_none=True)
-            out['total_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+        model.load_state_dict(checkpoint['triplet_reranker_state_dict'])
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_criterion = checkpoint.get('best_criterion',
+                                        checkpoint['val_metrics'].get('T@10', -1.0))
+        # The cosine scheduler carries no state dict; replay its steps.
+        for _ in range(start_epoch * steps_per_epoch):
             scheduler.step_batch()
-            losses.append(float(out['total_loss'].detach()))
+        for _ in range(start_epoch):
+            scheduler.step_epoch(float('nan'))
+        history_path = os.path.join(experiment_dir, 'metrics_history.json')
+        if os.path.exists(history_path):
+            with open(history_path) as fh:
+                history = [entry for entry in json.load(fh) if entry['epoch'] < start_epoch]
+        logger.info(f'resumed from {args.resume}: continuing at epoch {start_epoch}, '
+                    f'best T@10 {best_criterion:.4f}')
 
-        metrics = evaluate(model, eval_dataset, eval_side, device)
-        metrics['train_loss'] = float(np.mean(losses)) if losses else float('nan')
-        metrics['epoch'] = epoch
-        metrics['lr'] = scheduler.get_last_lr()[0]
-        history.append(metrics)
-        logger.info(f"epoch {epoch}: loss {metrics['train_loss']:.4f} "
-                    f"T@10 {metrics['T@10']:.4f} median rank {metrics['gt_rank_median']}")
-        scheduler.step_epoch(metrics['train_loss'])
+    _flush_history(experiment_dir, history)
+    epoch = start_epoch
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            model.train()
+            losses = []
+            epoch_start = time.time()
+            for step, batch in enumerate(loader):
+                features = batch['features'].to(device)
+                pos_mask = batch['pos_mask'].to(device)
+                valid_mask = batch['valid_mask'].to(device)
+                out = model.compute_loss(features, pos_mask, valid_mask)
+                optimizer.zero_grad(set_to_none=True)
+                out['total_loss'].backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+                scheduler.step_batch()
+                losses.append(float(out['total_loss'].detach()))
+                if args.log_every and step % args.log_every == 0:
+                    elapsed = max(time.time() - epoch_start, 1e-9)
+                    rate = (step + 1) / elapsed
+                    eta_min = (steps_per_epoch - step - 1) / rate / 60
+                    logger.info(f'epoch {epoch} | batch {step}/{steps_per_epoch} '
+                                f'| loss {np.mean(losses):.4f} '
+                                f'| lr {scheduler.get_last_lr()[0]:.2e} '
+                                f'| {rate:.2f} batch/s | ETA {eta_min:.1f} min')
 
-        is_best = metrics['T@10'] > best_criterion
-        best_criterion = max(best_criterion, metrics['T@10'])
-        manager.save_checkpoint(
-            {'triplet_reranker_state_dict': model.state_dict(),
-             'args': vars(args), 'val_metrics': metrics, 'epoch': epoch},
-            epoch, metrics['T@10'], is_best)
-        with open(os.path.join(experiment_dir, 'metrics_history.json'), 'w') as fh:
-            json.dump(history, fh, indent=2)
+            metrics = evaluate(model, eval_dataset, eval_side, device)
+            metrics['train_loss'] = float(np.mean(losses)) if losses else float('nan')
+            metrics['epoch'] = epoch
+            metrics['lr'] = scheduler.get_last_lr()[0]
+            history.append(metrics)
+            logger.info(f"epoch {epoch}: loss {metrics['train_loss']:.4f} "
+                        f"T@10 {metrics['T@10']:.4f} median rank {metrics['gt_rank_median']}")
+            scheduler.step_epoch(metrics['train_loss'])
 
-    best = max(history, key=lambda m: m['T@10'])
-    logger.info(f"best epoch {best['epoch']}: " +
-                ' '.join(f"T@{k} {best[f'T@{k}']:.4f}" for k in K_VALUES))
+            is_best = metrics['T@10'] > best_criterion
+            best_criterion = max(best_criterion, metrics['T@10'])
+            manager.save_checkpoint(
+                _checkpoint_payload(model, optimizer, args, metrics, epoch, best_criterion,
+                                    feature_names, norm_stats, score_column, tau),
+                epoch, metrics['T@10'], is_best)
+            _flush_history(experiment_dir, history)
+    except BaseException:
+        logger.error(f'training crashed at epoch {epoch}:\n{traceback.format_exc()}')
+        crash_path = os.path.join(checkpoints_dir, f'crash_epoch{epoch}.pt')
+        torch.save(_checkpoint_payload(model, optimizer, args, {}, epoch, best_criterion,
+                                       feature_names, norm_stats, score_column, tau),
+                   crash_path)
+        _flush_history(experiment_dir, history)
+        logger.error(f'saved emergency checkpoint {crash_path}')
+        raise
+
+    if history:
+        best = max(history, key=lambda m: m['T@10'])
+        logger.info(f"best epoch {best['epoch']}: " +
+                    ' '.join(f"T@{k} {best[f'T@{k}']:.4f}" for k in K_VALUES))
+
+    best_path = os.path.join(checkpoints_dir, 'best_model.pt')
+    if os.path.exists(best_path):
+        checkpoint = torch.load(best_path, map_location='cpu', weights_only=False)
+        model.load_state_dict(checkpoint['triplet_reranker_state_dict'])
+        model.to(device)
+        logger.info(f'final full eval on {len(full_eval)} events '
+                    f'(best epoch {checkpoint["epoch"]})')
+        final = evaluate(model, eval_dataset, full_eval, device)
+        final['best_epoch'] = checkpoint['epoch']
+        with open(os.path.join(experiment_dir, 'final_eval.json'), 'w') as fh:
+            json.dump(final, fh, indent=2)
+        logger.info('final eval: ' + ' '.join(f"T@{k} {final[f'T@{k}']:.4f}" for k in K_VALUES))
 
 
 if __name__ == '__main__':

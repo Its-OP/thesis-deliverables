@@ -4,6 +4,7 @@ import argparse
 import glob
 import multiprocessing
 import os
+import traceback
 
 import joblib
 import numpy as np
@@ -18,14 +19,22 @@ from utils.triplet_join import (
     build_triplet_candidates,
     triplet_candidate_features,
 )
-from build_triplet_filter_table import DUMP, SRC, SRC_COLS, _load
+try:
+    from scripts.python.build_triplet_filter_table import DUMP, SRC, SRC_COLS
+except ImportError:  # direct-file invocation: scripts/python is sys.path[0]
+    from build_triplet_filter_table import DUMP, SRC, SRC_COLS
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'models')
 OUT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'low-pt', 'eval', 'triplet_rank')
 MAX_CANDIDATES_PER_EVENT = 32768
 CHUNK_SIZE = 500
 
-# One row per event; list columns are parallel across the event's Tier-H candidates.
+DUMP_COLS = ['stage1_sorted_indices', 'stage1_scores', 'stage2_sorted_indices',
+             'stage2_scores', 'stage3_sorted_couples', 'stage3_couple_scores']
+
+# One row per event; cand_*/couple_rank/gbdt*/is_gt list columns are parallel across
+# the event's Tier-H candidates; track_s1/track_s2 are per-track (track_s2 is NaN
+# outside the stage-1 top-K1) and couple_scores is per-kept-couple.
 CANDIDATE_SCHEMA = pa.schema([
     pa.field('n_tracks', pa.int32()),
     pa.field('n_candidates', pa.int32()),
@@ -40,7 +49,22 @@ CANDIDATE_SCHEMA = pa.schema([
     pa.field('gt_j', pa.int16()),
     pa.field('gt_k', pa.int16()),
     pa.field('recon', pa.bool_()),
+    pa.field('track_s1', pa.list_(pa.float32())),
+    pa.field('track_s2', pa.list_(pa.float32())),
+    pa.field('couple_scores', pa.list_(pa.float32())),
 ])
+
+
+def _load_prefix(dump_path, src_glob, max_events):
+    # A dump may cover only a row-prefix of the source (smoke dumps, crash-partial
+    # dumps); build candidates for exactly the dumped prefix.
+    dump = pq.read_table(dump_path, columns=DUMP_COLS)
+    src = pa.concat_tables([pq.read_table(s, columns=SRC_COLS)
+                            for s in sorted(glob.glob(src_glob))])
+    assert dump.num_rows <= src.num_rows, \
+        f'dump rows {dump.num_rows} exceed src rows {src.num_rows}'
+    n = dump.num_rows if max_events is None else min(max_events, dump.num_rows)
+    return dump.slice(0, n), src.slice(0, n), n
 
 
 def load_gbdt_models():
@@ -77,8 +101,7 @@ def _list_views(table, name):
 
 
 def _event_views(dump, src):
-    dump_cols = (_list_views(dump, 'stage1_sorted_indices'),
-                 _list_views(dump, 'stage3_sorted_couples'))
+    dump_cols = {name: _list_views(dump, name) for name in DUMP_COLS}
     src_cols = {name: (src[name].to_numpy(zero_copy_only=False) if name == 'event_n_tracks'
                        else _list_views(src, name)) for name in SRC_COLS}
     return dump_cols, src_cols
@@ -87,7 +110,7 @@ def _event_views(dump, src):
 def _load_slice(dump_path, src_glob, start, end):
     # Read only the source files overlapping [start, end) so each worker holds
     # its slice, never the full dataset.
-    dump = pq.read_table(dump_path, columns=['stage1_sorted_indices', 'stage3_sorted_couples'])
+    dump = pq.read_table(dump_path, columns=DUMP_COLS)
     dump = dump.slice(start, end - start)
     parts, row0 = [], 0
     for path in sorted(glob.glob(src_glob)):
@@ -102,7 +125,8 @@ def _load_slice(dump_path, src_glob, start, end):
 
 
 def event_features(r, dump_cols, src_cols, *, top_c):
-    s1, couples_all = dump_cols
+    s1 = dump_cols['stage1_sorted_indices']
+    couples_all = dump_cols['stage3_sorted_couples']
     cols = src_cols
     assert len(s1[r]) == cols['event_n_tracks'][r], f'alignment break at row {r}'
     n_tracks = int(cols['event_n_tracks'][r])
@@ -140,6 +164,25 @@ def event_features(r, dump_cols, src_cols, *, top_c):
     assert n_candidates <= MAX_CANDIDATES_PER_EVENT, f'{n_candidates} candidates at row {r}'
     assert torch.isfinite(X).all(), f'non-finite features at row {r}'
 
+    # Frozen-cascade score columns: stage-1 scores scattered back to track order
+    # (full coverage), stage-2 scores NaN outside the stage-1 top-K1, and the kept
+    # couples' stage-3 scores indexed by couple_rank.
+    track_s1 = np.full(n_tracks, np.nan, dtype=np.float32)
+    track_s1[np.asarray(s1[r], dtype=np.int64)] = \
+        np.asarray(dump_cols['stage1_scores'][r], dtype=np.float32)
+    assert np.isfinite(track_s1).all(), f'incomplete stage-1 coverage at row {r}'
+    track_s2 = np.full(n_tracks, np.nan, dtype=np.float32)
+    track_s2[np.asarray(dump_cols['stage2_sorted_indices'][r], dtype=np.int64)] = \
+        np.asarray(dump_cols['stage2_scores'][r], dtype=np.float32)
+    couple_scores = np.asarray(dump_cols['stage3_couple_scores'][r],
+                               dtype=np.float32)[:top_c]
+    if n_candidates:
+        assert np.isfinite(track_s2[triplets[:, 0].numpy()]).all() \
+            and np.isfinite(track_s2[triplets[:, 1].numpy()]).all(), \
+            f'couple member outside the stage-2 set at row {r}'
+        assert int(couple_row.max()) < len(couple_scores), \
+            f'couple_rank exceeds kept couple scores at row {r}'
+
     gt_i, gt_j, gt_k = (gt_sorted if gt_sorted is not None else (-1, -1, -1))
     row = {
         'n_tracks': n_tracks,
@@ -151,6 +194,9 @@ def event_features(r, dump_cols, src_cols, *, top_c):
         'is_gt': is_gt.tolist(),
         'gt_i': gt_i, 'gt_j': gt_j, 'gt_k': gt_k,
         'recon': bool(reconstructable),
+        'track_s1': track_s1.tolist(),
+        'track_s2': track_s2.tolist(),
+        'couple_scores': couple_scores.tolist(),
     }
     return row, X.numpy()
 
@@ -176,7 +222,8 @@ def _empty_row(src_cols, r):
     return {'n_tracks': n_tracks, 'n_candidates': 0,
             'cand_i': [], 'cand_j': [], 'cand_k': [], 'couple_rank': [],
             'gbdt6_score': [], 'gbdt8_score': [], 'is_gt': [],
-            'gt_i': -1, 'gt_j': -1, 'gt_k': -1, 'recon': False}
+            'gt_i': -1, 'gt_j': -1, 'gt_k': -1, 'recon': False,
+            'track_s1': [], 'track_s2': [], 'couple_scores': []}
 
 
 def _valid_rows(path):
@@ -201,8 +248,9 @@ def _process_chunk(chunk_events, offset, dump_cols, src_cols, top_c, gbdt_models
             rows.append(row)
             feature_blocks.append(X)
             succeeded.append(True)
-        except Exception as error:
-            print(f'event {g} failed, writing empty row: {error!r}', flush=True)
+        except Exception:
+            print(f'event {g} failed, writing empty row:\n{traceback.format_exc()}',
+                  flush=True)
             rows.append(_empty_row(src_cols, int(g) - offset))
             succeeded.append(False)
     if feature_blocks:
@@ -299,7 +347,7 @@ def _worker_main(dump_path, src_glob, start, end, top_c, chunk_size, out_path, w
 def _run_workers(args, n, out_path):
     if _finalize_if_complete(out_path, n):
         return
-    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['OMP_NUM_THREADS'] = str(max(1, (os.cpu_count() or 8) // max(1, args.workers)))
     context = multiprocessing.get_context('spawn')
     ranges = _worker_ranges(n, args.chunk_size, args.workers)
     print(f'launching {len(ranges)} workers over {n} events...', flush=True)
@@ -343,7 +391,7 @@ def main(argv=None):
 
     os.makedirs(args.out_dir, exist_ok=True)
     print('loading dump + source parquet...', flush=True)
-    dump, src, n = _load(args.dump, args.src_glob, args.max_events)
+    dump, src, n = _load_prefix(args.dump, args.src_glob, args.max_events)
     if not args.skip_tracks:
         write_tracks(src, n, os.path.join(args.out_dir, f'tracks_{args.tag}.parquet'))
     if args.tracks_only:

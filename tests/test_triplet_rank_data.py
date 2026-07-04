@@ -12,13 +12,17 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts', 'python'))
 
+from utils.triplet_join import FEATURE_NAMES
 from utils.triplet_rank_data import (
+    CASCADE_EXTRA_NAMES,
+    GBDT_EXTRA_NAMES,
     LOG1P_MARKERS,
     TripletRankDataset,
     collate_triplet_rank,
     fit_norm_stats,
     load_norm_stats,
     load_track16_params,
+    resolve_feature_names,
     save_norm_stats,
     standardize_features,
     track16_std,
@@ -191,3 +195,123 @@ def test_collate_pads_and_masks(real_artifact):
     assert batch['valid_mask'].shape == (B, N)
     assert (batch['pos_mask'] & ~batch['valid_mask']).sum() == 0
     assert (batch['features'].transpose(1, 2)[~batch['valid_mask']] == 0).all()
+
+
+def _write_synthetic_artifacts(directory, with_cascade):
+    # Event 0: 5 tracks, 3 candidates (first is GT), one couple. Event 1: 4 tracks,
+    # 2 candidates that are BOTH GT decompositions (zero negatives). track_s2[3] of
+    # event 0 is NaN so candidate 1 (k=3) exercises the missing-Stage-2 path.
+    import pyarrow as pa
+
+    candidates = {
+        'n_tracks': [5, 4],
+        'n_candidates': [3, 2],
+        'cand_i': [[0, 0, 1], [0, 0]],
+        'cand_j': [[1, 1, 2], [1, 1]],
+        'cand_k': [[2, 3, 4], [2, 3]],
+        'couple_rank': [[0, 1, 1], [0, 0]],
+        'gbdt6_score': [[0.9, 0.5, 0.2], [0.7, 0.6]],
+        'gbdt8_score': [[0.8, 0.4, 0.1], [0.65, 0.55]],
+        'is_gt': [[True, False, False], [True, True]],
+        'gt_i': [0, 0], 'gt_j': [1, 1], 'gt_k': [2, 2],
+        'recon': [True, True],
+    }
+    if with_cascade:
+        nan = float('nan')
+        candidates['track_s1'] = [[0.9, 0.8, 0.7, 0.6, 0.5], [0.9, 0.8, 0.7, 0.6]]
+        candidates['track_s2'] = [[0.5, 0.4, 0.3, nan, 0.2], [0.5, 0.4, 0.3, 0.2]]
+        candidates['couple_scores'] = [[1.5, 1.2], [2.0]]
+    tracks = {
+        'track_pt': [[1.0, 2.0, 3.0, 4.0, 5.0], [1.5, 2.5, 3.5, 4.5]],
+        'track_eta': [[0.1, -0.2, 0.3, -0.4, 0.5], [0.2, -0.1, 0.4, -0.3]],
+        'track_phi': [[0.5, 1.0, -1.0, 2.0, -2.0], [0.3, -0.6, 1.2, -1.5]],
+        'track_charge': [[1.0, -1.0, 1.0, -1.0, 1.0], [1.0, -1.0, 1.0, -1.0]],
+        'track_dz_significance': [[0.1, 0.2, 0.3, 0.4, 0.5], [0.1, 0.2, 0.3, 0.4]],
+        'track_dxy_significance': [[1.1, 1.2, 1.3, 1.4, 1.5], [1.1, 1.2, 1.3, 1.4]],
+        'track_dca_significance': [[2.1, 2.2, 2.3, 2.4, 2.5], [2.1, 2.2, 2.3, 2.4]],
+        'track_n_valid_pixel_hits': [[3.0, 4.0, 3.0, 4.0, 3.0], [4.0, 3.0, 4.0, 3.0]],
+        'track_norm_chi2': [[1.0, 1.1, 1.2, 1.3, 1.4], [1.0, 1.1, 1.2, 1.3]],
+        'track_pt_error': [[0.01, 0.02, 0.03, 0.04, 0.05], [0.01, 0.02, 0.03, 0.04]],
+        'track_covariance_phi_phi': [[1e-6, 2e-6, 3e-6, 4e-6, 5e-6],
+                                     [1e-6, 2e-6, 3e-6, 4e-6]],
+        'track_covariance_lambda_lambda': [[1e-6, 2e-6, 3e-6, 4e-6, 5e-6],
+                                           [1e-6, 2e-6, 3e-6, 4e-6]],
+    }
+    candidates_path = os.path.join(directory, 'candidates_syn.parquet')
+    tracks_path = os.path.join(directory, 'tracks_syn.parquet')
+    pq.write_table(pa.table(candidates), candidates_path)
+    pq.write_table(pa.table(tracks), tracks_path)
+    return candidates_path, tracks_path, candidates
+
+
+def test_resolve_feature_names_variants(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    with_cascade = TripletRankDataset(cand, tracks, tau=0.0).table
+    assert resolve_feature_names(with_cascade, 'none') == list(FEATURE_NAMES)
+    assert resolve_feature_names(with_cascade, 'gbdt') == list(FEATURE_NAMES) + GBDT_EXTRA_NAMES
+    assert (resolve_feature_names(with_cascade, 'all')
+            == list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES)
+    assert resolve_feature_names(with_cascade, 'auto') == resolve_feature_names(with_cascade, 'all')
+    with pytest.raises(ValueError):
+        resolve_feature_names(with_cascade, 'bogus')
+
+    bare_dir = tmp_path / 'bare'
+    bare_dir.mkdir()
+    cand_bare, tracks_bare, _ = _write_synthetic_artifacts(str(bare_dir), with_cascade=False)
+    without = TripletRankDataset(cand_bare, tracks_bare, tau=0.0).table
+    assert resolve_feature_names(without, 'auto') == list(FEATURE_NAMES) + GBDT_EXTRA_NAMES
+    with pytest.raises(ValueError):
+        resolve_feature_names(without, 'all')
+
+
+def test_extra_feature_values_and_nan_pattern(tmp_path):
+    cand, tracks, raw = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    ds = TripletRankDataset(cand, tracks, tau=0.0, mode='eval', extra_features='all')
+    assert ds.feature_names == list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES
+    item = ds[0]
+    features = item['features']
+    assert features.shape == (3, 99)
+    base = len(FEATURE_NAMES)
+    column = {name: features[:, base + offset]
+              for offset, name in enumerate(GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES)}
+    torch.testing.assert_close(column['gbdt6_score'],
+                               torch.tensor(raw['gbdt6_score'][0]))
+    torch.testing.assert_close(column['gbdt8_score'],
+                               torch.tensor(raw['gbdt8_score'][0]))
+    track_s1 = raw['track_s1'][0]
+    torch.testing.assert_close(column['s1_i'],
+                               torch.tensor([track_s1[i] for i in raw['cand_i'][0]]))
+    torch.testing.assert_close(column['s1_k'],
+                               torch.tensor([track_s1[k] for k in raw['cand_k'][0]]))
+    # candidate 1 has k=3 whose Stage-2 score is NaN -> raw NaN + flag 0.
+    assert torch.isnan(column['s2_k'][1])
+    torch.testing.assert_close(column['s2_k_isvalid'], torch.tensor([1.0, 0.0, 1.0]))
+    couple_scores = raw['couple_scores'][0]
+    torch.testing.assert_close(column['s3_couple'],
+                               torch.tensor([couple_scores[c] for c in raw['couple_rank'][0]]))
+
+
+def test_norm_stats_nan_policy_and_passthrough(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    names = list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES
+    stats = fit_norm_stats(cand, tracks, feature_names=names, n_events=2, per_event=10)
+    assert list(stats) == names
+    # NaN-aware fit: s2_k stats come from the finite entries only.
+    assert np.isfinite(stats['s2_k']['center']) and np.isfinite(stats['s2_k']['scale'])
+    assert stats['s2_k_isvalid'] == {'log1p': False, 'center': 0.0, 'scale': 1.0}
+
+    ds = TripletRankDataset(cand, tracks, tau=0.0, mode='eval', extra_features='all',
+                            norm_stats=stats)
+    features = ds[0]['features']
+    assert torch.isfinite(features).all()  # NaN s2_k standardized to 0
+    isvalid = features[:, names.index('s2_k_isvalid')]
+    torch.testing.assert_close(isvalid, torch.tensor([1.0, 0.0, 1.0]))
+    assert features[1, names.index('s2_k')].item() == 0.0
+
+
+def test_train_item_zero_negatives_guard(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    ds = TripletRankDataset(cand, tracks, tau=0.0, num_negatives=8, mode='train')
+    item = ds[1]  # event 1: both candidates are GT -> zero negatives
+    assert item['features'].shape[0] == 2
+    assert item['pos_mask'].all()

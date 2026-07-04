@@ -10,9 +10,141 @@ from weaver.nn.model.CoupleReranker import (
     _TRACK_EMBED_DIM,
 )
 
-# ti/tj/tk standardized 16-blocks followed by the rest block (triplet geometry +
-# couple-unit physics + cascade-context ranks). See utils/triplet_rank_data.py.
-_HIERARCHICAL_TRACK_BLOCKS = 3
+_TRACK_PREFIXES = ('ti_', 'tj_', 'tk_')
+
+
+def _positive_slots(pos_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """pos_mask: (B, N) bool. Returns slots (B, P) long, slot_valid (B, P) bool."""
+    batch_size, num_candidates = pos_mask.shape
+    slot_range = torch.arange(num_candidates, device=pos_mask.device)
+    key = torch.where(pos_mask, slot_range.expand(batch_size, -1),
+                      torch.full((batch_size, num_candidates), num_candidates,
+                                 device=pos_mask.device, dtype=torch.long))
+    sorted_key, _ = key.sort(dim=1)
+    max_positives = int(pos_mask.sum(dim=1).max()) if pos_mask.any() else 0
+    slots = sorted_key[:, :max_positives]
+    slot_valid = slots < num_candidates
+    return slots.clamp_max(max(num_candidates - 1, 0)), slot_valid
+
+
+def _sample_negatives(
+    pos_mask: torch.Tensor,
+    neg_mask: torch.Tensor,
+    num_samples: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """pos_mask, neg_mask: (B, N) bool. Returns neg_idx (B, S) long, neg_valid
+    (B, S) bool, contrib (B,) bool. Consumes the global RNG exactly like the
+    reference loop: one randint(0, n_neg, (min(S, n_neg),)) per contributing event,
+    in event order, skipping 0-pos/0-neg events before the draw."""
+    batch_size = pos_mask.shape[0]
+    neg_idx = torch.zeros(batch_size, num_samples, dtype=torch.long, device=device)
+    neg_valid = torch.zeros(batch_size, num_samples, dtype=torch.bool, device=device)
+    contrib = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    for event in range(batch_size):
+        negative_indices = neg_mask[event].nonzero(as_tuple=True)[0]
+        if not pos_mask[event].any() or len(negative_indices) == 0:
+            continue
+        contrib[event] = True
+        count = min(num_samples, len(negative_indices))
+        draw = torch.randint(0, len(negative_indices), (count,), device=device)
+        neg_idx[event, :count] = negative_indices[draw]
+        neg_valid[event, :count] = True
+    return neg_idx, neg_valid, contrib
+
+
+def sampled_softmax_ce_loss(
+    scores: torch.Tensor,
+    pos_mask: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    num_samples: int,
+    temperature: float,
+    label_smoothing: float,
+    neg_idx: torch.Tensor | None = None,
+    neg_valid: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """scores: (B, N). pos_mask, valid_mask: (B, N) bool. neg_idx, neg_valid:
+    optional (B, S) injected negatives (tests). Returns scalar loss."""
+    positive = pos_mask & valid_mask
+    negative = ~pos_mask & valid_mask
+    if neg_idx is None:
+        neg_idx, neg_valid, contrib = _sample_negatives(
+            positive, negative, num_samples, scores.device)
+    else:
+        if neg_valid is None:
+            neg_valid = torch.ones_like(neg_idx, dtype=torch.bool)
+        contrib = positive.any(dim=1) & neg_valid.any(dim=1)
+    if not contrib.any():
+        return scores.sum() * 0.0
+
+    slots, slot_valid = _positive_slots(positive)
+    max_positives = slots.shape[1]
+    positive_scores = scores.gather(1, slots)
+    negative_scores = scores.gather(1, neg_idx)
+
+    pool = torch.cat([
+        positive_scores.unsqueeze(2),
+        negative_scores.unsqueeze(1).expand(-1, max_positives, -1),
+    ], dim=2)
+    entry_valid = torch.cat([
+        torch.ones_like(slot_valid).unsqueeze(2),
+        neg_valid.unsqueeze(1).expand(-1, max_positives, -1),
+    ], dim=2)
+
+    scaled = pool / temperature
+    log_normalizer = scaled.masked_fill(~entry_valid, float('-inf')).logsumexp(dim=2)
+    nll = -positive_scores / temperature + log_normalizer
+    if label_smoothing > 0.0:
+        mean_scaled = (scaled * entry_valid).sum(dim=2) / entry_valid.sum(dim=2)
+        per_positive = ((1.0 - label_smoothing) * nll
+                        + label_smoothing * (-mean_scaled + log_normalizer))
+    else:
+        per_positive = nll
+
+    row_valid = slot_valid & contrib.unsqueeze(1)
+    per_event = (per_positive * row_valid).sum(dim=1) / row_valid.sum(dim=1).clamp_min(1)
+    return per_event[contrib].mean()
+
+
+def full_list_softmax_ce_loss(
+    scores: torch.Tensor,
+    pos_mask: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    temperature: float,
+    label_smoothing: float,
+) -> torch.Tensor:
+    """scores: (B, N). pos_mask, valid_mask: (B, N) bool. Returns scalar loss.
+    Each positive's pool is itself plus ALL valid negatives — other positives are
+    excluded from every denominator, so duplicate GT 3-sets never suppress each
+    other."""
+    positive = pos_mask & valid_mask
+    negative = ~pos_mask & valid_mask
+    contrib = positive.any(dim=1) & negative.any(dim=1)
+    if not contrib.any():
+        return scores.sum() * 0.0
+
+    scaled = scores / temperature
+    negative_lse = scaled.masked_fill(~negative, float('-inf')).logsumexp(dim=1)
+    negative_sum = (scaled * negative).sum(dim=1)
+    negative_count = negative.sum(dim=1)
+
+    slots, slot_valid = _positive_slots(positive)
+    positive_scaled = scores.gather(1, slots) / temperature
+    log_normalizer = torch.logaddexp(positive_scaled, negative_lse.unsqueeze(1))
+    nll = -positive_scaled + log_normalizer
+    if label_smoothing > 0.0:
+        mean_scaled = ((positive_scaled + negative_sum.unsqueeze(1))
+                       / (1 + negative_count).unsqueeze(1))
+        per_positive = ((1.0 - label_smoothing) * nll
+                        + label_smoothing * (-mean_scaled + log_normalizer))
+    else:
+        per_positive = nll
+
+    row_valid = slot_valid & contrib.unsqueeze(1)
+    per_event = (per_positive * row_valid).sum(dim=1) / row_valid.sum(dim=1).clamp_min(1)
+    return per_event[contrib].mean()
 
 
 class TripletReranker(nn.Module):
@@ -28,21 +160,46 @@ class TripletReranker(nn.Module):
         ranking_temperature: float = 1.0,
         label_smoothing: float = 0.10,
         projector_dim: int = 32,
-        rest_dim: int = 41,
+        feature_names: list[str] | None = None,
+        loss_mode: str = 'sampled',
     ):
         super().__init__()
         if input_mode not in ('flat', 'hierarchical'):
             raise ValueError(f'unknown input_mode {input_mode!r}')
+        if loss_mode not in ('sampled', 'full'):
+            raise ValueError(f'unknown loss_mode {loss_mode!r}')
         self.input_mode = input_mode
-        self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         self.ranking_num_samples = ranking_num_samples
         self.ranking_temperature = ranking_temperature
         self.label_smoothing = label_smoothing
         self.projector_dim = projector_dim
-        self.rest_dim = rest_dim
+        self.loss_mode = loss_mode
+        self.feature_names = list(feature_names) if feature_names is not None else None
 
         if input_mode == 'hierarchical':
+            if self.feature_names is None:
+                raise ValueError('hierarchical input_mode requires feature_names '
+                                 'to locate the ti_/tj_/tk_ channel blocks')
+            track_indices = {prefix: [index for index, name in enumerate(self.feature_names)
+                                      if name.startswith(prefix)]
+                             for prefix in _TRACK_PREFIXES}
+            for prefix, indices in track_indices.items():
+                if len(indices) != _TRACK_EMBED_DIM:
+                    raise ValueError(f'expected {_TRACK_EMBED_DIM} {prefix}* features, '
+                                     f'got {len(indices)}')
+            rest_indices = [index for index, name in enumerate(self.feature_names)
+                            if not name.startswith(_TRACK_PREFIXES)]
+            self.register_buffer('ti_idx', torch.tensor(track_indices['ti_']),
+                                 persistent=False)
+            self.register_buffer('tj_idx', torch.tensor(track_indices['tj_']),
+                                 persistent=False)
+            self.register_buffer('tk_idx', torch.tensor(track_indices['tk_']),
+                                 persistent=False)
+            self.register_buffer('rest_idx', torch.tensor(rest_indices),
+                                 persistent=False)
+            self.rest_dim = len(rest_indices)
+            self.feature_dim = len(self.feature_names)
             # φ(t) = LayerNorm(ReLU(Linear(16→p)(t))) shared over i, j, k — same block as
             # CoupleReranker.couple_projector, so it can warm-start from its state dict.
             self.track_projector = nn.Sequential(
@@ -58,9 +215,11 @@ class TripletReranker(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.LayerNorm(projector_dim),
             )
-            self.input_dim = 4 * projector_dim + rest_dim
+            self.input_dim = 4 * projector_dim + self.rest_dim
         else:
-            self.input_dim = feature_dim
+            self.feature_dim = (len(self.feature_names)
+                                if self.feature_names is not None else feature_dim)
+            self.input_dim = self.feature_dim
 
         self.input_projection = nn.Sequential(
             nn.Conv1d(self.input_dim, hidden_dim, kernel_size=1, bias=False),
@@ -81,16 +240,14 @@ class TripletReranker(nn.Module):
         )
 
     def _assemble_hierarchical(self, features: torch.Tensor) -> torch.Tensor:
-        """features: (B, 48 + rest_dim, N). Returns (B, 4*p + rest_dim, N)."""
-        d = _TRACK_EMBED_DIM
-        expected = _HIERARCHICAL_TRACK_BLOCKS * d + self.rest_dim
-        assert features.shape[1] == expected, \
-            f'hierarchical input expects {expected} channels, got {features.shape[1]}'
+        """features: (B, len(feature_names), N). Returns (B, 4*p + rest_dim, N)."""
+        assert features.shape[1] == self.feature_dim, \
+            f'hierarchical input expects {self.feature_dim} channels, got {features.shape[1]}'
         project = lambda block: self.track_projector(block.transpose(1, 2)).transpose(1, 2)
-        phi_i = project(features[:, :d, :])
-        phi_j = project(features[:, d:2 * d, :])
-        phi_k = project(features[:, 2 * d:3 * d, :])
-        rest = features[:, 3 * d:, :]
+        phi_i = project(features.index_select(1, self.ti_idx))
+        phi_j = project(features.index_select(1, self.tj_idx))
+        phi_k = project(features.index_select(1, self.tk_idx))
+        rest = features.index_select(1, self.rest_idx)
 
         couple_assembly = torch.cat(
             [phi_i, phi_j, (phi_i - phi_j).abs(), phi_i * phi_j], dim=1)
@@ -118,12 +275,23 @@ class TripletReranker(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """features: (B, F, N). pos_mask, valid_mask: (B, N) bool."""
         scores = self.forward(features)
-        ranking_loss = self._softmax_ce_loss(scores, pos_mask.float(), valid_mask.float())
+        if self.loss_mode == 'full':
+            ranking_loss = full_list_softmax_ce_loss(
+                scores, pos_mask.bool(), valid_mask.bool(),
+                temperature=self.ranking_temperature,
+                label_smoothing=self.label_smoothing)
+        else:
+            ranking_loss = sampled_softmax_ce_loss(
+                scores, pos_mask.bool(), valid_mask.bool(),
+                num_samples=self.ranking_num_samples,
+                temperature=self.ranking_temperature,
+                label_smoothing=self.label_smoothing)
         return {
             'total_loss': ranking_loss,
             'ranking_loss': ranking_loss,
             '_scores': scores,
         }
 
-    # InfoNCE top-1 with label smoothing — the couple stage's implementation, reused.
+    # InfoNCE top-1 with label smoothing — the couple stage's loop implementation,
+    # kept as the numerical reference the vectorized losses are pinned to.
     _softmax_ce_loss = CoupleReranker._softmax_ce_loss

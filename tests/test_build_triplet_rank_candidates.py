@@ -33,7 +33,17 @@ _HAVE_MODELS = os.path.exists(_GBDT6) and os.path.exists(_GBDT8)
 
 def _synthetic_event(couples):
     # 5 tracks, charges (+,+,-,-,+); GT = tracks 0,1,2. Mirrors tests/test_triplet_join.py.
-    dump_cols = ([list(range(5))], [couples])
+    # stage1 order is a nontrivial permutation so the track_s1 scatter is exercised;
+    # track 4 sits outside the stage-2 set -> NaN track_s2 there (couple members must
+    # stay inside it, matching the real top-K2 construction).
+    dump_cols = {
+        'stage1_sorted_indices': [[2, 0, 3, 1, 4]],
+        'stage1_scores': [[0.9, 0.8, 0.7, 0.6, 0.5]],
+        'stage2_sorted_indices': [[2, 0, 3, 1]],
+        'stage2_scores': [[0.5, 0.4, 0.35, 0.3]],
+        'stage3_sorted_couples': [couples],
+        'stage3_couple_scores': [[round(0.95 - 0.1 * c, 2) for c in range(len(couples))]],
+    }
     src_cols = {
         'event_n_tracks': [5],
         'track_pt': [[1.0, 1.2, 0.9, 1.1, 0.8]],
@@ -62,6 +72,8 @@ def test_candidate_schema_fields():
     assert CANDIDATE_SCHEMA.field('is_gt').type == pa.list_(pa.bool_())
     assert CANDIDATE_SCHEMA.field('gt_i').type == pa.int16()
     assert CANDIDATE_SCHEMA.field('recon').type == pa.bool_()
+    for field_name in ['track_s1', 'track_s2', 'couple_scores']:
+        assert CANDIDATE_SCHEMA.field(field_name).type == pa.list_(pa.float32())
 
 
 @pytest.mark.skipif(not _HAVE_MODELS, reason='GBDT joblibs not present')
@@ -145,9 +157,68 @@ def test_builder_integration_real_val(tmp_path):
 
 
 def _replicate(dump_cols, src_cols, n):
-    dump = ([dump_cols[0][0]] * n, [dump_cols[1][0]] * n)
+    dump = {key: value * n for key, value in dump_cols.items()}
     src = {key: value * n for key, value in src_cols.items()}
     return dump, src
+
+
+@pytest.mark.skipif(not _HAVE_MODELS, reason='GBDT joblibs not present')
+def test_cascade_columns_synthetic():
+    dump_cols, src_cols = _synthetic_event([[0, 1], [0, 2]])
+    models = load_gbdt_models()
+    row = event_candidates(0, dump_cols, src_cols, top_c=100, gbdt_models=models)
+
+    # track_s1 = stage1 scores scattered back to track order by the sorted indices.
+    assert row['track_s1'] == pytest.approx([0.8, 0.6, 0.9, 0.7, 0.5])
+    # track_s2 covers only the stage-2 set {2, 0, 3, 1}; track 4 is NaN.
+    track_s2 = row['track_s2']
+    assert track_s2[:4] == pytest.approx([0.4, 0.3, 0.5, 0.35])
+    assert np.isnan(track_s2[4])
+    # couple members always carry finite stage-2 scores.
+    for i, j in zip(row['cand_i'], row['cand_j']):
+        assert np.isfinite(track_s2[i]) and np.isfinite(track_s2[j])
+    assert row['couple_scores'] == pytest.approx([0.95, 0.85])
+    assert max(row['couple_rank']) < len(row['couple_scores'])
+
+
+@pytest.mark.skipif(not _HAVE_MODELS, reason='GBDT joblibs not present')
+def test_couple_scores_truncated_to_top_c():
+    dump_cols, src_cols = _synthetic_event([[0, 1], [0, 2]])
+    models = load_gbdt_models()
+    row = event_candidates(0, dump_cols, src_cols, top_c=1, gbdt_models=models)
+    assert row['couple_scores'] == pytest.approx([0.95])
+    assert max(row['couple_rank']) == 0
+
+
+def _write_prefix_fixtures(directory, dump_rows, src_rows):
+    import build_triplet_rank_candidates as builder
+
+    dump_cols, src_cols = _synthetic_event([[0, 1]])
+    dump = {key: value * dump_rows for key, value in dump_cols.items()}
+    src = {key: value * src_rows for key, value in src_cols.items()}
+    dump_path = os.path.join(directory, 'dump.parquet')
+    src_path = os.path.join(directory, 'src_0.parquet')
+    pq.write_table(pa.table(dump), dump_path)
+    pq.write_table(pa.table({key: src[key] for key in builder.SRC_COLS}), src_path)
+    return dump_path, os.path.join(directory, 'src_*.parquet')
+
+
+def test_load_prefix_allows_partial_dump(tmp_path):
+    from build_triplet_rank_candidates import _load_prefix
+
+    dump_path, src_glob = _write_prefix_fixtures(str(tmp_path), dump_rows=2, src_rows=3)
+    dump, src, n = _load_prefix(dump_path, src_glob, None)
+    assert n == 2 and dump.num_rows == 2 and src.num_rows == 2
+    _, _, n_capped = _load_prefix(dump_path, src_glob, 1)
+    assert n_capped == 1
+
+
+def test_load_prefix_rejects_dump_longer_than_src(tmp_path):
+    from build_triplet_rank_candidates import _load_prefix
+
+    dump_path, src_glob = _write_prefix_fixtures(str(tmp_path), dump_rows=4, src_rows=3)
+    with pytest.raises(AssertionError):
+        _load_prefix(dump_path, src_glob, None)
 
 
 @pytest.mark.skipif(not _HAVE_MODELS, reason='GBDT joblibs not present')
@@ -232,7 +303,13 @@ def test_parallel_workers_match_single_process(tmp_path):
     single = pq.read_table(str(single_dir / 'candidates_val.parquet'))
     parallel = pq.read_table(str(parallel_dir / 'candidates_val.parquet'))
     assert single.num_rows == parallel.num_rows == 40
-    assert single.equals(parallel)
+    # track_s2 legitimately holds NaN (outside the stage-1 top-K1) and arrow's
+    # equals treats NaN != NaN -> compare that column NaN-aware, the rest exactly.
+    nan_free = [name for name in single.schema.names if name != 'track_s2']
+    assert single.select(nan_free).equals(parallel.select(nan_free))
+    for left, right in zip(single['track_s2'].to_pylist(),
+                           parallel['track_s2'].to_pylist()):
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
     assert not glob.glob(str(parallel_dir / 'candidates_val.parquet.chunk*'))
 
 
