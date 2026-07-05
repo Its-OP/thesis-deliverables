@@ -68,6 +68,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--weaver-track-blocks', action='store_true',
                         help='weaver-standardized ti_/tj_/tk_ blocks for hierarchical '
                              'warm-start fidelity')
+    parser.add_argument('--context-features', action='store_true',
+                        help='append per-candidate standings within the event\'s '
+                             'tau-surviving list (ctx_* features)')
     parser.add_argument('--extra-features', choices=('none', 'gbdt', 'all', 'auto'), default='auto',
                         help='inputs beyond the 89 geometry features (gbdt scores, cascade scores)')
     parser.add_argument('--loss-mode', choices=('sampled', 'full'), default='sampled')
@@ -102,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _norm_stats(args, feature_names, train_events) -> dict:
+def _norm_stats(args, feature_names, train_events, tau, score_column) -> dict:
     if os.path.exists(args.norm_stats):
         logger.info(f'loading norm stats from {args.norm_stats}')
         stats = load_norm_stats(args.norm_stats)
@@ -114,7 +117,8 @@ def _norm_stats(args, feature_names, train_events) -> dict:
     logger.info('fitting norm stats on the train side')
     stats = fit_norm_stats(args.candidates, args.tracks, feature_names=feature_names,
                            n_events=args.norm_stats_events, seed=args.seed,
-                           events=train_events)
+                           events=train_events, tau=tau, score_column=score_column,
+                           context_features=args.context_features)
     save_norm_stats(stats, args.norm_stats)
     logger.info(f'wrote {args.norm_stats}')
     return stats
@@ -218,9 +222,10 @@ def main(argv=None) -> None:
         args.candidates, args.tracks, tau=tau, score_column=score_column,
         num_negatives=args.num_negatives, mode='train', seed=args.seed,
         extra_features=args.extra_features,
-        weaver_track_blocks=args.weaver_track_blocks)
+        weaver_track_blocks=args.weaver_track_blocks,
+        context_features=args.context_features)
     feature_names = train_dataset.feature_names
-    norm_stats = _norm_stats(args, feature_names, train_events)
+    norm_stats = _norm_stats(args, feature_names, train_events, tau, score_column)
     train_dataset.norm_stats = norm_stats
 
     if args.eval_candidates:
@@ -228,7 +233,8 @@ def main(argv=None) -> None:
             args.eval_candidates, args.eval_tracks, tau=tau, score_column=score_column,
             mode='eval', norm_stats=norm_stats, seed=args.seed,
             extra_features=args.extra_features,
-            weaver_track_blocks=args.weaver_track_blocks)
+            weaver_track_blocks=args.weaver_track_blocks,
+            context_features=args.context_features)
         if eval_dataset.feature_names != feature_names:
             raise SystemExit('eval artifact resolves different feature names than the '
                              'train artifact (extra columns mismatch)')
@@ -237,7 +243,8 @@ def main(argv=None) -> None:
             args.candidates, args.tracks, tau=tau, score_column=score_column,
             mode='eval', norm_stats=norm_stats, seed=args.seed,
             extra_features=args.extra_features,
-            weaver_track_blocks=args.weaver_track_blocks)
+            weaver_track_blocks=args.weaver_track_blocks,
+            context_features=args.context_features)
 
     n_rows = train_dataset.table.num_rows
     if args.split_json:

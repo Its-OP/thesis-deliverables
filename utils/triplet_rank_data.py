@@ -36,6 +36,12 @@ LOG1P_MARKERS = ('dz', 'dxy', 'dca', 'chi2', 'pt_error', 'rel_pt_err', 'cov_', '
 GBDT_EXTRA_NAMES = ['gbdt6_score', 'gbdt8_score']
 CASCADE_EXTRA_NAMES = ['s1_i', 's1_j', 's1_k', 's2_i', 's2_j', 's2_k',
                        's2_k_isvalid', 's3_couple']
+# Per-candidate standings within the event's full tau-surviving list; computed at
+# dataset time from the full list on both the train and eval side, so the sampled
+# training subset sees the same values as full-list eval.
+CONTEXT_FEATURE_NAMES = ['ctx_gbdt6_rank_frac', 'ctx_gbdt6_top_gap', 'ctx_gbdt6_z',
+                         'ctx_gbdt8_rank_frac', 'ctx_gbdt8_top_gap',
+                         'ctx_log_n_surviving', 'ctx_couple_rank_frac']
 
 
 def resolve_feature_names(table: '_EventTable', extra_features: str) -> list[str]:
@@ -215,9 +221,45 @@ def build_candidate_features(table: _EventTable, r: int, arrays: dict, selected,
     return features, i, j, k
 
 
+def _rank_fractions(scores: np.ndarray) -> np.ndarray:
+    order = np.argsort(-scores, kind='stable')
+    ranks = np.empty(len(scores), dtype=np.int64)
+    ranks[order] = np.arange(1, len(scores) + 1)
+    return ranks / len(scores)
+
+
+def event_context_features(arrays: dict, cascade: dict, surviving: np.ndarray,
+                           selected) -> torch.Tensor:
+    """arrays/cascade: candidate_arrays(r)/cascade_arrays(r). surviving: (S,) and
+    selected: (M,) candidate positions, selected a subset of surviving.
+    Returns (M, len(CONTEXT_FEATURE_NAMES)) float32."""
+    n_surviving = len(surviving)
+    if n_surviving == 0:
+        return torch.zeros((0, len(CONTEXT_FEATURE_NAMES)), dtype=torch.float32)
+    gbdt6 = arrays['gbdt6_score'][surviving].astype(np.float64)
+    gbdt8 = arrays['gbdt8_score'][surviving].astype(np.float64)
+    n_couples = len(cascade['couple_scores'])
+    couple_rank = arrays['couple_rank'][surviving].astype(np.float64)
+    context = np.stack([
+        _rank_fractions(gbdt6),
+        gbdt6.max() - gbdt6,
+        (gbdt6 - gbdt6.mean()) / (gbdt6.std() + 1e-6),
+        _rank_fractions(gbdt8),
+        gbdt8.max() - gbdt8,
+        np.full(n_surviving, np.log1p(n_surviving)),
+        couple_rank / n_couples if n_couples else np.zeros(n_surviving),
+    ], axis=1)
+    position_in_surviving = np.empty(int(surviving.max()) + 1, dtype=np.int64)
+    position_in_surviving[surviving] = np.arange(n_surviving)
+    lookup = position_in_surviving[np.asarray(selected)]
+    return torch.tensor(context[lookup], dtype=torch.float32)
+
+
 def fit_norm_stats(candidates_path: str, tracks_path: str, *,
                    feature_names: list[str] | None = None, n_events: int = 2000,
-                   per_event: int = 50, seed: int = 0, events=None) -> dict:
+                   per_event: int = 50, seed: int = 0, events=None,
+                   tau: float | None = None, score_column: str = 'gbdt6_score',
+                   context_features: bool = False) -> dict:
     """Median/IQR stats over sampled surviving candidates; keys = feature_names
     (default FEATURE_NAMES). NaN entries (missing Stage-2 scores) are ignored by
     the percentiles; binary *_isvalid flags get passthrough stats.
@@ -225,9 +267,13 @@ def fit_norm_stats(candidates_path: str, tracks_path: str, *,
     events: optional event-row pool to sample from (e.g. the train split side);
     defaults to all rows.
     """
+    if context_features and tau is None:
+        raise ValueError('context_features=True requires tau (context is defined '
+                         'over the tau-surviving list)')
     table = _EventTable(candidates_path, tracks_path)
     if feature_names is None:
         feature_names = list(FEATURE_NAMES)
+    base_names = [name for name in feature_names if name not in CONTEXT_FEATURE_NAMES]
     generator = np.random.default_rng(seed)
     pool = np.arange(table.num_rows) if events is None else np.asarray(events)
     events = generator.choice(pool, min(n_events, len(pool)), replace=False)
@@ -237,8 +283,20 @@ def fit_norm_stats(candidates_path: str, tracks_path: str, *,
         n = len(arrays['cand_i'])
         if n == 0:
             continue
-        take = generator.choice(n, min(per_event, n), replace=False)
-        X, _, _, _ = build_candidate_features(table, int(r), arrays, take, feature_names)
+        if context_features:
+            surviving = np.where(arrays[score_column] >= tau)[0]
+            if len(surviving) == 0:
+                continue
+            take = surviving[generator.choice(len(surviving),
+                                              min(per_event, len(surviving)),
+                                              replace=False)]
+        else:
+            take = generator.choice(n, min(per_event, n), replace=False)
+        X, _, _, _ = build_candidate_features(table, int(r), arrays, take, base_names)
+        if context_features:
+            context = event_context_features(arrays, table.cascade_arrays(int(r)),
+                                             surviving, take)
+            X = torch.cat([X, context], dim=1)
         samples.append(X.numpy())
     sample = np.concatenate(samples)
     stats = {}
@@ -269,7 +327,8 @@ class TripletRankDataset(Dataset):
     def __init__(self, candidates_path: str, tracks_path: str, *, tau: float,
                  score_column: str = 'gbdt6_score', num_negatives: int = 50,
                  mode: str = 'train', norm_stats: dict | None = None, seed: int = 0,
-                 extra_features: str = 'none', weaver_track_blocks: bool = False):
+                 extra_features: str = 'none', weaver_track_blocks: bool = False,
+                 context_features: bool = False):
         assert mode in ('train', 'eval')
         self.table = _EventTable(candidates_path, tracks_path)
         self.tau = tau
@@ -278,7 +337,14 @@ class TripletRankDataset(Dataset):
         self.mode = mode
         self.norm_stats = norm_stats
         self.generator = np.random.default_rng(seed)
-        self.feature_names = resolve_feature_names(self.table, extra_features)
+        self._base_feature_names = resolve_feature_names(self.table, extra_features)
+        self.feature_names = self._base_feature_names
+        self.context_features = context_features
+        if context_features:
+            if not self.table.has_cascade_columns:
+                raise ValueError('context_features requires track_s1/track_s2/'
+                                 'couple_scores columns in the candidates artifact')
+            self.feature_names = self._base_feature_names + CONTEXT_FEATURE_NAMES
         self.weaver_track_blocks = weaver_track_blocks
         if weaver_track_blocks:
             self.track16_params = load_track16_params()
@@ -328,7 +394,7 @@ class TripletRankDataset(Dataset):
             pos_mask = is_gt.astype(bool)
 
         features, i, j, k = build_candidate_features(
-            self.table, int(r), arrays, selected, self.feature_names)
+            self.table, int(r), arrays, selected, self._base_feature_names)
         if self.weaver_track_blocks:
             kw = self.table.track_kw(int(r))
             pt = torch.sqrt(kw['lorentz'][0] ** 2 + kw['lorentz'][1] ** 2)
@@ -340,6 +406,10 @@ class TripletRankDataset(Dataset):
                 params=self.track16_params)
             features[:, self.track_block_columns] = torch.cat(
                 [track16[i], track16[j], track16[k]], dim=1)
+        if self.context_features:
+            context = event_context_features(
+                arrays, self.table.cascade_arrays(int(r)), surviving, selected)
+            features = torch.cat([features, context], dim=1)
         if self.norm_stats is not None:
             standardized = standardize_features(features, self.feature_names, self.norm_stats)
             if self.weaver_track_blocks:

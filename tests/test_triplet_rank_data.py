@@ -15,11 +15,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts', 'pyt
 from utils.triplet_join import FEATURE_NAMES, build_track_lorentz
 from utils.triplet_rank_data import (
     CASCADE_EXTRA_NAMES,
+    CONTEXT_FEATURE_NAMES,
     GBDT_EXTRA_NAMES,
     LOG1P_MARKERS,
     TripletRankDataset,
     collate_triplet_rank,
     collate_triplet_rank_eval,
+    event_context_features,
     fit_norm_stats,
     load_norm_stats,
     load_track16_params,
@@ -446,3 +448,123 @@ def test_weaver_track_blocks_with_norm_stats_keeps_raw_track16_values(tmp_path):
     torch.testing.assert_close(weaver_item['features'][:, non_track_columns],
                                baseline_item['features'][:, non_track_columns],
                                rtol=0.0, atol=0.0, equal_nan=True)
+
+
+def test_context_feature_names_order():
+    assert CONTEXT_FEATURE_NAMES == [
+        'ctx_gbdt6_rank_frac', 'ctx_gbdt6_top_gap', 'ctx_gbdt6_z',
+        'ctx_gbdt8_rank_frac', 'ctx_gbdt8_top_gap',
+        'ctx_log_n_surviving', 'ctx_couple_rank_frac',
+    ]
+    assert not any(any(marker in name for marker in LOG1P_MARKERS)
+                   for name in CONTEXT_FEATURE_NAMES)
+
+
+def test_context_features_hand_computed_event0(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    dataset = TripletRankDataset(cand, tracks, tau=0.0, mode='eval',
+                                 extra_features='all', context_features=True)
+    assert dataset.feature_names == (list(FEATURE_NAMES) + GBDT_EXTRA_NAMES
+                                     + CASCADE_EXTRA_NAMES + CONTEXT_FEATURE_NAMES)
+    context = dataset[0]['features'][:, -len(CONTEXT_FEATURE_NAMES):]
+
+    # Event 0 at tau=0: surviving = all 3 candidates, gbdt6 [0.9, 0.5, 0.2],
+    # gbdt8 [0.8, 0.4, 0.1], couple_rank [0, 1, 1], couple_scores len 2.
+    gbdt6 = np.array([0.9, 0.5, 0.2])
+    gbdt8 = np.array([0.8, 0.4, 0.1])
+    expected = np.stack([
+        [1 / 3, 2 / 3, 3 / 3],
+        gbdt6.max() - gbdt6,
+        (gbdt6 - gbdt6.mean()) / (gbdt6.std() + 1e-6),
+        [1 / 3, 2 / 3, 3 / 3],
+        gbdt8.max() - gbdt8,
+        [np.log1p(3)] * 3,
+        [0 / 2, 1 / 2, 1 / 2],
+    ], axis=1)
+    torch.testing.assert_close(context, torch.tensor(expected, dtype=torch.float32),
+                               rtol=0.0, atol=1e-5)
+
+
+def test_context_features_tau_dependence(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    dataset = TripletRankDataset(cand, tracks, tau=0.3, mode='eval',
+                                 extra_features='all', context_features=True)
+    context = dataset[0]['features'][:, -len(CONTEXT_FEATURE_NAMES):]
+
+    # tau=0.3 drops the gbdt6=0.2 candidate: surviving = first 2 of event 0.
+    gbdt6 = np.array([0.9, 0.5])
+    gbdt8 = np.array([0.8, 0.4])
+    expected = np.stack([
+        [1 / 2, 2 / 2],
+        gbdt6.max() - gbdt6,
+        (gbdt6 - gbdt6.mean()) / (gbdt6.std() + 1e-6),
+        [1 / 2, 2 / 2],
+        gbdt8.max() - gbdt8,
+        [np.log1p(2)] * 2,
+        [0 / 2, 1 / 2],
+    ], axis=1)
+    torch.testing.assert_close(context, torch.tensor(expected, dtype=torch.float32),
+                               rtol=0.0, atol=1e-5)
+
+
+def test_context_features_train_eval_consistency(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    kwargs = dict(tau=0.0, extra_features='all', context_features=True)
+    train_dataset = TripletRankDataset(cand, tracks, num_negatives=2, mode='train',
+                                       seed=0, **kwargs)
+    eval_dataset = TripletRankDataset(cand, tracks, mode='eval', **kwargs)
+    train_item = train_dataset[0]
+    eval_item = eval_dataset[0]
+    n_context = len(CONTEXT_FEATURE_NAMES)
+    # The positive (candidate 0) leads the train item; its context must equal the
+    # eval item's row for the same candidate — both derive from the full list.
+    torch.testing.assert_close(train_item['features'][0, -n_context:],
+                               eval_item['features'][0, -n_context:],
+                               rtol=0.0, atol=0.0)
+
+
+def test_context_features_flag_off_unchanged(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    plain = TripletRankDataset(cand, tracks, tau=0.0, mode='eval', extra_features='all')
+    flagged_off = TripletRankDataset(cand, tracks, tau=0.0, mode='eval',
+                                     extra_features='all', context_features=False)
+    assert flagged_off.feature_names == plain.feature_names
+    torch.testing.assert_close(flagged_off[0]['features'], plain[0]['features'],
+                               rtol=0.0, atol=0.0, equal_nan=True)
+
+
+def test_context_features_require_cascade_columns(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=False)
+    with pytest.raises(ValueError, match='couple_scores'):
+        TripletRankDataset(cand, tracks, tau=0.0, mode='eval',
+                           extra_features='gbdt', context_features=True)
+
+
+def test_event_context_features_single_survivor_guards(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    table = TripletRankDataset(cand, tracks, tau=0.0).table
+    arrays = table.candidate_arrays(0)
+    cascade = table.cascade_arrays(0)
+    surviving = np.array([0])
+    context = event_context_features(arrays, cascade, surviving, surviving)
+    torch.testing.assert_close(
+        context,
+        torch.tensor([[1.0, 0.0, 0.0, 1.0, 0.0, np.log1p(1), 0.0]],
+                     dtype=torch.float32))
+
+
+def test_fit_norm_stats_context(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    names = (list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES
+             + CONTEXT_FEATURE_NAMES)
+    stats = fit_norm_stats(cand, tracks, feature_names=names, n_events=2,
+                           per_event=10, tau=0.0, context_features=True)
+    assert set(names) <= set(stats)
+    for name in CONTEXT_FEATURE_NAMES:
+        assert np.isfinite(stats[name]['center'])
+        assert stats[name]['scale'] > 0
+        assert not stats[name]['log1p']
+
+    with pytest.raises(ValueError, match='tau'):
+        fit_norm_stats(cand, tracks, feature_names=names, n_events=2,
+                       per_event=10, context_features=True)

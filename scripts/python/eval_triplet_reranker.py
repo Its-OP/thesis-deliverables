@@ -111,7 +111,8 @@ def main(argv=None) -> None:
         args.candidates, args.tracks, tau=tau, score_column=score_column,
         mode='eval', norm_stats=checkpoint['norm_stats'], seed=0,
         extra_features=checkpoint['args'].get('extra_features', 'none'),
-        weaver_track_blocks=checkpoint['args'].get('weaver_track_blocks', False))
+        weaver_track_blocks=checkpoint['args'].get('weaver_track_blocks', False),
+        context_features=checkpoint['args'].get('context_features', False))
     if dataset.feature_names != checkpoint['feature_names']:
         raise SystemExit('candidates artifact resolves different feature names than '
                          'the checkpoint was trained with')
