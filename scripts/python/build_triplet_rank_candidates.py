@@ -125,10 +125,6 @@ def load_gbdt_models():
 
 
 def _plain_array(column):
-    # list<> uses int32 offsets; a full 300k-event candidates table exceeds 2^31
-    # total elements, so cast to large_list (int64 offsets) before combining.
-    if isinstance(column, pa.ChunkedArray) and pa.types.is_list(column.type):
-        column = column.cast(pa.large_list(column.type.value_type))
     array = column.combine_chunks()
     if isinstance(array, pa.ChunkedArray):
         array = array.chunk(0)
