@@ -17,7 +17,6 @@ from utils.triplet_rank_data import (
     CASCADE_EXTRA_NAMES,
     GBDT_EXTRA_NAMES,
     LOG1P_MARKERS,
-    MULTIPLICITY_EXTRA_NAMES,
     TripletRankDataset,
     collate_triplet_rank,
     collate_triplet_rank_eval,
@@ -199,16 +198,11 @@ def test_collate_pads_and_masks(real_artifact):
     assert (batch['features'].transpose(1, 2)[~batch['valid_mask']] == 0).all()
 
 
-def _write_synthetic_artifacts(directory, with_cascade, with_multiplicity=None):
+def _write_synthetic_artifacts(directory, with_cascade):
     # Event 0: 5 tracks, 3 candidates (first is GT), one couple. Event 1: 4 tracks,
     # 2 candidates that are BOTH GT decompositions (zero negatives). track_s2[3] of
     # event 0 is NaN so candidate 1 (k=3) exercises the missing-Stage-2 path.
-    # with_multiplicity defaults to with_cascade (both extras land in the schema
-    # together in production); pass it explicitly to test a cascade-only artifact.
     import pyarrow as pa
-
-    if with_multiplicity is None:
-        with_multiplicity = with_cascade
 
     candidates = {
         'n_tracks': [5, 4],
@@ -228,8 +222,6 @@ def _write_synthetic_artifacts(directory, with_cascade, with_multiplicity=None):
         candidates['track_s1'] = [[0.9, 0.8, 0.7, 0.6, 0.5], [0.9, 0.8, 0.7, 0.6]]
         candidates['track_s2'] = [[0.5, 0.4, 0.3, nan, 0.2], [0.5, 0.4, 0.3, 0.2]]
         candidates['couple_scores'] = [[1.5, 1.2], [2.0]]
-    if with_multiplicity:
-        candidates['n_decomp'] = [[2, 1, 1], [1, 1]]
     tracks = {
         'track_pt': [[1.0, 2.0, 3.0, 4.0, 5.0], [1.5, 2.5, 3.5, 4.5]],
         'track_eta': [[0.1, -0.2, 0.3, -0.4, 0.5], [0.2, -0.1, 0.4, -0.3]],
@@ -259,8 +251,7 @@ def test_resolve_feature_names_variants(tmp_path):
     assert resolve_feature_names(with_cascade, 'none') == list(FEATURE_NAMES)
     assert resolve_feature_names(with_cascade, 'gbdt') == list(FEATURE_NAMES) + GBDT_EXTRA_NAMES
     assert (resolve_feature_names(with_cascade, 'all')
-            == list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES
-            + MULTIPLICITY_EXTRA_NAMES)
+            == list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES)
     assert resolve_feature_names(with_cascade, 'auto') == resolve_feature_names(with_cascade, 'all')
     with pytest.raises(ValueError):
         resolve_feature_names(with_cascade, 'bogus')
@@ -273,30 +264,17 @@ def test_resolve_feature_names_variants(tmp_path):
     with pytest.raises(ValueError):
         resolve_feature_names(without, 'all')
 
-    # Cascade columns present but n_decomp absent: 'auto' falls back gracefully (99
-    # names, no cascade-only regression); 'all' still requires the column.
-    no_multiplicity_dir = tmp_path / 'no_multiplicity'
-    no_multiplicity_dir.mkdir()
-    cand_nm, tracks_nm, _ = _write_synthetic_artifacts(
-        str(no_multiplicity_dir), with_cascade=True, with_multiplicity=False)
-    without_multiplicity = TripletRankDataset(cand_nm, tracks_nm, tau=0.0).table
-    assert (resolve_feature_names(without_multiplicity, 'auto')
-            == list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES)
-    with pytest.raises(ValueError):
-        resolve_feature_names(without_multiplicity, 'all')
-
 
 def test_extra_feature_values_and_nan_pattern(tmp_path):
     cand, tracks, raw = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
     ds = TripletRankDataset(cand, tracks, tau=0.0, mode='eval', extra_features='all')
-    assert (ds.feature_names == list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES
-            + MULTIPLICITY_EXTRA_NAMES)
+    assert ds.feature_names == list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES
     item = ds[0]
     features = item['features']
-    assert features.shape == (3, 100)
+    assert features.shape == (3, 99)
     base = len(FEATURE_NAMES)
-    extra_order = GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES + MULTIPLICITY_EXTRA_NAMES
-    column = {name: features[:, base + offset] for offset, name in enumerate(extra_order)}
+    column = {name: features[:, base + offset]
+              for offset, name in enumerate(GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES)}
     torch.testing.assert_close(column['gbdt6_score'],
                                torch.tensor(raw['gbdt6_score'][0]))
     torch.testing.assert_close(column['gbdt8_score'],
@@ -312,13 +290,11 @@ def test_extra_feature_values_and_nan_pattern(tmp_path):
     couple_scores = raw['couple_scores'][0]
     torch.testing.assert_close(column['s3_couple'],
                                torch.tensor([couple_scores[c] for c in raw['couple_rank'][0]]))
-    torch.testing.assert_close(column['n_decomp'],
-                               torch.tensor(raw['n_decomp'][0], dtype=torch.float32))
 
 
 def test_norm_stats_nan_policy_and_passthrough(tmp_path):
     cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
-    names = list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES + MULTIPLICITY_EXTRA_NAMES
+    names = list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES
     stats = fit_norm_stats(cand, tracks, feature_names=names, n_events=2, per_event=10)
     assert list(stats) == names
     # NaN-aware fit: s2_k stats come from the finite entries only.
@@ -376,7 +352,7 @@ def test_collate_triplet_rank_eval_carries_keys_and_counts(tmp_path):
     ds = TripletRankDataset(cand, tracks, tau=0.0, mode='eval', extra_features='all')
     items = [ds[0], ds[1]]
     batch = collate_triplet_rank_eval(items)
-    assert batch['features'].shape == (2, 100, 3)  # event 0 has 3 candidates, event 1 has 2
+    assert batch['features'].shape == (2, 99, 3)   # event 0 has 3 candidates, event 1 has 2
     assert batch['valid_mask'].tolist() == [[True, True, True], [True, True, False]]
     assert batch['counts'].tolist() == [3, 2]
     assert len(batch['keys']) == 2
@@ -440,7 +416,7 @@ def test_weaver_track_blocks_matches_track16_std_and_shields_other_columns(tmp_p
 
 def test_weaver_track_blocks_with_norm_stats_keeps_raw_track16_values(tmp_path):
     candidates_path, tracks_path, raw = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
-    names = list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES + MULTIPLICITY_EXTRA_NAMES
+    names = list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES
     stats = fit_norm_stats(candidates_path, tracks_path, feature_names=names, n_events=2, per_event=10)
 
     weaver_dataset = TripletRankDataset(

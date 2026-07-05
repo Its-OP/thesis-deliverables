@@ -37,12 +37,6 @@ GBDT_EXTRA_NAMES = ['gbdt6_score', 'gbdt8_score']
 CASCADE_EXTRA_NAMES = ['s1_i', 's1_j', 's1_k', 's2_i', 's2_j', 's2_k',
                        's2_k_isvalid', 's3_couple']
 
-# Per-candidate decomposition multiplicity: how many couple/third-track decompositions
-# of the same physical 3-set the kept candidate collapsed from (see
-# scripts/python/build_triplet_rank_candidates.dedupe_event_candidates). Present only in
-# artifacts built with the post-dedupe candidate schema.
-MULTIPLICITY_EXTRA_NAMES = ['n_decomp']
-
 
 def resolve_feature_names(table: '_EventTable', extra_features: str) -> list[str]:
     if extra_features not in ('none', 'gbdt', 'all', 'auto'):
@@ -52,14 +46,9 @@ def resolve_feature_names(table: '_EventTable', extra_features: str) -> list[str
     if extra_features == 'all' and not table.has_cascade_columns:
         raise ValueError('extra_features=all requires track_s1/track_s2/couple_scores '
                          'columns in the candidates artifact')
-    if extra_features == 'all' and not table.has_multiplicity_column:
-        raise ValueError('extra_features=all requires the n_decomp column in the '
-                         'candidates artifact')
     names = list(FEATURE_NAMES) + GBDT_EXTRA_NAMES
     if extra_features == 'all' or (extra_features == 'auto' and table.has_cascade_columns):
         names += CASCADE_EXTRA_NAMES
-    if extra_features == 'all' or (extra_features == 'auto' and table.has_multiplicity_column):
-        names += MULTIPLICITY_EXTRA_NAMES
     return names
 
 
@@ -146,7 +135,6 @@ class _EventTable:
     _CAND_COLS = ['n_tracks', 'n_candidates', 'cand_i', 'cand_j', 'cand_k',
                   'couple_rank', 'gbdt6_score', 'gbdt8_score', 'is_gt', 'recon']
     _CASCADE_COLS = ['track_s1', 'track_s2', 'couple_scores']
-    _MULTIPLICITY_COLS = ['n_decomp']
     _TRACK_COLS = ['track_pt', 'track_eta', 'track_phi', 'track_charge',
                    'track_dz_significance', 'track_dxy_significance',
                    'track_dca_significance', 'track_n_valid_pixel_hits',
@@ -156,11 +144,7 @@ class _EventTable:
     def __init__(self, candidates_path: str, tracks_path: str):
         schema_names = set(pq.read_schema(candidates_path).names)
         self.has_cascade_columns = all(name in schema_names for name in self._CASCADE_COLS)
-        self.has_multiplicity_column = all(name in schema_names
-                                           for name in self._MULTIPLICITY_COLS)
-        cand_cols = (self._CAND_COLS
-                    + (self._CASCADE_COLS if self.has_cascade_columns else [])
-                    + (self._MULTIPLICITY_COLS if self.has_multiplicity_column else []))
+        cand_cols = self._CAND_COLS + (self._CASCADE_COLS if self.has_cascade_columns else [])
         candidates = pq.read_table(candidates_path, columns=cand_cols)
         tracks = pq.read_table(tracks_path, columns=self._TRACK_COLS)
         assert candidates.num_rows == tracks.num_rows, 'candidates/tracks row mismatch'
@@ -169,11 +153,11 @@ class _EventTable:
         self.tracks = {name: _plain_array(tracks[name]) for name in self._TRACK_COLS}
 
     def candidate_arrays(self, r: int) -> dict[str, np.ndarray]:
-        names = ['cand_i', 'cand_j', 'cand_k', 'couple_rank', 'gbdt6_score',
-                 'gbdt8_score', 'is_gt']
-        if self.has_multiplicity_column:
-            names = names + self._MULTIPLICITY_COLS
-        return {name: np.asarray(self.candidates[name][r].values) for name in names}
+        out = {}
+        for name in ['cand_i', 'cand_j', 'cand_k', 'couple_rank', 'gbdt6_score',
+                     'gbdt8_score', 'is_gt']:
+            out[name] = np.asarray(self.candidates[name][r].values)
+        return out
 
     def cascade_arrays(self, r: int) -> dict[str, np.ndarray]:
         return {name: np.asarray(self.candidates[name][r].values)
@@ -212,9 +196,8 @@ def build_candidate_features(table: _EventTable, r: int, arrays: dict, selected,
     features = triplet_feature_columns(i, j, k, rank, **kw)
     extra_names = feature_names[len(FEATURE_NAMES):]
     if extra_names:
-        simple_names = GBDT_EXTRA_NAMES + MULTIPLICITY_EXTRA_NAMES
         values = {name: torch.tensor(arrays[name][selected], dtype=torch.float32)
-                  for name in extra_names if name in simple_names}
+                  for name in extra_names if name in GBDT_EXTRA_NAMES}
         if any(name in CASCADE_EXTRA_NAMES for name in extra_names):
             cascade = table.cascade_arrays(r)
             track_s1 = torch.tensor(cascade['track_s1'], dtype=torch.float32)
