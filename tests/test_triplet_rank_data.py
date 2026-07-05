@@ -553,6 +553,95 @@ def test_event_context_features_single_survivor_guards(tmp_path):
                      dtype=torch.float32))
 
 
+def _write_window_artifact(directory, positions):
+    import pyarrow as pa
+    window_path = os.path.join(directory, 'window_syn.parquet')
+    pq.write_table(pa.table({
+        'window_positions': [list(map(int, event)) for event in positions],
+        'window_scores': [[1.0 - 0.1 * n for n in range(len(event))]
+                          for event in positions],
+    }), window_path)
+    return window_path
+
+
+def test_window_eval_follows_artifact_order(tmp_path):
+    cand, tracks, raw = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    window = _write_window_artifact(str(tmp_path), [[1, 0, 2], [0, 1]])
+    dataset = TripletRankDataset(cand, tracks, tau=0.0, mode='eval',
+                                 extra_features='all', window_artifact=window,
+                                 attention_window=2)
+    item = dataset[0]
+    assert item['features'].shape[0] == 2
+    # Selected = artifact order [1, 0]: GT (candidate 0) sits in slot 1.
+    assert item['pos_mask'].tolist() == [False, True]
+    expected_keys = torch.tensor([
+        sorted([raw['cand_i'][0][1], raw['cand_j'][0][1], raw['cand_k'][0][1]]),
+        sorted([raw['cand_i'][0][0], raw['cand_j'][0][0], raw['cand_k'][0][0]]),
+    ])
+    torch.testing.assert_close(item['keys'], expected_keys)
+
+
+def test_window_train_swaps_missing_gt_into_tail(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    window = _write_window_artifact(str(tmp_path), [[1, 2, 0], [0, 1]])
+    train_dataset = TripletRankDataset(cand, tracks, tau=0.0, mode='train',
+                                       extra_features='all', window_artifact=window,
+                                       attention_window=2)
+    item = train_dataset[0]
+    # Window [1, 2] misses the GT (candidate 0) -> tail slot swapped to GT.
+    assert item['features'].shape[0] == 2
+    assert item['pos_mask'].tolist() == [False, True]
+
+    eval_dataset = TripletRankDataset(cand, tracks, tau=0.0, mode='eval',
+                                      extra_features='all', window_artifact=window,
+                                      attention_window=2)
+    eval_item = eval_dataset[0]
+    # Eval keeps the honest window: GT absent.
+    assert eval_item['pos_mask'].tolist() == [False, False]
+
+
+def test_window_larger_than_list_keeps_all(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    window = _write_window_artifact(str(tmp_path), [[0, 1, 2], [0, 1]])
+    dataset = TripletRankDataset(cand, tracks, tau=0.0, mode='eval',
+                                 extra_features='all', window_artifact=window,
+                                 attention_window=100)
+    assert dataset[0]['features'].shape[0] == 3
+    assert dataset[1]['features'].shape[0] == 2
+
+
+def test_window_respects_tau_mask(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    window = _write_window_artifact(str(tmp_path), [[0, 1, 2], [0, 1]])
+    dataset = TripletRankDataset(cand, tracks, tau=0.3, mode='eval',
+                                 extra_features='all', window_artifact=window,
+                                 attention_window=100)
+    # tau=0.3 kills the gbdt6=0.2 candidate even if the artifact lists it.
+    assert dataset[0]['features'].shape[0] == 2
+
+
+def test_window_ctx_uses_full_surviving_list(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    window = _write_window_artifact(str(tmp_path), [[1, 0, 2], [0, 1]])
+    dataset = TripletRankDataset(cand, tracks, tau=0.0, mode='eval',
+                                 extra_features='all', context_features=True,
+                                 window_artifact=window, attention_window=2)
+    item = dataset[0]
+    log_n_column = dataset.feature_names.index('ctx_log_n_surviving')
+    # Context is defined over the tau-surviving list (3 candidates), not the window.
+    torch.testing.assert_close(item['features'][:, log_n_column],
+                               torch.full((2,), float(np.log1p(3))))
+
+
+def test_window_row_count_mismatch_rejected(tmp_path):
+    cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
+    window = _write_window_artifact(str(tmp_path), [[0, 1, 2]])
+    with pytest.raises(AssertionError, match='window'):
+        TripletRankDataset(cand, tracks, tau=0.0, mode='eval',
+                           extra_features='all', window_artifact=window,
+                           attention_window=2)
+
+
 def test_fit_norm_stats_context(tmp_path):
     cand, tracks, _ = _write_synthetic_artifacts(str(tmp_path), with_cascade=True)
     names = (list(FEATURE_NAMES) + GBDT_EXTRA_NAMES + CASCADE_EXTRA_NAMES

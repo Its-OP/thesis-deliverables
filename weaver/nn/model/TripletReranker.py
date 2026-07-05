@@ -162,6 +162,8 @@ class TripletReranker(nn.Module):
         projector_dim: int = 32,
         feature_names: list[str] | None = None,
         loss_mode: str = 'sampled',
+        num_attention_layers: int = 0,
+        attention_heads: int = 8,
     ):
         super().__init__()
         if input_mode not in ('flat', 'hierarchical'):
@@ -175,6 +177,7 @@ class TripletReranker(nn.Module):
         self.label_smoothing = label_smoothing
         self.projector_dim = projector_dim
         self.loss_mode = loss_mode
+        self.num_attention_layers = num_attention_layers
         self.feature_names = list(feature_names) if feature_names is not None else None
 
         if input_mode == 'hierarchical':
@@ -230,6 +233,20 @@ class TripletReranker(nn.Module):
             ResidualBlock(hidden_dim=hidden_dim, dropout=dropout)
             for _ in range(num_residual_blocks)
         ])
+        if num_attention_layers > 0:
+            self.attention_blocks = nn.ModuleList([
+                nn.TransformerEncoderLayer(
+                    d_model=hidden_dim, nhead=attention_heads,
+                    dim_feedforward=2 * hidden_dim, dropout=dropout,
+                    batch_first=True, norm_first=True)
+                for _ in range(num_attention_layers)
+            ])
+            # ReZero gates: zero-init makes the attention stack an exact identity, so
+            # a trunk warm-started from a per-candidate checkpoint scores identically
+            # at epoch 0 and any later gain is attributable to cross-candidate mixing.
+            self.attention_gates = nn.ParameterList([
+                nn.Parameter(torch.zeros(1)) for _ in range(num_attention_layers)
+            ])
         intermediate_dim = hidden_dim // 2
         self.scorer = nn.Sequential(
             nn.Conv1d(hidden_dim, intermediate_dim, kernel_size=1, bias=False),
@@ -263,9 +280,24 @@ class TripletReranker(nn.Module):
             x = block(x)
         return x
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """features: (B, F, N). Returns (B, N) per-candidate scores."""
-        return self.scorer(self._encode(features)).squeeze(1)
+    def _attend(self, tokens: torch.Tensor,
+                key_padding_mask: torch.Tensor | None) -> torch.Tensor:
+        """tokens: (B, N, C). key_padding_mask: (B, N) bool, True = padded.
+        Returns (B, N, C)."""
+        for block, gate in zip(self.attention_blocks, self.attention_gates):
+            tokens = tokens + gate * (
+                block(tokens, src_key_padding_mask=key_padding_mask) - tokens)
+        return tokens
+
+    def forward(self, features: torch.Tensor,
+                valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """features: (B, F, N). valid_mask: optional (B, N) bool, True = real
+        candidate. Returns (B, N) per-candidate scores."""
+        x = self._encode(features)
+        if self.num_attention_layers > 0:
+            key_padding_mask = ~valid_mask.bool() if valid_mask is not None else None
+            x = self._attend(x.transpose(1, 2), key_padding_mask).transpose(1, 2)
+        return self.scorer(x).squeeze(1)
 
     def compute_loss(
         self,
@@ -274,7 +306,7 @@ class TripletReranker(nn.Module):
         valid_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """features: (B, F, N). pos_mask, valid_mask: (B, N) bool."""
-        scores = self.forward(features)
+        scores = self.forward(features, valid_mask=valid_mask)
         if self.loss_mode == 'full':
             ranking_loss = full_list_softmax_ce_loss(
                 scores, pos_mask.bool(), valid_mask.bool(),

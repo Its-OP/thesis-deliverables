@@ -328,7 +328,8 @@ class TripletRankDataset(Dataset):
                  score_column: str = 'gbdt6_score', num_negatives: int = 50,
                  mode: str = 'train', norm_stats: dict | None = None, seed: int = 0,
                  extra_features: str = 'none', weaver_track_blocks: bool = False,
-                 context_features: bool = False):
+                 context_features: bool = False, window_artifact: str | None = None,
+                 attention_window: int = 512):
         assert mode in ('train', 'eval')
         self.table = _EventTable(candidates_path, tracks_path)
         self.tau = tau
@@ -337,6 +338,14 @@ class TripletRankDataset(Dataset):
         self.mode = mode
         self.norm_stats = norm_stats
         self.generator = np.random.default_rng(seed)
+        self.attention_window = attention_window
+        self.window_positions = None
+        if window_artifact is not None:
+            window_table = pq.read_table(window_artifact, columns=['window_positions'])
+            assert window_table.num_rows == self.table.num_rows, (
+                f'window artifact rows {window_table.num_rows} != candidates rows '
+                f'{self.table.num_rows}')
+            self.window_positions = _plain_array(window_table['window_positions'])
         self._base_feature_names = resolve_feature_names(self.table, extra_features)
         self.feature_names = self._base_feature_names
         self.context_features = context_features
@@ -375,10 +384,28 @@ class TripletRankDataset(Dataset):
         survive = arrays[self.score_column] >= self.tau
         return arrays, np.where(survive)[0]
 
+    def _window_selection(self, r: int, arrays: dict,
+                          surviving: np.ndarray) -> np.ndarray:
+        window = np.asarray(self.window_positions[r].values,
+                            dtype=np.int64)[:self.attention_window]
+        window = window[arrays[self.score_column][window] >= self.tau]
+        if self.mode == 'train':
+            positives = surviving[arrays['is_gt'][surviving].astype(bool)]
+            missing = positives[~np.isin(positives, window)]
+            if missing.size >= window.size:
+                window = missing[:max(window.size, 1)]
+            elif missing.size:
+                window = window.copy()
+                window[-missing.size:] = missing
+        return window
+
     def __getitem__(self, r: int) -> dict[str, torch.Tensor]:
         arrays, surviving = self._select(int(r))
         is_gt = arrays['is_gt'][surviving]
-        if self.mode == 'train':
+        if self.window_positions is not None:
+            selected = self._window_selection(int(r), arrays, surviving)
+            pos_mask = arrays['is_gt'][selected].astype(bool)
+        elif self.mode == 'train':
             positive_positions = surviving[is_gt]
             negative_positions = surviving[~is_gt]
             if len(negative_positions) == 0:

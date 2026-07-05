@@ -115,3 +115,70 @@ def test_uses_nan_safe_batchnorm():
     assert bn_layers
     assert all(isinstance(m, NanSafeBatchNorm1d) for m in bn_layers)
     assert all(not m.track_running_stats for m in bn_layers)
+
+
+def test_attention_zero_layers_state_dict_backward_compat():
+    plain = TripletReranker(input_mode='flat', feature_dim=10)
+    default = TripletReranker(input_mode='flat', feature_dim=10)
+    assert set(default.state_dict()) == set(plain.state_dict())
+    assert not any('attention' in key for key in default.state_dict())
+    # An old-style (pre-attention) state dict loads strict into the default model.
+    default.load_state_dict(plain.state_dict())
+
+
+def test_attention_identity_at_init():
+    torch.manual_seed(0)
+    plain = TripletReranker(input_mode='flat', feature_dim=10)
+    attention = TripletReranker(input_mode='flat', feature_dim=10,
+                                num_attention_layers=2, attention_heads=4)
+    attention.load_state_dict(plain.state_dict(), strict=False)
+    plain.eval()
+    attention.eval()
+    features = torch.randn(3, 10, 8)
+    valid_mask = torch.ones(3, 8, dtype=torch.bool)
+    with torch.no_grad():
+        torch.testing.assert_close(attention(features, valid_mask=valid_mask),
+                                   plain(features), rtol=0.0, atol=0.0)
+
+
+def test_attention_mask_blocks_padded_tokens():
+    torch.manual_seed(0)
+    model = TripletReranker(input_mode='flat', feature_dim=10,
+                            num_attention_layers=1, attention_heads=4)
+    model.eval()
+    with torch.no_grad():
+        model.attention_gates[0].fill_(1.0)
+    valid_mask = torch.ones(1, 8, dtype=torch.bool)
+    valid_mask[0, 5:] = False
+    tokens_a = torch.randn(1, 8, model.hidden_dim)
+    tokens_b = tokens_a.clone()
+    tokens_b[0, 5:] = torch.randn(3, model.hidden_dim) * 100
+    key_padding = ~valid_mask
+    with torch.no_grad():
+        out_a = model._attend(tokens_a, key_padding)
+        out_b = model._attend(tokens_b, key_padding)
+    torch.testing.assert_close(out_a[0, :5], out_b[0, :5])
+
+
+def test_attention_checkpoint_round_trip():
+    model = TripletReranker(input_mode='flat', feature_dim=10,
+                            num_attention_layers=2, attention_heads=4)
+    rebuilt = TripletReranker(input_mode='flat', feature_dim=10,
+                              num_attention_layers=2, attention_heads=4)
+    rebuilt.load_state_dict(model.state_dict())
+
+
+def test_attention_forward_and_loss_gradients():
+    model = TripletReranker(input_mode='flat', feature_dim=10,
+                            num_attention_layers=2, attention_heads=4,
+                            loss_mode='full')
+    features = torch.randn(2, 10, 6)
+    pos_mask = torch.zeros(2, 6, dtype=torch.bool)
+    pos_mask[:, 0] = True
+    valid_mask = torch.ones(2, 6, dtype=torch.bool)
+    valid_mask[:, -1] = False
+    out = model.compute_loss(features, pos_mask, valid_mask)
+    assert torch.isfinite(out['total_loss'])
+    out['total_loss'].backward()
+    gate_grads = [gate.grad for gate in model.attention_gates]
+    assert all(grad is not None for grad in gate_grads)

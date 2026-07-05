@@ -43,6 +43,8 @@ def load_model(checkpoint_path: str, device: torch.device):
         projector_dim=trainer_args['projector_dim'],
         feature_names=checkpoint['feature_names'],
         loss_mode=trainer_args.get('loss_mode', 'sampled'),
+        num_attention_layers=trainer_args.get('attention_layers', 0),
+        attention_heads=trainer_args.get('attention_heads', 8),
     )
     model.load_state_dict(checkpoint['triplet_reranker_state_dict'])
     model.to(device).eval()
@@ -99,6 +101,9 @@ def main(argv=None) -> None:
                                                            'reports', 'triplet_reranker_eval.json'))
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--max-events', type=int, default=None)
+    parser.add_argument('--window-artifact', default=None,
+                        help='stage-A window dump matching --candidates; required '
+                             'when the checkpoint was trained window-mode')
     args = parser.parse_args(argv)
 
     device = torch.device(args.device)
@@ -107,12 +112,16 @@ def main(argv=None) -> None:
     score_column, tau = operating_point['score_column'], operating_point['tau']
     print(f"checkpoint epoch {checkpoint['epoch']} | {score_column} >= {tau}")
 
+    if checkpoint['args'].get('window_artifact') and not args.window_artifact:
+        raise SystemExit('checkpoint was trained window-mode; pass --window-artifact')
     dataset = TripletRankDataset(
         args.candidates, args.tracks, tau=tau, score_column=score_column,
         mode='eval', norm_stats=checkpoint['norm_stats'], seed=0,
         extra_features=checkpoint['args'].get('extra_features', 'none'),
         weaver_track_blocks=checkpoint['args'].get('weaver_track_blocks', False),
-        context_features=checkpoint['args'].get('context_features', False))
+        context_features=checkpoint['args'].get('context_features', False),
+        window_artifact=args.window_artifact,
+        attention_window=checkpoint['args'].get('attention_window', 512))
     if dataset.feature_names != checkpoint['feature_names']:
         raise SystemExit('candidates artifact resolves different feature names than '
                          'the checkpoint was trained with')

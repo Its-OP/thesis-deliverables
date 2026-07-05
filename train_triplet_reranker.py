@@ -71,6 +71,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--context-features', action='store_true',
                         help='append per-candidate standings within the event\'s '
                              'tau-surviving list (ctx_* features)')
+    parser.add_argument('--window-artifact', default=None,
+                        help='stage-A window dump for the train candidates; switches '
+                             'both modes to top-M window items')
+    parser.add_argument('--eval-window-artifact', default=None,
+                        help='stage-A window dump for the --eval-candidates side')
+    parser.add_argument('--attention-window', type=int, default=512,
+                        help='M: window rows taken from the window artifact')
+    parser.add_argument('--attention-layers', type=int, default=0)
+    parser.add_argument('--attention-heads', type=int, default=8)
+    parser.add_argument('--warm-start-checkpoint', default=None,
+                        help='stage-A checkpoint; loads all matching weights '
+                             '(strict=False) and supersedes --warm-start-projector')
     parser.add_argument('--extra-features', choices=('none', 'gbdt', 'all', 'auto'), default='auto',
                         help='inputs beyond the 89 geometry features (gbdt scores, cascade scores)')
     parser.add_argument('--loss-mode', choices=('sampled', 'full'), default='sampled')
@@ -133,6 +145,20 @@ def _warm_start_projector(model: TripletReranker, checkpoint_path: str) -> None:
     logger.info(f'warm-started track_projector from {checkpoint_path}')
 
 
+def _warm_start_checkpoint(model: TripletReranker, checkpoint_path: str) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    state = checkpoint['triplet_reranker_state_dict']
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if unexpected:
+        raise SystemExit(f'warm-start checkpoint has unexpected keys: {unexpected[:5]}')
+    fresh = [key for key in missing if not key.startswith(('attention_blocks.',
+                                                           'attention_gates.'))]
+    if fresh:
+        raise SystemExit(f'warm-start checkpoint lacks trunk keys: {fresh[:5]}')
+    logger.info(f'warm-started {len(state)} tensors from {checkpoint_path} '
+                f'({len(missing)} attention tensors stay fresh)')
+
+
 @torch.no_grad()
 def evaluate(model, dataset, event_indices, device, *, batch_size: int = 1,
              num_workers: int = 0) -> dict:
@@ -149,8 +175,9 @@ def evaluate(model, dataset, event_indices, device, *, batch_size: int = 1,
         counts = batch['counts']
         if int(counts.max()) == 0:
             continue
-        scores = model(batch['features'].to(device))
-        scores = scores.masked_fill(~batch['valid_mask'].to(device), float('-inf')).cpu()
+        valid_mask = batch['valid_mask'].to(device)
+        scores = model(batch['features'].to(device), valid_mask=valid_mask)
+        scores = scores.masked_fill(~valid_mask, float('-inf')).cpu()
         for b in range(scores.shape[0]):
             n = int(counts[b])
             if n == 0:
@@ -218,12 +245,18 @@ def main(argv=None) -> None:
     if args.split_json:
         train_events = load_split(args.split_json, 'train')
 
+    if args.eval_candidates and args.window_artifact and not args.eval_window_artifact:
+        raise SystemExit('--window-artifact with --eval-candidates also requires '
+                         '--eval-window-artifact')
+
     train_dataset = TripletRankDataset(
         args.candidates, args.tracks, tau=tau, score_column=score_column,
         num_negatives=args.num_negatives, mode='train', seed=args.seed,
         extra_features=args.extra_features,
         weaver_track_blocks=args.weaver_track_blocks,
-        context_features=args.context_features)
+        context_features=args.context_features,
+        window_artifact=args.window_artifact,
+        attention_window=args.attention_window)
     feature_names = train_dataset.feature_names
     norm_stats = _norm_stats(args, feature_names, train_events, tau, score_column)
     train_dataset.norm_stats = norm_stats
@@ -234,7 +267,9 @@ def main(argv=None) -> None:
             mode='eval', norm_stats=norm_stats, seed=args.seed,
             extra_features=args.extra_features,
             weaver_track_blocks=args.weaver_track_blocks,
-            context_features=args.context_features)
+            context_features=args.context_features,
+            window_artifact=args.eval_window_artifact,
+            attention_window=args.attention_window)
         if eval_dataset.feature_names != feature_names:
             raise SystemExit('eval artifact resolves different feature names than the '
                              'train artifact (extra columns mismatch)')
@@ -244,7 +279,9 @@ def main(argv=None) -> None:
             mode='eval', norm_stats=norm_stats, seed=args.seed,
             extra_features=args.extra_features,
             weaver_track_blocks=args.weaver_track_blocks,
-            context_features=args.context_features)
+            context_features=args.context_features,
+            window_artifact=args.window_artifact,
+            attention_window=args.attention_window)
 
     n_rows = train_dataset.table.num_rows
     if args.split_json:
@@ -280,8 +317,12 @@ def main(argv=None) -> None:
         ranking_num_samples=args.num_negatives, ranking_temperature=args.temperature,
         label_smoothing=args.label_smoothing, projector_dim=args.projector_dim,
         feature_names=feature_names, loss_mode=args.loss_mode,
+        num_attention_layers=args.attention_layers,
+        attention_heads=args.attention_heads,
     ).to(device)
-    if args.warm_start_projector:
+    if args.warm_start_checkpoint:
+        _warm_start_checkpoint(model, args.warm_start_checkpoint)
+    elif args.warm_start_projector:
         _warm_start_projector(model, args.warm_start_projector)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
