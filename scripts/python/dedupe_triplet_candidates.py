@@ -10,13 +10,11 @@ from tqdm import tqdm
 try:
     from scripts.python.build_triplet_rank_candidates import (
         CANDIDATE_SCHEMA,
-        _list_views,
         dedupe_event_candidates,
     )
 except ImportError:  # direct-file invocation: scripts/python is sys.path[0]
     from build_triplet_rank_candidates import (
         CANDIDATE_SCHEMA,
-        _list_views,
         dedupe_event_candidates,
     )
 
@@ -41,14 +39,8 @@ def main(argv=None) -> None:
     table = pq.read_table(args.candidates)
     n_events = table.num_rows if args.max_events is None else min(args.max_events,
                                                                   table.num_rows)
-    # Bulk per-event numpy views (offset slicing) instead of per-row to_pylist —
-    # the conversion, not the dedupe math, dominates otherwise.
-    schema = table.schema
-    list_names = [name for name in schema.names
-                  if pa.types.is_list(schema.field(name).type)]
-    scalar_names = [name for name in schema.names if name not in list_names]
-    list_views = {name: _list_views(table, name) for name in list_names}
-    scalars = {name: table[name].to_pylist() for name in scalar_names}
+    column_names = table.schema.names
+    columns = {name: table[name] for name in column_names}
 
     rows_before = 0
     rows_after = 0
@@ -57,8 +49,10 @@ def main(argv=None) -> None:
     writer = pq.ParquetWriter(args.out, CANDIDATE_SCHEMA)
     pending = []
     for r in tqdm(range(n_events), desc='dedupe', mininterval=10):
-        row = {name: list_views[name][r] for name in list_names}
-        row.update({name: scalars[name][r] for name in scalar_names})
+        row = {}
+        for name in column_names:
+            value = columns[name][r]
+            row[name] = value.values.to_pylist() if hasattr(value, 'values') else value.as_py()
         scores = np.asarray(row['gbdt6_score'], dtype=np.float64)
         is_gt = np.asarray(row['is_gt'], dtype=bool)
         if is_gt.any() and (scores[is_gt] >= args.tau).any():
