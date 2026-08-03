@@ -193,13 +193,21 @@ if command -v nvidia-smi &>/dev/null; then
         CUDA_MINOR=$(echo "$CUDA_FULL" | cut -d. -f2)
         CUDA_VERSION_STRING="cu${CUDA_MAJOR}${CUDA_MINOR}"
         echo "  Detected CUDA $CUDA_FULL (${CUDA_VERSION_STRING})"
+        # PyTorch publishes wheels only for selected CUDA versions — a 13.1
+        # driver has no cu131 index — so fall back to the default PyPI
+        # wheel, which already bundles a recent CUDA runtime
+        if ! wget -q --spider "https://download.pytorch.org/whl/${CUDA_VERSION_STRING}/torch/"; then
+            echo "  No wheel index for ${CUDA_VERSION_STRING}; using the default PyPI build."
+            CUDA_VERSION_STRING=""
+        fi
     fi
+else
+    echo "  WARNING: no nvidia-smi found — this box may have no GPU."
 fi
 
 if [ -n "$CUDA_VERSION_STRING" ]; then
     python -m pip install torch --extra-index-url "https://download.pytorch.org/whl/${CUDA_VERSION_STRING}"
 else
-    echo "  WARNING: No CUDA detected, installing CPU-only PyTorch."
     python -m pip install torch
 fi
 

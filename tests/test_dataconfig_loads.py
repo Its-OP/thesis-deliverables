@@ -23,6 +23,11 @@ from weaver.utils.dataset import SimpleIterDataset
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SUBSET = REPO_ROOT.parent / 'part' / 'data' / 'low-pt' / 'subset'
 DATA_CONFIG = REPO_ROOT / 'data' / 'low-pt' / 'lowpt_tau_trackfinder.yaml'
+# The frozen legacy sidecar is a complete, self-contained data config; the
+# dataset tests use it because the subset fixtures carry only the legacy
+# columns the live 32-channel config no longer suffices with.
+FROZEN_CONFIG = (REPO_ROOT / 'data' / 'low-pt' /
+                 'lowpt_tau_trackfinder.c8a40f560c44edfe47c8f0fc25230de1.auto.yaml')
 
 
 def _resolve_subset_dir() -> Path | None:
@@ -56,7 +61,7 @@ def test_simpleiterdataset_constructs(subset_dir: Path):
 
     dataset = SimpleIterDataset(
         file_dict={'all': train_files},
-        data_config_file=str(DATA_CONFIG),
+        data_config_file=str(FROZEN_CONFIG),
         for_training=False,
         fetch_by_files=True,
         fetch_step=1,
@@ -69,7 +74,7 @@ def test_simpleiterdataset_yields_batch(subset_dir: Path):
     train_files = sorted(str(p) for p in (subset_dir / 'train').glob('*.parquet'))
     dataset = SimpleIterDataset(
         file_dict={'all': train_files[:1]},
-        data_config_file=str(DATA_CONFIG),
+        data_config_file=str(FROZEN_CONFIG),
         for_training=False,
         fetch_by_files=True,
         fetch_step=1,

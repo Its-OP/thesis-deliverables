@@ -16,7 +16,11 @@ _DELIVERABLES = os.path.join(os.path.dirname(__file__), '..')
 _STAGE1 = os.path.join(_DELIVERABLES, 'models', 'prefilter_best.pt')
 _STAGE2 = os.path.join(_DELIVERABLES, 'models', 'stage2_best.pt')
 _STAGE3 = os.path.join(_DELIVERABLES, 'models', 'couple_reranker_best.pt')
-_DATA_CONFIG = os.path.join(_DELIVERABLES, 'data', 'low-pt', 'lowpt_tau_trackfinder.yaml')
+# The frozen legacy sidecar config — the production checkpoints under test
+# were trained on its 16-channel feature set; the live config is now 32.
+_DATA_CONFIG = os.path.join(
+    _DELIVERABLES, 'data', 'low-pt',
+    'lowpt_tau_trackfinder.c8a40f560c44edfe47c8f0fc25230de1.auto.yaml')
 _SUBSET_DIR = '/Users/oleh/Projects/masters/part/data/low-pt/subset/val'
 
 _SCORE_FIELDS = ['stage1_scores', 'stage2_scores', 'stage3_couple_scores']

@@ -36,6 +36,41 @@ new_variables:
    track_py_raw: track_py
    track_pz_raw: track_pz
    ###
+   ### H6 extension — raw impact-parameter magnitudes (PV-referenced, cm) and
+   ### the live covariance block (lambda_dxy/qop_dxy are identically zero in
+   ### the source and stay excluded).
+   track_absolute_dxy: np.abs(track_dxy)
+   track_absolute_dz: np.abs(track_dz)
+   track_log_covariance_dxy_dxy: np.log(np.maximum(track_covariance_dxy_dxy, 1e-30))
+   track_log_covariance_dsz_dsz: np.log(np.maximum(track_covariance_dsz_dsz, 1e-30))
+   track_log_absolute_covariance_dxy_dsz: np.log(np.abs(track_covariance_dxy_dsz) + 1e-30)
+   track_log_absolute_covariance_phi_dxy: np.log(np.abs(track_covariance_phi_dxy) + 1e-30)
+   ###
+   ### H6 extension — vertex re-association: the stored PV is not the tau
+   ### vertex in ~68% of events, so the OtherPV z list carries the true
+   ### collision vertex more often than not.
+   track_global_z: event_primary_vertex_z + track_dz
+   track_pileup_min_gap: ak.min(np.abs(track_global_z[:, :, np.newaxis] - event_other_pv_z[:, np.newaxis, :]), axis=-1)
+   track_closer_to_other_pv: (track_pileup_min_gap < np.abs(track_dz)) * 1.0
+   track_n_pvs: event_n_pvs * ak.ones_like(track_eta)
+   ###
+   ### H6 extension — soft-muon relations (other-tau tag). Empty reductions
+   ### yield None: dropped by the auto-standardizer, filled with the
+   ### post-standardization median (0) at padding time; the has_* flags let
+   ### the model distinguish "missing" from "median".
+   track_muon_min_delta_r: ak.min(np.sqrt((track_eta[:, :, np.newaxis] - muon_eta[muon_soft_id == 1][:, np.newaxis, :])**2 + (np.mod(track_phi[:, :, np.newaxis] - muon_phi[muon_soft_id == 1][:, np.newaxis, :] + np.pi, 2*np.pi) - np.pi)**2), axis=-1)
+   track_muon_min_dz_gap: ak.min(np.abs(track_dz[:, :, np.newaxis] - muon_dz[muon_soft_id == 1][:, np.newaxis, :]), axis=-1)
+   track_has_soft_muon: (ak.sum(muon_soft_id == 1, axis=1) > 0) * ak.ones_like(track_eta)
+   ###
+   ### H6 extension — linearized-track geometry: 3D line distance to the
+   ### nearest secondary vertex and to the stored PV.
+   track_direction_x: np.cos(track_phi) / np.cosh(track_eta)
+   track_direction_y: np.sin(track_phi) / np.cosh(track_eta)
+   track_direction_z: np.tanh(track_eta)
+   track_sv_min_line_distance: ak.min(np.sqrt(((sv_y[:, np.newaxis, :] - track_vertex_y[:, :, np.newaxis]) * track_direction_z[:, :, np.newaxis] - (sv_z[:, np.newaxis, :] - track_vertex_z[:, :, np.newaxis]) * track_direction_y[:, :, np.newaxis])**2 + ((sv_z[:, np.newaxis, :] - track_vertex_z[:, :, np.newaxis]) * track_direction_x[:, :, np.newaxis] - (sv_x[:, np.newaxis, :] - track_vertex_x[:, :, np.newaxis]) * track_direction_z[:, :, np.newaxis])**2 + ((sv_x[:, np.newaxis, :] - track_vertex_x[:, :, np.newaxis]) * track_direction_y[:, :, np.newaxis] - (sv_y[:, np.newaxis, :] - track_vertex_y[:, :, np.newaxis]) * track_direction_x[:, :, np.newaxis])**2), axis=-1)
+   track_has_sv: (ak.num(sv_x, axis=1) > 0) * ak.ones_like(track_eta)
+   track_pv_line_distance_3d: np.sqrt(((event_primary_vertex_y - track_vertex_y) * track_direction_z - (event_primary_vertex_z - track_vertex_z) * track_direction_y)**2 + ((event_primary_vertex_z - track_vertex_z) * track_direction_x - (event_primary_vertex_x - track_vertex_x) * track_direction_z)**2 + ((event_primary_vertex_x - track_vertex_x) * track_direction_y - (event_primary_vertex_y - track_vertex_y) * track_direction_x)**2)
+   ###
    ### Dummy label for weaver compatibility (actual loss uses per-track labels)
    dummy_label: np.ones_like(event_n_tracks, dtype='float32')
 
@@ -80,6 +115,24 @@ inputs:
          ### Derived features (standard in CMS/ATLAS taggers)
          - track_log_pt
          - track_log_relative_pt_error
+         ### H6 extension (appended AFTER the legacy 16 — channel order
+         ### 0-15 is load-bearing for the later cascade stages)
+         - track_absolute_dxy
+         - track_absolute_dz
+         - track_log_covariance_dxy_dxy
+         - track_log_covariance_dsz_dsz
+         - track_log_absolute_covariance_dxy_dsz
+         - track_log_absolute_covariance_phi_dxy
+         - track_n_valid_hits
+         - track_pileup_min_gap
+         - [track_closer_to_other_pv, null]
+         - track_n_pvs
+         - track_muon_min_delta_r
+         - track_muon_min_dz_gap
+         - [track_has_soft_muon, null]
+         - track_sv_min_line_distance
+         - [track_has_sv, null]
+         - track_pv_line_distance_3d
    pf_vectors:
       length: 2100
       pad_mode: constant
