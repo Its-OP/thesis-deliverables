@@ -1,0 +1,21 @@
+executable = run_merge.sh
+arguments  = $(batch_id)
+
+output = logs/merge_batch$(batch_id).out
+error  = logs/merge_batch$(batch_id).err
+log    = logs/merge_batch$(batch_id).log
+
++JobFlavour = "workday"
+
+queue batch_id from (
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+  10
+)

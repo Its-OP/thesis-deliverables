@@ -1,0 +1,10 @@
+executable = run_convert.sh
+
+output = logs/convert.$(ClusterId).out
+error  = logs/convert.$(ClusterId).err
+log    = logs/convert.$(ClusterId).log
+
+request_memory = 20000
++JobFlavour = "workday"
+
+queue
