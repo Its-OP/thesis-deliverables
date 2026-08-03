@@ -1,0 +1,118 @@
+selection:
+   ### Filter out events with 0 tracks — they cause NaN in FPS/kNN/max-pool.
+   event_n_tracks > 0
+
+new_variables:
+   track_mask: ak.ones_like(track_eta)
+   track_px: track_pt * np.cos(track_phi)
+   track_py: track_pt * np.sin(track_phi)
+   track_pz: track_pt * np.sinh(track_eta)
+   ### Assumed pion mass: E = sqrt(px^2 + py^2 + pz^2 + m_pi^2), m_pi = 0.13957 GeV
+   track_energy: np.sqrt(track_px**2 + track_py**2 + track_pz**2 + 0.13957**2)
+   ###
+   ### Log-transformed features: compress heavy-tailed distributions that
+   ### auto-standardization clips (dz_sig: 99.9% clipped, covs: scale >7000).
+   ### sign(x) * log(1 + |x|) for signed quantities, log(1 + x) for positive.
+   track_log_dz_significance: np.sign(track_dz_significance) * np.log1p(np.abs(track_dz_significance))
+   ### log(x) not log1p(x): pt_error values are ~0.01, log1p(0.01)≈0.01 (no spread)
+   ### chi2/ndof: ≈1 for real tracks, >>1 for fakes.
+   ### Using log1p (not log+eps) so padding zeros map to 0 instead of -13.8.
+   ### Real tracks: log1p(1) = 0.69, log1p(10) = 2.40. Clean separation from padding at 0.
+   track_log_norm_chi2: np.log1p(track_norm_chi2)
+   ### np.maximum clamps non-positive values (zeros from padding, rare negatives
+   ### from numerical noise in covariance fits) to 1e-12 before log.
+   track_log_pt_error: np.log(np.maximum(track_pt_error, 1e-12))
+   track_log_covariance_phi_phi: np.log(np.maximum(track_covariance_phi_phi, 1e-12))
+   track_log_covariance_lambda_lambda: np.log(np.maximum(track_covariance_lambda_lambda, 1e-12))
+   ###
+   ### Derived features: standard in CMS/ATLAS taggers (DeepJet, DeepTau, GN2)
+   track_log_pt: np.log(track_pt + 1e-6)
+   track_log_relative_pt_error: np.log(np.maximum(track_pt_error / (track_pt + 1e-6), 1e-12))
+   ###
+   ### Raw aliases: avoid parameter collision between standardized and raw copies
+   track_eta_raw: track_eta
+   track_phi_raw: track_phi
+   track_px_raw: track_px
+   track_py_raw: track_py
+   track_pz_raw: track_pz
+   ###
+   ### Dummy label for weaver compatibility (actual loss uses per-track labels)
+   dummy_label: np.ones_like(event_n_tracks, dtype='float32')
+
+preprocess:
+  method: auto
+  data_fraction: 0.5
+
+inputs:
+   pf_points:
+      length: 2100
+      pad_mode: constant
+      vars:
+         - [track_eta_raw, null]
+         - [track_phi_raw, null]
+   pf_features:
+      length: 2100
+      pad_mode: constant
+      vars:
+         ### Kinematic features
+         - track_px
+         - track_py
+         - track_pz
+         - track_eta
+         - track_phi
+         - track_charge
+         ### Displacement features
+         - track_dxy_significance
+         ### Log-transformed dz significance: raw has std=488, auto-standardization
+         ### clips 99.9% of values. sign(x)*log(1+|x|) preserves full dynamic range.
+         - track_log_dz_significance
+         ### Track fit quality: log(chi2/ndof). ≈0 for real tracks, >>0 for fakes.
+         ### #1 CMS track quality discriminator across all generations.
+         - track_log_norm_chi2
+         ### Track measurement quality (log-transformed to compress tails)
+         - track_log_pt_error
+         - track_n_valid_pixel_hits
+         ### 3D displacement (complements 2D dxy_significance)
+         - track_dca_significance
+         ### Helix fit precision (log-transformed: raw scales are 7530 and 86704)
+         - track_log_covariance_phi_phi
+         - track_log_covariance_lambda_lambda
+         ### Derived features (standard in CMS/ATLAS taggers)
+         - track_log_pt
+         - track_log_relative_pt_error
+   pf_vectors:
+      length: 2100
+      pad_mode: constant
+      vars:
+         - [track_px_raw, null]
+         - [track_py_raw, null]
+         - [track_pz_raw, null]
+         - [track_energy, null]
+   pf_mask:
+      length: 2100
+      pad_mode: constant
+      vars:
+         - [track_mask, null]
+   pf_label:
+      length: 2100
+      pad_mode: constant
+      vars:
+         ### Per-track binary label: 1.0 = tau-origin pion, 0.0 = background/padding.
+         ### [var_name, null] bypasses standardization — labels must stay as 0/1.
+         - [track_label_from_tau, null]
+
+labels:
+   ### Dummy label for weaver compatibility. The actual loss uses pf_label
+   ### (per-track labels loaded as an input group above).
+   type: simple
+   value: [dummy_label]
+
+observers:
+   - event_n_tracks
+   - event_run
+   - event_id
+   - event_luminosity_block
+   - source_batch_id
+   - source_microbatch_id
+
+weights:

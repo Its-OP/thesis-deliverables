@@ -33,3 +33,4 @@ data/low-pt/subset/
 *.root
 *.h5
 */thesis_files/*
+reports/*

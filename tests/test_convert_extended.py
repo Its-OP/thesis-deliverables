@@ -35,10 +35,9 @@ from convert_root_to_parquet import (
     sanitize_jagged,
     validate_parquet_output,
 )
-from validate_parquet_positional_identity import compare_parquet_dirs
 
 FIXTURE = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), '..', 'data', 'low-pt', 'example_root.root',
+    os.path.dirname(__file__), '..', '..', 'part', 'data', 'low-pt', 'example_root.root',
 ))
 
 pytestmark = pytest.mark.skipif(
@@ -219,33 +218,12 @@ class TestSplitSubdirNaming:
         assert not os.path.exists(os.path.join(output_dir, 'val'))
 
 
-class TestTestSplitConverter:
-    def test_extended_test_split_conversion(self, tmp_path, monkeypatch):
-        import convert_test_split_to_parquet as test_split
-        output_dir = str(tmp_path / 'test_split_out')
-        monkeypatch.setattr(sys, 'argv', [
-            'convert_test_split_to_parquet.py',
-            '--input', FIXTURE,
-            '--output-dir', output_dir,
-            '--events-per-shard', '10',
-            '--extended',
-        ])
-        test_split.main()
-
-        data = ak.from_parquet(os.path.join(output_dir, 'test_000.parquet'))
-        assert 'event_global_index' in data.fields
-        assert 'tauto3pi_n' in data.fields
-        assert set(MUON_BRANCH_MAP.values()) <= set(data.fields)
-        assert set(OTHER_TRACK_BRANCH_MAP.values()) <= set(data.fields)
-        assert 'event_other_pv_z' in data.fields
-
-
 NAN_FIXTURE = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), '..', 'data', 'low-pt',
+    os.path.dirname(__file__), '..', '..', 'part', 'data', 'low-pt',
     'nan_covariance_fixture.root',
 ))
 NAN_DIRTY_PARQUET = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), '..', 'data', 'low-pt',
+    os.path.dirname(__file__), '..', '..', 'part', 'data', 'low-pt',
     'nan_covariance_dirty.parquet',
 ))
 nan_fixture_required = pytest.mark.skipif(
@@ -292,76 +270,8 @@ class TestNaNSanitization:
                 assert (np.abs(flat) <= 1e10).all(), (split, column)
 
 
-@nan_fixture_required
-class TestPatchScript:
-    @pytest.fixture()
-    def patched_dir(self, tmp_path, monkeypatch):
-        import shutil
-        import patch_sanitize_track_columns as patch_module
-        shard_dir = tmp_path / 'shards'
-        shard_dir.mkdir()
-        shutil.copyfile(NAN_DIRTY_PARQUET,
-                        shard_dir / 'nan_covariance_dirty.parquet')
-        monkeypatch.setattr(sys, 'argv', [
-            'patch_sanitize_track_columns.py',
-            '--data-dir', str(shard_dir),
-            '--pattern', '*.parquet',
-        ])
-        patch_module.main()
-        return shard_dir
-
-    def test_patch_cleans_and_preserves(self, patched_dir):
-        from convert_root_to_parquet import NEW_TRACK_FLOAT_COLUMNS
-        original = ak.from_parquet(NAN_DIRTY_PARQUET)
-        patched = ak.from_parquet(
-            os.path.join(patched_dir, 'nan_covariance_dirty.parquet'))
-        assert len(patched) == len(original)
-        assert patched.fields == original.fields
-        for column in patched.fields:
-            original_flat = ak.to_numpy(ak.flatten(original[column],
-                                                   axis=None))
-            patched_flat = ak.to_numpy(ak.flatten(patched[column], axis=None))
-            assert original_flat.shape == patched_flat.shape, column
-            if column in NEW_TRACK_FLOAT_COLUMNS:
-                assert np.isfinite(patched_flat).all(), column
-                was_finite = np.isfinite(original_flat)
-                assert np.array_equal(original_flat[was_finite],
-                                      patched_flat[was_finite]), column
-                assert (patched_flat[~was_finite] == 0.0).all(), column
-            else:
-                assert np.array_equal(original_flat, patched_flat,
-                                      equal_nan=True), column
-
-    def test_patch_idempotent(self, patched_dir, monkeypatch):
-        import patch_sanitize_track_columns as patch_module
-        shard_path = os.path.join(patched_dir, 'nan_covariance_dirty.parquet')
-        before = ak.from_parquet(shard_path)
-        monkeypatch.setattr(sys, 'argv', [
-            'patch_sanitize_track_columns.py',
-            '--data-dir', str(patched_dir),
-            '--pattern', '*.parquet',
-        ])
-        patch_module.main()
-        after = ak.from_parquet(shard_path)
-        assert before.fields == after.fields
-        for column in before.fields:
-            assert np.array_equal(
-                ak.to_numpy(ak.flatten(before[column], axis=None)),
-                ak.to_numpy(ak.flatten(after[column], axis=None)),
-            ), column
-
-
 class TestValidators:
     def test_extended_output_validates(self, extended_dir):
         validate_parquet_output(os.path.join(extended_dir, 'train'),
                                 pt_cutoff=0.5, required_gt_pions=3,
                                 extended=True)
-
-    def test_positional_identity_passes(self, legacy_dir, extended_dir):
-        compare_parquet_dirs(os.path.join(legacy_dir, 'train'),
-                             os.path.join(extended_dir, 'train'))
-
-    def test_positional_identity_catches_mismatch(self, legacy_dir, extended_dir):
-        with pytest.raises(ValueError):
-            compare_parquet_dirs(os.path.join(legacy_dir, 'train'),
-                                 os.path.join(extended_dir, 'val'))

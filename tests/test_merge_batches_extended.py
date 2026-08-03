@@ -21,7 +21,7 @@ if MERGE_DIR not in sys.path:
 from merge_batches import KEEP_BRANCHES, merge_batch, parse_microbatch_id
 
 DATA_DIR = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), '..', 'data', 'low-pt',
+    os.path.dirname(__file__), '..', '..', 'part', 'data', 'low-pt',
 ))
 EXAMPLE = os.path.join(DATA_DIR, 'example_root.root')
 DITAUS = os.path.join(DATA_DIR, 'step_MINI_10_nano_ditaus_mc.root')
