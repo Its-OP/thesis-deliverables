@@ -127,6 +127,10 @@ def build_data_loaders(args, logger: logging.Logger) -> tuple[
         val_range = ((args.train_fraction, 1.0), 1.0)
 
     train_num_workers = min(args.num_workers, num_train_files)
+    # async_load spawns a ThreadPoolExecutor inside the dataset BEFORE torch
+    # forks its DataLoader workers; the children inherit the executor's lock
+    # in a locked state and hang forever after their first fetch. in_memory
+    # mode gains nothing from async prefetch, so it stays off.
     train_dataset = SimpleIterDataset(
         train_file_dict,
         data_config_file=args.data_config,
@@ -135,6 +139,7 @@ def build_data_loaders(args, logger: logging.Logger) -> tuple[
         fetch_by_files=True,
         fetch_step=num_train_files,
         in_memory=load_in_memory,
+        async_load=False,
     )
     data_config = train_dataset.config
 
@@ -146,6 +151,7 @@ def build_data_loaders(args, logger: logging.Logger) -> tuple[
         fetch_by_files=True,
         fetch_step=num_val_files,
         in_memory=load_in_memory,
+        async_load=False,
     )
 
     train_loader = DataLoader(
