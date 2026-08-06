@@ -40,6 +40,16 @@ NEW_FEATURE_NAMES = [
 ]
 UNSTANDARDIZED_FLAGS = ['track_closer_to_other_pv', 'track_has_soft_muon',
                         'track_has_sv']
+POINTS_TRANSPORT_NAMES = [
+    'track_eta_raw', 'track_phi_raw', 'track_dz',
+    'track_vertex_x', 'track_vertex_y', 'track_vertex_z',
+    'track_nearest_other_pv_index',
+    'track_lifetime_disp_x', 'track_lifetime_disp_y',
+]
+TRANSPORT_NEW_VARIABLES = [
+    'track_nearest_other_pv_index', 'track_pca_parameter',
+    'track_lifetime_disp_x', 'track_lifetime_disp_y',
+]
 
 eval_shard_required = pytest.mark.skipif(
     not EVAL_SHARD.exists(), reason='eval_000.parquet not present')
@@ -79,10 +89,31 @@ class TestConfigStructure:
             assert name in defined, name
 
 
+class TestPointsStructure:
+    def points_entries(self):
+        with open(DATA_CONFIG) as handle:
+            config = yaml.safe_load(handle)
+        return config['inputs']['pf_points']['vars']
+
+    def test_nine_null_standardized_transport_channels(self):
+        entries = self.points_entries()
+        assert [entry_name(entry) for entry in entries] == (
+            POINTS_TRANSPORT_NAMES)
+        for entry in entries:
+            assert isinstance(entry, list) and entry[1] is None, entry
+
+    def test_transport_new_variables_defined(self):
+        with open(DATA_CONFIG) as handle:
+            config = yaml.safe_load(handle)
+        defined = set(config['new_variables'])
+        for name in TRANSPORT_NEW_VARIABLES:
+            assert name in defined, name
+
+
 @eval_shard_required
 class TestBatchContents:
     @pytest.fixture(scope='class')
-    def feature_samples(self):
+    def batch_samples(self):
         sidecar_path = str(DATA_CONFIG).replace(
             '.yaml', f'.{_md5(str(DATA_CONFIG))}.auto.yaml')
         if not os.path.exists(sidecar_path):
@@ -98,11 +129,21 @@ class TestBatchContents:
             async_load=False,
         )
         iterator = iter(dataset)
-        samples = []
+        features, points, masks = [], [], []
         for _ in range(30):
             model_inputs, _, _ = next(iterator)
-            samples.append(np.asarray(model_inputs['pf_features']))
-        return np.stack(samples)
+            features.append(np.asarray(model_inputs['pf_features']))
+            points.append(np.asarray(model_inputs['pf_points']))
+            masks.append(np.asarray(model_inputs['pf_mask']))
+        return {
+            'features': np.stack(features),
+            'points': np.stack(points),
+            'masks': np.stack(masks),
+        }
+
+    @pytest.fixture(scope='class')
+    def feature_samples(self, batch_samples):
+        return batch_samples['features']
 
     def test_shape_and_finiteness(self, feature_samples):
         assert feature_samples.shape[1:] == (32, 2100)
@@ -112,3 +153,39 @@ class TestBatchContents:
         for channel_offset, name in enumerate(NEW_FEATURE_NAMES):
             channel = feature_samples[:, 16 + channel_offset, :]
             assert float(channel.std()) > 0, name
+
+    def test_points_shape_and_finiteness(self, batch_samples):
+        assert batch_samples['points'].shape[1:] == (9, 2100)
+        assert np.isfinite(batch_samples['points']).all()
+
+    def test_signed_dz_keeps_both_signs(self, batch_samples):
+        valid = batch_samples['masks'][:, 0, :] > 0
+        signed_dz = batch_samples['points'][:, 2, :][valid]
+        assert (signed_dz < 0).any() and (signed_dz > 0).any()
+
+    def test_nearest_index_is_integer_valued(self, batch_samples):
+        valid = batch_samples['masks'][:, 0, :] > 0
+        nearest_index = batch_samples['points'][:, 6, :][valid]
+        assert np.allclose(nearest_index, np.round(nearest_index))
+        assert (nearest_index >= 0).all()
+
+    def test_nearest_index_matches_numpy_recompute(self, batch_samples):
+        awkward = pytest.importorskip('awkward')
+        records = awkward.from_parquet(
+            str(EVAL_SHARD),
+            columns=['track_dz', 'event_primary_vertex_z',
+                     'event_other_pv_z'])
+        for event_index in range(batch_samples['points'].shape[0]):
+            record = records[event_index]
+            longitudinal_ip = np.asarray(record['track_dz'])[:2100]
+            track_count = len(longitudinal_ip)
+            other_pv_z = np.asarray(record['event_other_pv_z'])
+            global_z = float(record['event_primary_vertex_z']) + (
+                longitudinal_ip)
+            if other_pv_z.size:
+                expected = np.abs(
+                    global_z[:, None] - other_pv_z[None, :]).argmin(axis=1)
+            else:
+                expected = np.zeros(track_count)
+            observed = batch_samples['points'][event_index, 6, :track_count]
+            np.testing.assert_array_equal(observed, expected)

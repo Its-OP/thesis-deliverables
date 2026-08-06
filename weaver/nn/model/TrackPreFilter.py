@@ -149,7 +149,7 @@ class TrackPreFilter(nn.Module):
         lorentz_vectors: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """points: (B, 2, P) (eta, phi). features: (B, F, P). lorentz_vectors: (B, 4, P). mask: (B, 1, P). Returns (B, P); padded tracks -inf."""
+        """points: (B, >=2, P) (eta, phi, ...). features: (B, F, P). lorentz_vectors: (B, 4, P). mask: (B, 1, P). Returns (B, P); padded tracks -inf."""
         valid_mask = mask.squeeze(1).bool()
         scores = self._forward_mlp(points, features, lorentz_vectors, mask)
         return scores.masked_fill(~valid_mask, float('-inf'))

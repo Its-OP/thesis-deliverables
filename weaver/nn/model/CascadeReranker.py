@@ -6,6 +6,8 @@ import torch.nn.functional as functional
 
 from weaver.nn.model.graph_ops import pairwise_lv_fts
 
+SUPPORTED_PAIR_EXTRA_DIMS = (0, 6, 10)
+
 
 class Embed(nn.Module):
     def __init__(self, input_dim, dims, normalize_input=True, activation='gelu'):
@@ -247,6 +249,11 @@ class CascadeReranker(nn.Module):
         rs_at_k_tau2: float = 1.0,
     ):
         super().__init__()
+        if pair_extra_dim not in SUPPORTED_PAIR_EXTRA_DIMS:
+            raise ValueError(
+                f'pair_extra_dim={pair_extra_dim} is not supported; '
+                f'choose one of {SUPPORTED_PAIR_EXTRA_DIMS}.'
+            )
         self.ranking_num_samples = ranking_num_samples
         self.ranking_temperature = ranking_temperature
         self.pair_extra_dim = pair_extra_dim
@@ -312,7 +319,7 @@ class CascadeReranker(nn.Module):
         mask: torch.Tensor,
         stage1_scores: torch.Tensor,
     ) -> torch.Tensor:
-        """points: (B,2,K1). features: (B,F,K1). lorentz_vectors: (B,4,K1).
+        """points: (B,>=2,K1). features: (B,F,K1). lorentz_vectors: (B,4,K1).
         mask: (B,1,K1). stage1_scores: (B,K1). Returns (B,K1) with -inf at padded."""
         valid_mask = mask.squeeze(1).bool()
         padding_mask = ~valid_mask
@@ -348,9 +355,9 @@ class CascadeReranker(nn.Module):
         ) if self.pair_extra_dim > 0 else None
         if extra_pairwise is not None and extra_pairwise.shape[1] != self.pair_extra_dim:
             raise ValueError(
-                f'pair_extra_dim={self.pair_extra_dim} but got '
-                f'{extra_pairwise.shape[1]} pairwise channels. '
-                f'Use pair_extra_dim=6 or 0.'
+                f'pair_extra_dim={self.pair_extra_dim} but the builder '
+                f'produced {extra_pairwise.shape[1]} pairwise channels — '
+                'builder/config mismatch.'
             )
 
         attention_bias = self.pair_embed(lorentz_for_pairs, uu=extra_pairwise)
@@ -381,8 +388,12 @@ class CascadeReranker(nn.Module):
         lorentz_for_pairs: torch.Tensor,
         mask_float: torch.Tensor,
     ) -> torch.Tensor:
-        """Returns (B, 6, K1, K1). Channels: q_i*q_j, |Δdz_sig|, ρ(770) Gaussian,
-        OS×ρ, φ-corrected |Δdxy|, Lorentz dot."""
+        """points: (B, >=2, K1) — >=9 when pair_extra_dim=10. features:
+        (B, F, K1). lorentz_for_pairs: (B, 4, K1). mask_float: (B, 1, K1).
+        Returns (B, pair_extra_dim, K1, K1). Channels 0-5: q_i*q_j, |Δdz_sig|,
+        ρ(770) Gaussian, OS×ρ, φ-corrected |Δdxy|, Lorentz dot; dim 10
+        appends raw |Δdz|, ln 3D POCA, same-other-PV,
+        both-lifetime-positive."""
         pair_mask = mask_float.unsqueeze(-1) * mask_float.unsqueeze(-2)
 
         # charge feature is standardized (center=1.0, scale=0.5); recover raw.
@@ -425,10 +436,119 @@ class CascadeReranker(nn.Module):
             - pz.unsqueeze(-1) * pz.unsqueeze(-2)
         )
 
-        return torch.cat([
+        channels = [
             charge_product, dz_diff, rho_indicator,
             rho_os_indicator, dxy_phi_corrected, lorentz_dot,
-        ], dim=1) * pair_mask
+        ]
+        if self.pair_extra_dim >= 10:
+            if points.shape[1] < 9:
+                raise ValueError(
+                    f'pair_extra_dim={self.pair_extra_dim} needs the '
+                    '9-channel pf_points transport block, got '
+                    f'{points.shape[1]} point channels.'
+                )
+            # point index 2 = signed track_dz (cm): the raw gap beats the
+            # significance gap head-to-head (H6 S2.2) and is kept alongside it.
+            dz_raw = points[:, 2:3, :].float() * mask_float
+            raw_dz_gap = (dz_raw.unsqueeze(-1) - dz_raw.unsqueeze(-2)).abs()
+            channels.append(raw_dz_gap)
+            channels.extend(self._compute_vertex_pair_channels(
+                points, features, px, py,
+            ))
+
+        return torch.cat(channels, dim=1) * pair_mask
+
+    def _compute_vertex_pair_channels(
+        self,
+        points: torch.Tensor,
+        features: torch.Tensor,
+        px: torch.Tensor,
+        py: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """points: (B, >=9, K1). features: (B, F, K1). px, py: (B, 1, K1).
+        Returns three (B, 1, K1, K1) tensors: ln 3D POCA distance,
+        same-other-PV flag, both-lifetime-positive flag."""
+        eta = points[:, 0:1, :].float()
+        phi = points[:, 1:2, :].float()
+        cosh_eta = torch.cosh(eta)
+        direction = torch.cat([
+            torch.cos(phi) / cosh_eta,
+            torch.sin(phi) / cosh_eta,
+            torch.tanh(eta),
+        ], dim=1)
+        reference = points[:, 3:6, :].float()
+
+        # Skew-line closest approach between the linearized tracks; parallel
+        # pairs (denominator ~ 0, incl. every self-pair on the diagonal) fall
+        # back to the point-to-line distance. torch.where evaluates both
+        # branches, so denominators are made safe before dividing.
+        direction_i = direction.unsqueeze(-1)
+        direction_j = direction.unsqueeze(-2)
+        separation = reference.unsqueeze(-1) - reference.unsqueeze(-2)
+        direction_i_squared = (
+            direction_i * direction_i).sum(dim=1, keepdim=True)
+        direction_j_squared = (
+            direction_j * direction_j).sum(dim=1, keepdim=True)
+        direction_dot = (direction_i * direction_j).sum(dim=1, keepdim=True)
+        separation_dot_i = (direction_i * separation).sum(dim=1, keepdim=True)
+        separation_dot_j = (direction_j * separation).sum(dim=1, keepdim=True)
+
+        denominator = (
+            direction_i_squared * direction_j_squared - direction_dot ** 2
+        )
+        parallel = denominator < 1e-12
+        safe_denominator = torch.where(
+            parallel, torch.ones_like(denominator), denominator)
+        safe_direction_j_squared = torch.where(
+            direction_j_squared > 0,
+            direction_j_squared, torch.ones_like(direction_j_squared))
+        parameter_i = torch.where(
+            parallel, torch.zeros_like(denominator),
+            (direction_dot * separation_dot_j
+             - direction_j_squared * separation_dot_i) / safe_denominator)
+        parameter_j = torch.where(
+            parallel, separation_dot_j / safe_direction_j_squared,
+            (direction_i_squared * separation_dot_j
+             - direction_dot * separation_dot_i) / safe_denominator)
+        closest_gap = (
+            separation + parameter_i * direction_i - parameter_j * direction_j
+        )
+        poca_distance = closest_gap.square().sum(dim=1, keepdim=True).sqrt()
+        # ln: POCA spans µm (GT-GT) to meters and PairEmbed opens with a
+        # plain BatchNorm1d; the log keeps the discriminative decades apart.
+        ln_poca = torch.log(poca_distance + 1e-6)
+
+        # point index 6 = nearest-other-PV index; feature index 24 =
+        # track_closer_to_other_pv (null-standardized 0/1). Together they
+        # reproduce the H6 nearest-vertex test over [PV] + OtherPV.
+        nearest_index = points[:, 6:7, :]
+        closer_flag = features[:, 24:25, :]
+        same_index = (
+            nearest_index.unsqueeze(-1) == nearest_index.unsqueeze(-2))
+        both_closer = (
+            (closer_flag.unsqueeze(-1) > 0.5)
+            & (closer_flag.unsqueeze(-2) > 0.5))
+        same_other_pv = (same_index & both_closer).float()
+
+        # point indices 7-8 = transverse PCA displacement w.r.t. the stored
+        # PV; sign each track's impact parameter by its projection on the
+        # pair momentum axis (b-tagging convention).
+        displacement_x = points[:, 7:8, :].float()
+        displacement_y = points[:, 8:9, :].float()
+        magnitude = torch.hypot(displacement_x, displacement_y)
+        axis_px = px.unsqueeze(-1) + px.unsqueeze(-2)
+        axis_py = py.unsqueeze(-1) + py.unsqueeze(-2)
+        projection_i = (
+            displacement_x.unsqueeze(-1) * axis_px
+            + displacement_y.unsqueeze(-1) * axis_py)
+        projection_j = (
+            displacement_x.unsqueeze(-2) * axis_px
+            + displacement_y.unsqueeze(-2) * axis_py)
+        positive_i = (projection_i >= 0) & (magnitude.unsqueeze(-1) > 0)
+        positive_j = (projection_j >= 0) & (magnitude.unsqueeze(-2) > 0)
+        both_lifetime_positive = (positive_i & positive_j).float()
+
+        return [ln_poca, same_other_pv, both_lifetime_positive]
 
     def set_training_progress(self, progress: float) -> None:
         self._training_progress = max(0.0, min(1.0, progress))

@@ -71,6 +71,15 @@ new_variables:
    track_has_sv: (ak.num(sv_x, axis=1) > 0) * ak.ones_like(track_eta)
    track_pv_line_distance_3d: np.sqrt(((event_primary_vertex_y - track_vertex_y) * track_direction_z - (event_primary_vertex_z - track_vertex_z) * track_direction_y)**2 + ((event_primary_vertex_z - track_vertex_z) * track_direction_x - (event_primary_vertex_x - track_vertex_x) * track_direction_z)**2 + ((event_primary_vertex_x - track_vertex_x) * track_direction_y - (event_primary_vertex_y - track_vertex_y) * track_direction_x)**2)
    ###
+   ### H6 Stage-2 pair transport — per-track raw inputs the pairwise
+   ### interaction-matrix builder consumes (nearest-other-PV identity for the
+   ### re-association channel; transverse PCA displacement w.r.t. the stored
+   ### PV for the lifetime-sign channel).
+   track_nearest_other_pv_index: ak.argmin(np.abs(track_global_z[:, :, np.newaxis] - event_other_pv_z[:, np.newaxis, :]), axis=-1) * 1.0
+   track_pca_parameter: (event_primary_vertex_x - track_vertex_x) * np.cos(track_phi) + (event_primary_vertex_y - track_vertex_y) * np.sin(track_phi)
+   track_lifetime_disp_x: track_vertex_x - event_primary_vertex_x + track_pca_parameter * np.cos(track_phi)
+   track_lifetime_disp_y: track_vertex_y - event_primary_vertex_y + track_pca_parameter * np.sin(track_phi)
+   ###
    ### Dummy label for weaver compatibility (actual loss uses per-track labels)
    dummy_label: np.ones_like(event_n_tracks, dtype='float32')
 
@@ -85,6 +94,16 @@ inputs:
       vars:
          - [track_eta_raw, null]
          - [track_phi_raw, null]
+         ### H6 Stage-2 pair transport (raw, cm) — channels 2+ are invisible
+         ### to the frozen Stage-1 (cross_set_knn slices [:, 0:1]/[:, 1:2]
+         ### only) and feed the Stage-2 interaction-matrix builder.
+         - [track_dz, null]
+         - [track_vertex_x, null]
+         - [track_vertex_y, null]
+         - [track_vertex_z, null]
+         - [track_nearest_other_pv_index, null]
+         - [track_lifetime_disp_x, null]
+         - [track_lifetime_disp_y, null]
    pf_features:
       length: 2100
       pad_mode: constant
