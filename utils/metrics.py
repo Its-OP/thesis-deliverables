@@ -161,6 +161,7 @@ class MetricsAccumulator:
 
         self.recall_sums: dict[int, float] = {k: 0.0 for k in k_values}
         self.perfect_event_counts: dict[int, int] = {k: 0 for k in k_values}
+        self.duplet_event_counts: dict[int, int] = {k: 0 for k in k_values}
 
         self.breakdown_k = 200
         self.compute_breakdown = self.breakdown_k in k_values
@@ -222,6 +223,8 @@ class MetricsAccumulator:
                 self.recall_sums[k] += found / num_gt
                 if found == num_gt:
                     self.perfect_event_counts[k] += 1
+                if found >= 2:
+                    self.duplet_event_counts[k] += 1
                 if k == self.breakdown_k:
                     found_at_breakdown_k = found
 
@@ -242,6 +245,9 @@ class MetricsAccumulator:
             metrics[f'recall_at_{k}'] = self.recall_sums[k] / num_events
             metrics[f'perfect_at_{k}'] = (
                 self.perfect_event_counts[k] / num_events
+            )
+            metrics[f'duplet_at_{k}'] = (
+                self.duplet_event_counts[k] / num_events
             )
 
         metrics['total_gt_tracks'] = self.total_gt_tracks

@@ -213,3 +213,54 @@ class TestGlobalRecallConsistency:
             assert accumulated[key] == pytest.approx(direct[key], abs=1e-6), (
                 f'{key}: accumulated={accumulated[key]}, direct={direct[key]}'
             )
+
+
+class TestDupletAtK:
+    """duplet_at_k = fraction of events with >= 2 GT tracks in the top-K —
+    the D@K acceptance metric for the couple-seeded downstream stages."""
+
+    def test_duplet_fractions_hand_computed(self):
+        from utils.metrics import MetricsAccumulator
+
+        # 4 events, 30 tracks, 3 GT each at positions 0/1/2. Scores place:
+        #   event 0: all 3 GT in top-5            -> duplet at 5 and 10
+        #   event 1: exactly 2 GT in top-5        -> duplet at 5 and 10
+        #   event 2: 1 GT in top-5, 2nd in top-10 -> duplet at 10 only
+        #   event 3: 1 GT in top-10, rest beyond  -> never a duplet
+        scores = torch.zeros(4, 30)
+        labels = torch.zeros(4, 1, 30)
+        mask = torch.ones(4, 1, 30)
+        labels[:, 0, 0] = 1
+        labels[:, 0, 1] = 1
+        labels[:, 0, 2] = 1
+        background_positions = torch.arange(3, 30)
+        for event_index in range(4):
+            scores[event_index, background_positions] = torch.linspace(
+                4.0, 0.1, len(background_positions))
+        scores[0, 0], scores[0, 1], scores[0, 2] = 10.0, 9.0, 8.0
+        scores[1, 0], scores[1, 1], scores[1, 2] = 10.0, 9.0, 0.05
+        scores[2, 0], scores[2, 1], scores[2, 2] = 10.0, 3.4, 0.05
+        scores[3, 0], scores[3, 1], scores[3, 2] = 3.4, 0.05, 0.04
+
+        accumulator = MetricsAccumulator(k_values=(5, 10))
+        accumulator.update(scores, labels, mask)
+        metrics = accumulator.compute()
+
+        assert metrics['duplet_at_5'] == pytest.approx(2 / 4)
+        assert metrics['duplet_at_10'] == pytest.approx(3 / 4)
+
+    def test_duplet_counts_events_not_tracks(self):
+        from utils.metrics import MetricsAccumulator
+
+        # One event with a single GT track: a duplet is impossible, but the
+        # event still enters the denominator.
+        scores = torch.tensor([[10.0, 5.0, 1.0, 0.5]])
+        labels = torch.tensor([[[1.0, 0.0, 0.0, 0.0]]])
+        mask = torch.ones(1, 1, 4)
+
+        accumulator = MetricsAccumulator(k_values=(2,))
+        accumulator.update(scores, labels, mask)
+        metrics = accumulator.compute()
+
+        assert metrics['duplet_at_2'] == 0.0
+        assert metrics['recall_at_2'] == 1.0

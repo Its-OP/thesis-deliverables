@@ -127,7 +127,7 @@ def main():
                 ema_stage2.state_dict() if ema_stage2 is not None else None
             ),
             'best_val_loss': best_val_loss,
-            'best_val_recall_at_50': best_selection_value,
+            'best_val_duplet_at_50': best_selection_value,
             'best_val_epoch': best_val_epoch,
             'global_batch_count': global_batch_count,
             'val_losses': val_losses,
@@ -148,12 +148,14 @@ def main():
             device=device,
         )
         resume_state['best_selection_value'] = checkpoint.get(
-            'best_val_recall_at_50', 0.0,
+            'best_val_duplet_at_50', 0.0,
         )
 
     def metrics_factory():
         return MetricsAccumulator(
-            k_values=tuple(k for k in (10, 20, 30, 50, 100, 200) if k < args.top_k1),
+            k_values=tuple(
+                k for k in (10, 20, 30, 50, 60, 100, 200) if k < args.top_k1
+            ),
         )
 
     run_training(
@@ -175,8 +177,8 @@ def main():
             'stage2_loss_mode': args.stage2_loss_mode,
             'stage2_rs_at_k_target': args.stage2_rs_at_k_target,
         },
-        selection_metric='recall_at_50',
-        criterion_name_short='R@50',
+        selection_metric='duplet_at_50',
+        criterion_name_short='D@50',
         optimizer_factory=optimizer_factory,
         metrics_accumulator_factory=metrics_factory,
         on_epoch_start=on_epoch_start,
