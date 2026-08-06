@@ -75,6 +75,7 @@ class CoupleDumpModel(nn.Module):
                 member_full_indices=member_full_indices,
                 top_k2_track_labels=top_k2_track_labels,
                 track_valid_mask=track_valid_mask,
+                precomputed_cone=batch.get('precomputed_cone'),
             )
 
             couple_inputs['n_gt_in_top_k1'] = (
@@ -97,6 +98,40 @@ class CoupleDumpModel(nn.Module):
                 n_gt_in_top_k_tracks_columns, dim=1,
             )
         return couple_inputs
+
+    @torch.no_grad()
+    def build_cone_cache(
+        self,
+        dataset,
+        batch_size: int,
+        device: torch.device,
+        num_workers: int = 4,
+    ) -> torch.Tensor:
+        """dataset: CoupleDumpDataset (without a cache attached). Returns
+        (num_events, 4, n_couples) float16 cpu — the companion-cone block
+        [count, sum_pt, min_dr, has_companion], deterministic per
+        (event, K2), computed once so training batches skip it."""
+        from torch.utils.data import DataLoader
+
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=False, drop_last=False,
+            num_workers=num_workers, collate_fn=dataset.collate,
+        )
+        cache: torch.Tensor | None = None
+        for batch in loader:
+            batch = {key: value.to(device) for key, value in batch.items()}
+            couple_inputs = self._build_couple_inputs(batch)
+            # h6 block tail layout: [.., cone(4), sv(3), has_sv] — the cone
+            # block is channels -8:-4 of the couple vector.
+            cone_block = couple_inputs['couple_features'][:, -8:-4, :]
+            if cache is None:
+                cache = torch.empty(
+                    len(dataset), 4, cone_block.shape[2],
+                    dtype=torch.float16,
+                )
+            cache[batch['event_index'].cpu()] = (
+                cone_block.half().cpu())
+        return cache
 
     def forward(
         self, batch: dict[str, torch.Tensor],

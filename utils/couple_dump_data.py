@@ -63,6 +63,12 @@ class CoupleDumpDataset(torch.utils.data.Dataset):
         if self._length == 0:
             raise ValueError(f'No events in dump files: {parquet_paths}')
 
+        # Optional per-event cone cache: (num_events, 4, n_couples) fp16,
+        # attached by the trainer after a one-off precompute pass. When
+        # present, items carry their slice and the builder skips the
+        # per-batch cone computation entirely.
+        self.cone_cache: torch.Tensor | None = None
+
         # K1 is inferred from list lengths plus the known channel counts.
         self.top_k1 = len(self._columns['k1_stage2_scores'][0])
         k1_lengths = {
@@ -107,6 +113,9 @@ class CoupleDumpDataset(torch.utils.data.Dataset):
         }
         for name in _CONE_KEYS:
             item[name] = as_float(name)
+        if self.cone_cache is not None:
+            item['precomputed_cone'] = self.cone_cache[index]
+        item['event_index'] = torch.tensor(index, dtype=torch.long)
         return item
 
     @staticmethod
@@ -121,6 +130,11 @@ class CoupleDumpDataset(torch.utils.data.Dataset):
             key: torch.stack([item[key] for item in batch])
             for key in _STACKED_KEYS
         }
+        collated['event_index'] = torch.stack(
+            [item['event_index'] for item in batch])
+        if 'precomputed_cone' in batch[0]:
+            collated['precomputed_cone'] = torch.stack(
+                [item['precomputed_cone'] for item in batch])
         batch_size = len(batch)
         cone_lengths = [item['cone_eta'].shape[0] for item in batch]
         max_length = max(cone_lengths)

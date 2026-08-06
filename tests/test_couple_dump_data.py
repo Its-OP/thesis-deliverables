@@ -254,3 +254,45 @@ def test_dump_mode_requires_both_dump_paths():
 
     with pytest.raises(SystemExit):
         train_main(['--train-dump', 'only_train.parquet'])
+
+
+@requires_fixture
+def test_cone_cache_reproduces_direct_computation(dump_dataset, dump_model):
+    dataset = dump_dataset
+    model = dump_model
+    import torch
+
+    cache = model.build_cone_cache(
+        dataset, batch_size=8, device=torch.device('cpu'), num_workers=0)
+    assert cache.shape[0] == len(dataset)
+    assert cache.shape[1] == 4
+    assert cache.dtype == torch.float16
+
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=8, shuffle=False,
+        collate_fn=dataset.collate)
+    direct_batch = next(iter(loader))
+    direct_features = model._build_couple_inputs(
+        direct_batch)['couple_features']
+
+    dataset.cone_cache = cache
+    cached_loader = torch.utils.data.DataLoader(
+        dataset, batch_size=8, shuffle=False,
+        collate_fn=dataset.collate)
+    cached_batch = next(iter(cached_loader))
+    assert 'precomputed_cone' in cached_batch
+    cached_features = model._build_couple_inputs(
+        cached_batch)['couple_features']
+
+    # The cache stores fp16; everything outside the cone block must be
+    # bit-identical, the cone block equal within fp16 rounding.
+    torch.testing.assert_close(
+        cached_features[:, :91], direct_features[:, :91],
+        rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        cached_features[:, 95:], direct_features[:, 95:],
+        rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        cached_features[:, 91:95], direct_features[:, 91:95],
+        rtol=2e-3, atol=2e-2)
+    dataset.cone_cache = None

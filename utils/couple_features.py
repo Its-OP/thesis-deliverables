@@ -234,11 +234,15 @@ def _compute_h6_couple_channels(
     full_valid_mask: torch.Tensor,
     member_full_indices: torch.Tensor,
     companion_chunk_elements: int,
+    precomputed_cone: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """top_k2_points: (B, >=26, K2). top_k2_features: (B, 32, K2).
     upper_i/upper_j: (C,). sum_px/sum_py/sum_pz: (B, C). full_points:
     (B, >=3, P). full_lorentz: (B, 4, P). full_valid_mask: (B, P).
-    member_full_indices: (B, K2). Returns (B, 11, C)."""
+    member_full_indices: (B, K2). precomputed_cone: optional (B, 4, C)
+    [count, sum_pt, min_dr, has_companion] — the cone block is
+    deterministic per (event, K2), so callers may cache it and skip the
+    per-batch cone computation. Returns (B, 11, C)."""
     with torch.no_grad():
         batch_size, _, pool_size = full_points.shape
         n_couples = upper_i.shape[0]
@@ -309,66 +313,77 @@ def _compute_h6_couple_channels(
             / torch.clamp_min(displacement * axis_pt, 1e-12)
         )
 
-        # Companion cone over the FULL kept-track set, members excluded,
-        # chunked over the couple axis to bound (B, chunk, P) intermediates.
-        axis_eta = torch.asinh(sum_pz / torch.clamp_min(axis_pt, 1e-12))
-        axis_phi = torch.atan2(sum_py, sum_px)
-        member_dz_i = top_k2_points[:, _POINT_IDX_DZ, upper_i]
-        member_dz_j = top_k2_points[:, _POINT_IDX_DZ, upper_j]
-        axis_dz = 0.5 * (member_dz_i + member_dz_j)
-        original_index_i = member_full_indices.gather(
-            1, upper_i.unsqueeze(0).expand(batch_size, -1))
-        original_index_j = member_full_indices.gather(
-            1, upper_j.unsqueeze(0).expand(batch_size, -1))
+        if precomputed_cone is not None:
+            cone_block = precomputed_cone.float()
+            companion_count = cone_block[:, 0, :]
+            companion_sum_pt = cone_block[:, 1, :]
+            companion_min_dr = cone_block[:, 2, :]
+            has_companion = cone_block[:, 3, :]
+        else:
+            # Companion cone over the FULL kept-track set, members excluded,
+            # chunked over the couple axis to bound (B, chunk, P)
+            # intermediates.
+            axis_eta = torch.asinh(sum_pz / torch.clamp_min(axis_pt, 1e-12))
+            axis_phi = torch.atan2(sum_py, sum_px)
+            member_dz_i = top_k2_points[:, _POINT_IDX_DZ, upper_i]
+            member_dz_j = top_k2_points[:, _POINT_IDX_DZ, upper_j]
+            axis_dz = 0.5 * (member_dz_i + member_dz_j)
+            original_index_i = member_full_indices.gather(
+                1, upper_i.unsqueeze(0).expand(batch_size, -1))
+            original_index_j = member_full_indices.gather(
+                1, upper_j.unsqueeze(0).expand(batch_size, -1))
 
-        full_eta = full_points[:, 0, :].float()
-        full_phi = full_points[:, 1, :].float()
-        full_dz = full_points[:, _POINT_IDX_DZ, :].float()
-        full_pt = torch.hypot(
-            full_lorentz[:, 0, :].float(), full_lorentz[:, 1, :].float())
-        track_index = torch.arange(
-            pool_size, device=full_points.device).view(1, 1, pool_size)
+            full_eta = full_points[:, 0, :].float()
+            full_phi = full_points[:, 1, :].float()
+            full_dz = full_points[:, _POINT_IDX_DZ, :].float()
+            full_pt = torch.hypot(
+                full_lorentz[:, 0, :].float(), full_lorentz[:, 1, :].float())
+            track_index = torch.arange(
+                pool_size, device=full_points.device).view(1, 1, pool_size)
 
-        companion_count = torch.empty(
-            batch_size, n_couples, device=full_points.device)
-        companion_sum_pt = torch.empty_like(companion_count)
-        companion_min_dr = torch.empty_like(companion_count)
+            companion_count = torch.empty(
+                batch_size, n_couples, device=full_points.device)
+            companion_sum_pt = torch.empty_like(companion_count)
+            companion_min_dr = torch.empty_like(companion_count)
 
-        chunk_size = max(
-            64, min(n_couples,
-                    companion_chunk_elements
-                    // max(1, batch_size * pool_size)))
-        for chunk_start in range(0, n_couples, chunk_size):
-            chunk = slice(chunk_start, min(chunk_start + chunk_size,
-                                           n_couples))
-            delta_eta = (
-                full_eta.unsqueeze(1) - axis_eta[:, chunk].unsqueeze(-1))
-            delta_phi = (
-                full_phi.unsqueeze(1) - axis_phi[:, chunk].unsqueeze(-1))
-            delta_phi = (delta_phi + math.pi) % (2 * math.pi) - math.pi
-            delta_r = torch.sqrt(delta_eta ** 2 + delta_phi ** 2)
-            dz_gap = (
-                full_dz.unsqueeze(1) - axis_dz[:, chunk].unsqueeze(-1)
-            ).abs()
-            in_cone = (
-                (delta_r < CONE_DELTA_R_MAXIMUM)
-                & (dz_gap < CONE_DZ_WINDOW)
-                & full_valid_mask.unsqueeze(1)
-                & (track_index != original_index_i[:, chunk].unsqueeze(-1))
-                & (track_index != original_index_j[:, chunk].unsqueeze(-1))
-            )
-            in_cone_float = in_cone.float()
-            companion_count[:, chunk] = in_cone_float.sum(dim=-1)
-            companion_sum_pt[:, chunk] = (
-                in_cone_float * full_pt.unsqueeze(1)).sum(dim=-1)
-            masked_delta_r = torch.where(
-                in_cone, delta_r, torch.full_like(delta_r, float('inf')))
-            companion_min_dr[:, chunk] = masked_delta_r.amin(dim=-1)
+            chunk_size = max(
+                64, min(n_couples,
+                        companion_chunk_elements
+                        // max(1, batch_size * pool_size)))
+            for chunk_start in range(0, n_couples, chunk_size):
+                chunk = slice(chunk_start, min(chunk_start + chunk_size,
+                                               n_couples))
+                delta_eta = (
+                    full_eta.unsqueeze(1) - axis_eta[:, chunk].unsqueeze(-1))
+                delta_phi = (
+                    full_phi.unsqueeze(1) - axis_phi[:, chunk].unsqueeze(-1))
+                delta_phi = (delta_phi + math.pi) % (2 * math.pi) - math.pi
+                delta_r = torch.sqrt(delta_eta ** 2 + delta_phi ** 2)
+                dz_gap = (
+                    full_dz.unsqueeze(1) - axis_dz[:, chunk].unsqueeze(-1)
+                ).abs()
+                in_cone = (
+                    (delta_r < CONE_DELTA_R_MAXIMUM)
+                    & (dz_gap < CONE_DZ_WINDOW)
+                    & full_valid_mask.unsqueeze(1)
+                    & (track_index
+                       != original_index_i[:, chunk].unsqueeze(-1))
+                    & (track_index
+                       != original_index_j[:, chunk].unsqueeze(-1))
+                )
+                in_cone_float = in_cone.float()
+                companion_count[:, chunk] = in_cone_float.sum(dim=-1)
+                companion_sum_pt[:, chunk] = (
+                    in_cone_float * full_pt.unsqueeze(1)).sum(dim=-1)
+                masked_delta_r = torch.where(
+                    in_cone, delta_r, torch.full_like(delta_r, float('inf')))
+                companion_min_dr[:, chunk] = masked_delta_r.amin(dim=-1)
 
-        has_companion = (companion_count > 0).float()
-        companion_min_dr = torch.where(
-            companion_count > 0, companion_min_dr,
-            torch.full_like(companion_min_dr, COMPANION_MIN_DR_SENTINEL))
+            has_companion = (companion_count > 0).float()
+            companion_min_dr = torch.where(
+                companion_count > 0, companion_min_dr,
+                torch.full_like(companion_min_dr,
+                                COMPANION_MIN_DR_SENTINEL))
 
         # Nearest secondary vertex to the couple vertex (POCA midpoint) over
         # the 3 transported SV slots; empty slots sit at the coordinate
@@ -440,6 +455,7 @@ def build_couple_features_batched(
     track_valid_mask: torch.Tensor | None = None,
     m_tau: float = M_TAU_GEV,
     companion_chunk_elements: int = COMPANION_CHUNK_TARGET_ELEMENTS,
+    precomputed_cone: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Vectorized batched version of the per-event feature builder.
 
@@ -680,6 +696,7 @@ def build_couple_features_batched(
         full_valid_mask=full_valid_mask,
         member_full_indices=member_full_indices,
         companion_chunk_elements=companion_chunk_elements,
+        precomputed_cone=precomputed_cone,
     )
     couple_features_list.append(h6_couple_channels)
 

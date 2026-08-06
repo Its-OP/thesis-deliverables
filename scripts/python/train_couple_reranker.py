@@ -380,6 +380,28 @@ def run_dump_training(args) -> None:
         f'(input_dim={couple_reranker.input_dim})',
     )
 
+    # One-off companion-cone precompute: the cone block is deterministic per
+    # (event, K2); caching it removes the dominant per-batch builder cost.
+    cache_start = time.time()
+    logger.info('Precomputing companion-cone cache (train)...')
+    train_dataset.cone_cache = model.build_cone_cache(
+        train_dataset, args.batch_size, device,
+        num_workers=args.num_workers,
+    )
+    logger.info('Precomputing companion-cone cache (val)...')
+    val_dataset.cone_cache = model.build_cone_cache(
+        val_dataset, args.batch_size, device,
+        num_workers=args.num_workers,
+    )
+    cache_gib = (
+        train_dataset.cone_cache.numel()
+        + val_dataset.cone_cache.numel()
+    ) * 2 / 2 ** 30
+    logger.info(
+        f'Cone caches ready in {time.time() - cache_start:.1f}s '
+        f'({cache_gib:.1f} GiB host RAM)',
+    )
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
