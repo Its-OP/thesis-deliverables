@@ -165,7 +165,7 @@ class TestBatchContents:
             assert float(channel.std()) > 0, name
 
     def test_points_shape_and_finiteness(self, batch_samples):
-        assert batch_samples['points'].shape[1:] == (9, 2100)
+        assert batch_samples['points'].shape[1:] == (26, 2100)
         assert np.isfinite(batch_samples['points']).all()
 
     def test_signed_dz_keeps_both_signs(self, batch_samples):

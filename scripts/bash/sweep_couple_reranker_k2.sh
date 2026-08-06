@@ -23,24 +23,22 @@ fi
 K2_GRID=(50 60 70 80 100 125 150)
 DATA_CONFIG="data/low-pt/lowpt_tau_trackfinder.yaml"
 VAL_DATA_DIR="data/low-pt/eval/"
+TRAIN_DUMP="${TRAIN_DUMP:-/workspace/dumps/stage3_dump_train.parquet}"
+VAL_DUMP="${VAL_DUMP:-/workspace/dumps/stage3_dump_eval.parquet}"
 
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 
 for K2 in "${K2_GRID[@]}"; do
     MODEL_NAME="h6s3_k${K2}_CoupleReranker"
-    echo "=== K2=${K2}: training ${MODEL_NAME} ==="
+    echo "=== K2=${K2}: training ${MODEL_NAME} (dump mode) ==="
     "${PYTHON}" -m scripts.python.train_couple_reranker \
-        --data-config "${DATA_CONFIG}" \
-        --data-dir data/low-pt/train/ \
-        --val-data-dir "${VAL_DATA_DIR}" \
-        --network networks/lowpt_tau_CoupleReranker.py \
-        --stage1-checkpoint models/prefilter_best.pt \
-        --stage2-checkpoint models/stage2_best.pt \
+        --train-dump "${TRAIN_DUMP}" \
+        --val-dump "${VAL_DUMP}" \
         --top-k2 "${K2}" \
         --model-name "${MODEL_NAME}" \
         --experiments-dir experiments \
-        --epochs 100 --steps-per-epoch 500 --batch-size 16 --lr 5e-4 \
-        --couple-label-smoothing 0.10 --amp --num-workers 10 \
+        --epochs 30 --steps-per-epoch 146 --batch-size 2048 --lr 2e-3 \
+        --couple-label-smoothing 0.10 --amp --num-workers 4 \
         --keep-best-k 5 \
         --k-values-couples 50 60 75 100 125 200 \
         --k-values-tracks 30 50 60 70 80 100 125 150 200 \

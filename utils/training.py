@@ -49,10 +49,11 @@ def add_common_training_args(
     default_grad_clip: float = 1.0,
     default_train_fraction: float = 0.8,
     default_save_every: int = 5,
+    require_data_args: bool = True,
 ) -> None:
-    parser.add_argument('--data-config', type=str, required=True)
-    parser.add_argument('--data-dir', type=str, required=True)
-    parser.add_argument('--network', type=str, required=True)
+    parser.add_argument('--data-config', type=str, required=require_data_args)
+    parser.add_argument('--data-dir', type=str, required=require_data_args)
+    parser.add_argument('--network', type=str, required=require_data_args)
     parser.add_argument('--experiments-dir', type=str, default='experiments')
     parser.add_argument('--epochs', type=int, default=default_epochs)
     parser.add_argument('--batch-size', type=int, default=default_batch_size)
