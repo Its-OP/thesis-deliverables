@@ -37,7 +37,7 @@ for K2 in "${K2_GRID[@]}"; do
         --top-k2 "${K2}" \
         --model-name "${MODEL_NAME}" \
         --experiments-dir experiments \
-        --epochs 30 --steps-per-epoch 146 --batch-size 2048 --lr 2e-3 \
+        --epochs 20 --steps-per-epoch 146 --batch-size 2048 --lr 2e-3 \
         --couple-label-smoothing 0.10 --amp --num-workers 4 \
         --keep-best-k 5 \
         --k-values-couples 50 60 75 100 125 200 \
