@@ -593,6 +593,119 @@ class TestDenominatorInvariant:
 
 
 # ---------------------------------------------------------------------------
+# Vectorized update vs the per-event reference loop
+# ---------------------------------------------------------------------------
+
+def oracle_update(
+    accumulator: CoupleMetricsAccumulator,
+    couple_scores: torch.Tensor,
+    couple_labels: torch.Tensor,
+    couple_mask: torch.Tensor,
+    n_gt_in_top_k1: torch.Tensor | None = None,
+    n_gt_in_top_k_tracks: torch.Tensor | None = None,
+) -> None:
+    """couple_scores, couple_labels, couple_mask: (B, n_couples).
+    Verbatim copy of the pre-vectorization ``update`` loop, mutating
+    ``accumulator`` state exactly as it did."""
+    batch_size = couple_scores.shape[0]
+
+    if n_gt_in_top_k_tracks is not None:
+        for batch_index in range(batch_size):
+            accumulator.total_events_count += 1
+            for k_index, k in enumerate(accumulator.k_values_tracks):
+                n_gt_at_k = n_gt_in_top_k_tracks[batch_index, k_index].item()
+                if n_gt_at_k >= accumulator.duplet_threshold:
+                    accumulator.d_sums[k] += 1.0
+    else:
+        accumulator.total_events_count += batch_size
+
+    for batch_index in range(batch_size):
+        valid_mask = couple_mask[batch_index] > 0.5
+        if not valid_mask.any():
+            continue
+        gt_mask = (couple_labels[batch_index] > 0.5) & valid_mask
+        if not gt_mask.any():
+            continue
+
+        event_scores = couple_scores[batch_index].clone()
+        event_scores = event_scores.masked_fill(~valid_mask, float('-inf'))
+        sorted_indices = torch.argsort(event_scores, descending=True)
+        sorted_gt = gt_mask[sorted_indices]
+
+        accumulator.eligible_events_count += 1
+        first_gt_position = int(sorted_gt.float().argmax().item())
+        accumulator.first_gt_rank_sum += float(first_gt_position + 1)
+
+        full_triplet_present = False
+        if n_gt_in_top_k1 is not None:
+            full_triplet_present = bool(
+                n_gt_in_top_k1[batch_index].item()
+                >= accumulator.full_triplet_threshold
+            )
+            if full_triplet_present:
+                accumulator.events_with_full_triplet_count += 1
+
+        for k in accumulator.k_values_couples:
+            if bool(sorted_gt[:k].any().item()):
+                accumulator.c_sums[k] += 1.0
+                if full_triplet_present:
+                    accumulator.rc_sums[k] += 1.0
+
+
+class TestVectorizedUpdateMatchesLoop:
+    def test_randomized_batches_match_reference(self):
+        torch.manual_seed(1234)
+        k_couples = (5, 20, 50)
+        k_tracks = (10, 30, 50)
+        vectorized = CoupleMetricsAccumulator(
+            k_values_couples=k_couples, k_values_tracks=k_tracks,
+        )
+        reference = CoupleMetricsAccumulator(
+            k_values_couples=k_couples, k_values_tracks=k_tracks,
+        )
+        # Four batches spanning the argument grid: (n_gt_in_top_k1 present,
+        # n_gt_in_top_k_tracks present) in all combinations, plus events with
+        # no valid couples, no GT couples, and a guaranteed eligible event.
+        argument_grid = [(True, True), (True, False), (False, False),
+                         (False, True)]
+        for with_top_k1, with_top_k_tracks in argument_grid:
+            batch_size, n_couples = 9, 60
+            scores = torch.randn(batch_size, n_couples)
+            labels = (torch.rand(batch_size, n_couples) < 0.06).float()
+            mask = (torch.rand(batch_size, n_couples) < 0.8).float()
+            mask[0] = 0.0                        # no valid couples
+            labels[1] = 0.0                      # no GT couples
+            labels[2, 5] = 1.0                   # guaranteed eligible event
+            mask[2, 5] = 1.0
+            n_gt_in_top_k1 = (
+                torch.randint(0, 4, (batch_size,)).float()
+                if with_top_k1 else None
+            )
+            n_gt_in_top_k_tracks = (
+                torch.randint(0, 4, (batch_size, len(k_tracks)))
+                if with_top_k_tracks else None
+            )
+            vectorized.update(
+                scores, labels, mask,
+                n_gt_in_top_k1=n_gt_in_top_k1,
+                n_gt_in_top_k_tracks=n_gt_in_top_k_tracks,
+            )
+            oracle_update(
+                reference, scores, labels, mask,
+                n_gt_in_top_k1=n_gt_in_top_k1,
+                n_gt_in_top_k_tracks=n_gt_in_top_k_tracks,
+            )
+
+        vectorized_metrics = vectorized.compute()
+        reference_metrics = reference.compute()
+        assert set(vectorized_metrics) == set(reference_metrics)
+        for key, reference_value in reference_metrics.items():
+            assert vectorized_metrics[key] == pytest.approx(
+                reference_value, abs=1e-9,
+            ), f'metric {key} diverged from the reference loop'
+
+
+# ---------------------------------------------------------------------------
 # Validation log table formatter
 # ---------------------------------------------------------------------------
 

@@ -175,7 +175,10 @@ def _expand_dump_files(pattern: str) -> list[str]:
 
 
 def _batch_to_device(batch: dict, device: torch.device) -> dict:
-    return {key: value.to(device) for key, value in batch.items()}
+    return {
+        key: value.to(device, non_blocking=True)
+        for key, value in batch.items()
+    }
 
 
 def _dump_train_one_epoch(
@@ -202,20 +205,14 @@ def _dump_train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast('cuda', enabled=grad_scaler is not None):
-            loss_dict = model.compute_loss(batch)
+            loss_dict = model.compute_loss(batch, with_metrics=False)
         for key in [name for name in loss_dict if name.startswith('_')]:
             loss_dict.pop(key)
         loss = loss_dict['total_loss']
 
-        if not torch.isfinite(loss).item():
-            logger.warning(
-                f'Epoch {epoch} | Batch {batch_index} | '
-                f'Skipping batch with non-finite loss',
-            )
-            optimizer.zero_grad(set_to_none=True)
-            global_batch_count += 1
-            continue
-
+        # No per-batch finiteness sync: under AMP the GradScaler skips the
+        # optimizer step on non-finite gradients; finiteness is only checked
+        # inside the periodic logging branch below (which syncs anyway).
         if grad_scaler is not None:
             grad_scaler.scale(loss).backward()
             grad_scaler.unscale_(optimizer)
@@ -243,10 +240,16 @@ def _dump_train_one_epoch(
 
         if batch_index % 20 == 0:
             elapsed = time.time() - start_time
+            loss_value = loss.item()
+            if not math.isfinite(loss_value):
+                logger.warning(
+                    f'Epoch {epoch} | Batch {batch_index} | '
+                    f'Non-finite loss {loss_value}',
+                )
             avg_loss = loss_accumulators['total_loss'].item() / num_batches
             logger.info(
                 f'Epoch {epoch} | Batch {batch_index} | '
-                f'Loss: {loss.item():.5f} | Avg: {avg_loss:.5f} | '
+                f'Loss: {loss_value:.5f} | Avg: {avg_loss:.5f} | '
                 f'LR: {scheduler.get_last_lr()[0]:.2e} | '
                 f'Time: {elapsed:.1f}s',
             )
@@ -344,15 +347,22 @@ def run_dump_training(args) -> None:
         f'(K1={train_dataset.top_k1}), val={len(val_dataset)} events',
     )
     pin_memory = device.type == 'cuda'
+    # Cone caches must be attached to the datasets before these loaders are
+    # first iterated (persistent workers snapshot the dataset at spawn); the
+    # precompute below runs its own throwaway loaders, so the order holds.
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
         drop_last=True, pin_memory=pin_memory, num_workers=args.num_workers,
         collate_fn=CoupleDumpDataset.collate,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         drop_last=False, pin_memory=pin_memory, num_workers=args.num_workers,
         collate_fn=CoupleDumpDataset.collate,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
 
     couple_reranker = CoupleReranker(

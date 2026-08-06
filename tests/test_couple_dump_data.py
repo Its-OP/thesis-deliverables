@@ -168,6 +168,16 @@ class TestCoupleDumpModel:
         assert loss_dict['_n_gt_in_top_k1'].shape == (4,)
         assert loss_dict['_n_gt_in_top_k_tracks'].shape == (4, 5)
 
+    def test_compute_loss_without_metrics_omits_metric_keys(
+            self, dump_model, dump_batch):
+        loss_dict = dump_model.compute_loss(dump_batch, with_metrics=False)
+        assert '_n_gt_in_top_k1' not in loss_dict
+        assert '_n_gt_in_top_k_tracks' not in loss_dict
+        for key in ('total_loss', 'ranking_loss', '_scores',
+                    '_couple_labels', '_couple_mask'):
+            assert key in loss_dict
+        assert torch.isfinite(loss_dict['total_loss'])
+
     def test_top_k2_selection_follows_stage2_order(self, dump_model, dump_batch):
         # End-to-end gather check via the cascade-score block of the couple
         # feature vector: for couple 0 = (pool position 0, pool position 1),

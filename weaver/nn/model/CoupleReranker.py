@@ -13,6 +13,47 @@ _TRACK_EMBED_DIM = 32
 _REST_DIM = 35
 
 
+def _positive_slots(pos_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """pos_mask: (B, N) bool. Returns slots (B, P) long, slot_valid (B, P) bool."""
+    batch_size, num_candidates = pos_mask.shape
+    slot_range = torch.arange(num_candidates, device=pos_mask.device)
+    key = torch.where(pos_mask, slot_range.expand(batch_size, -1),
+                      torch.full((batch_size, num_candidates), num_candidates,
+                                 device=pos_mask.device, dtype=torch.long))
+    sorted_key, _ = key.sort(dim=1)
+    max_positives = int(pos_mask.sum(dim=1).max()) if pos_mask.any() else 0
+    slots = sorted_key[:, :max_positives]
+    slot_valid = slots < num_candidates
+    return slots.clamp_max(max(num_candidates - 1, 0)), slot_valid
+
+
+def _sample_negative_indices(
+    negative: torch.Tensor,
+    num_samples: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """negative: (B, C) bool. Returns neg_idx (B, S) long, neg_valid (B, S)
+    bool with S = num_samples; per event the first min(S, n_neg) positions
+    hold uniform-with-replacement draws from that event's negatives. Sync-free:
+    ranks come from one rand(B, S) and map to columns via searchsorted over
+    the negatives' cumulative count."""
+    batch_size, num_candidates = negative.shape
+    negative_count = negative.sum(dim=1)
+    safe_count = negative_count.clamp(min=1)
+    uniform = torch.rand(batch_size, num_samples, device=negative.device)
+    draw_rank = (uniform * safe_count.unsqueeze(1)).long()
+    draw_rank = torch.minimum(draw_rank, (safe_count - 1).unsqueeze(1))
+    cumulative_count = negative.cumsum(dim=1)
+    neg_idx = torch.searchsorted(
+        cumulative_count.contiguous(), (draw_rank + 1).contiguous(),
+    ).clamp(max=num_candidates - 1)
+    sample_position = torch.arange(num_samples, device=negative.device)
+    neg_valid = (
+        sample_position.unsqueeze(0)
+        < negative_count.clamp(max=num_samples).unsqueeze(1)
+    )
+    return neg_idx, neg_valid
+
+
 class NanSafeBatchNorm1d(nn.BatchNorm1d):
     """BatchNorm1d that skips running-stat updates on non-finite inputs.
     Stat update with NaN corrupts running_mean permanently; on a non-finite
@@ -164,54 +205,65 @@ class CoupleReranker(nn.Module):
         scores: torch.Tensor,
         couple_labels: torch.Tensor,
         couple_mask: torch.Tensor,
+        *,
+        neg_idx: torch.Tensor | None = None,
+        neg_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """ListMLE top-1 with optional label smoothing.
-        For each positive p_i: L_i = (1−ε)·(−s_{p_i}/T + logsumexp(s_pool/T))
-                                      + ε·(−mean(s_pool)/T + logsumexp(s_pool/T))."""
-        batch_size = scores.shape[0]
+        """scores: (B, C). couple_labels, couple_mask: (B, C) float or bool.
+        neg_idx, neg_valid: optional (B, S) injected negative draws (tests) —
+        when given, sampling is skipped and validity trims each pool."""
         temperature = self.ranking_temperature
-        eps = self.label_smoothing
-        event_losses: list[torch.Tensor] = []
+        label_smoothing = self.label_smoothing
+        valid = couple_mask > 0.5
+        positive = (couple_labels > 0.5) & valid
+        negative = (couple_labels < 0.5) & valid
 
-        for event_index in range(batch_size):
-            event_scores = scores[event_index]
-            event_labels = couple_labels[event_index]
-            event_valid = couple_mask[event_index] > 0.5
-
-            positive_indices = (
-                (event_labels > 0.5) & event_valid
-            ).nonzero(as_tuple=True)[0]
-            negative_indices = (
-                (event_labels < 0.5) & event_valid
-            ).nonzero(as_tuple=True)[0]
-
-            if len(positive_indices) == 0 or len(negative_indices) == 0:
-                continue
-
-            num_samples = min(self.ranking_num_samples, len(negative_indices))
-            sample_positions = torch.randint(
-                0, len(negative_indices), (num_samples,),
-                device=event_scores.device,
+        if neg_idx is None:
+            neg_idx, neg_valid = _sample_negative_indices(
+                negative, self.ranking_num_samples,
             )
-            sampled_negatives = negative_indices[sample_positions]
-            negative_scores = event_scores[sampled_negatives]
-
-            positive_losses: list[torch.Tensor] = []
-            for positive_index in positive_indices:
-                positive_score = event_scores[positive_index]
-                pool_scores = torch.cat(
-                    [positive_score.unsqueeze(0), negative_scores],
-                )
-                scaled_pool = pool_scores / temperature
-                log_normalizer = torch.logsumexp(scaled_pool, dim=0)
-                nll = -positive_score / temperature + log_normalizer
-                if eps > 0.0:
-                    uniform_nll = -scaled_pool.mean() + log_normalizer
-                    positive_losses.append((1.0 - eps) * nll + eps * uniform_nll)
-                else:
-                    positive_losses.append(nll)
-            event_losses.append(torch.stack(positive_losses).mean())
-
-        if not event_losses:
+        elif neg_valid is None:
+            neg_valid = torch.ones_like(neg_idx, dtype=torch.bool)
+        contributing = positive.any(dim=1) & neg_valid.any(dim=1)
+        if not contributing.any():
             return scores.sum() * 0.0
-        return torch.stack(event_losses).mean()
+
+        slots, slot_valid = _positive_slots(positive)
+        max_positives = slots.shape[1]
+        positive_scores = scores.gather(1, slots)
+        negative_scores = scores.gather(1, neg_idx)
+
+        # Per-positive pool [s_pos] ++ sampled negatives, width 1 + S; the
+        # positive's own entry is always valid, so every row's logsumexp is
+        # finite even for skipped events.
+        pool = torch.cat([
+            positive_scores.unsqueeze(2),
+            negative_scores.unsqueeze(1).expand(-1, max_positives, -1),
+        ], dim=2)
+        entry_valid = torch.cat([
+            torch.ones_like(slot_valid).unsqueeze(2),
+            neg_valid.unsqueeze(1).expand(-1, max_positives, -1),
+        ], dim=2)
+
+        scaled = pool / temperature
+        log_normalizer = scaled.masked_fill(
+            ~entry_valid, float('-inf'),
+        ).logsumexp(dim=2)
+        nll = -positive_scores / temperature + log_normalizer
+        if label_smoothing > 0.0:
+            mean_scaled = (
+                (scaled * entry_valid).sum(dim=2) / entry_valid.sum(dim=2)
+            )
+            per_positive = (
+                (1.0 - label_smoothing) * nll
+                + label_smoothing * (-mean_scaled + log_normalizer)
+            )
+        else:
+            per_positive = nll
+
+        row_valid = slot_valid & contributing.unsqueeze(1)
+        per_event = (
+            (per_positive * row_valid).sum(dim=1)
+            / row_valid.sum(dim=1).clamp_min(1)
+        )
+        return per_event[contributing].mean()

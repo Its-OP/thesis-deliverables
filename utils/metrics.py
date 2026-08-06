@@ -443,59 +443,72 @@ class CoupleMetricsAccumulator:
                 ``k_values_tracks``. Required for D@K_tracks.
         """
         batch_size = couple_scores.shape[0]
+        # All per-batch sums are computed on-device as int64 counts and moved
+        # to the host in ONE transfer at the end of the call.
+        result_chunks: list[torch.Tensor] = []
 
         # ---- D@K_tracks accumulation (denominator = all events) ----
         if n_gt_in_top_k_tracks is not None:
-            for batch_index in range(batch_size):
-                self.total_events_count += 1
-                for k_index, k in enumerate(self.k_values_tracks):
-                    n_gt_at_k = n_gt_in_top_k_tracks[batch_index, k_index].item()
-                    if n_gt_at_k >= self.duplet_threshold:
-                        self.d_sums[k] += 1.0
-        else:
-            self.total_events_count += batch_size
+            duplet_found = n_gt_in_top_k_tracks >= self.duplet_threshold
+            result_chunks.append(duplet_found.sum(dim=0).long())
+        self.total_events_count += batch_size
 
         # ---- C@K_couples / RC@K_couples accumulation ----
-        for batch_index in range(batch_size):
-            valid_mask = couple_mask[batch_index] > 0.5
-            if not valid_mask.any():
-                continue
-            gt_mask = (couple_labels[batch_index] > 0.5) & valid_mask
-            if not gt_mask.any():
-                continue
+        valid_mask = couple_mask > 0.5
+        gt_mask = (couple_labels > 0.5) & valid_mask
+        eligible = valid_mask.any(dim=1) & gt_mask.any(dim=1)
 
-            # Push invalid couples to -inf so they sort to the bottom
-            event_scores = couple_scores[batch_index].clone()
-            event_scores = event_scores.masked_fill(
-                ~valid_mask, float('-inf'),
+        # Push invalid couples to -inf so they sort to the bottom
+        masked_scores = couple_scores.masked_fill(~valid_mask, float('-inf'))
+        sorted_indices = torch.argsort(masked_scores, dim=1, descending=True)
+        sorted_gt = gt_mask.gather(1, sorted_indices)
+
+        # First (best) GT couple rank, 1-indexed: argmax returns the first
+        # True position of each row; only eligible rows contribute.
+        first_gt_position = sorted_gt.float().argmax(dim=1)
+
+        if n_gt_in_top_k1 is not None:
+            full_triplet = n_gt_in_top_k1 >= self.full_triplet_threshold
+        else:
+            full_triplet = torch.zeros(
+                batch_size, dtype=torch.bool, device=couple_scores.device,
             )
-            sorted_indices = torch.argsort(event_scores, descending=True)
-            sorted_gt = gt_mask[sorted_indices]
+        full_triplet_eligible = eligible & full_triplet
 
-            self.eligible_events_count += 1
+        couple_in_top_k = torch.stack([
+            sorted_gt[:, :k].any(dim=1) & eligible
+            for k in self.k_values_couples
+        ])
+        couple_in_top_k_full = (
+            couple_in_top_k & full_triplet_eligible.unsqueeze(0)
+        )
 
-            # First (best) GT couple rank, 1-indexed. We know sorted_gt
-            # has at least one True position because gt_mask.any() passed
-            # the early-continue check above.
-            #     rank = 1 + argmax over sorted positions of the GT mask
-            first_gt_position = int(sorted_gt.float().argmax().item())
-            self.first_gt_rank_sum += float(first_gt_position + 1)
+        result_chunks.append(eligible.sum().reshape(1))
+        result_chunks.append(full_triplet_eligible.sum().reshape(1))
+        result_chunks.append(
+            ((first_gt_position + 1) * eligible).sum().reshape(1),
+        )
+        result_chunks.append(couple_in_top_k.sum(dim=1).long())
+        result_chunks.append(couple_in_top_k_full.sum(dim=1).long())
 
-            full_triplet_present = False
-            if n_gt_in_top_k1 is not None:
-                full_triplet_present = bool(
-                    n_gt_in_top_k1[batch_index].item()
-                    >= self.full_triplet_threshold
-                )
-                if full_triplet_present:
-                    self.events_with_full_triplet_count += 1
-
-            for k in self.k_values_couples:
-                couple_in_top_k = bool(sorted_gt[:k].any().item())
-                if couple_in_top_k:
-                    self.c_sums[k] += 1.0
-                    if full_triplet_present:
-                        self.rc_sums[k] += 1.0
+        results = torch.cat(result_chunks).cpu().tolist()
+        cursor = 0
+        if n_gt_in_top_k_tracks is not None:
+            for k in self.k_values_tracks:
+                self.d_sums[k] += float(results[cursor])
+                cursor += 1
+        self.eligible_events_count += int(results[cursor])
+        cursor += 1
+        self.events_with_full_triplet_count += int(results[cursor])
+        cursor += 1
+        self.first_gt_rank_sum += float(results[cursor])
+        cursor += 1
+        for k in self.k_values_couples:
+            self.c_sums[k] += float(results[cursor])
+            cursor += 1
+        for k in self.k_values_couples:
+            self.rc_sums[k] += float(results[cursor])
+            cursor += 1
 
     def compute(self) -> dict[str, float]:
         """Compute final averages.

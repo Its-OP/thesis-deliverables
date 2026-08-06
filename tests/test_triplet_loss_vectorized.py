@@ -5,10 +5,13 @@ import math
 import pytest
 import torch
 
+from test_couple_loss_vectorized import (
+    _inject_negatives,
+    reference_softmax_ce_loss,
+)
 from weaver.nn.model.TripletReranker import (
     TripletReranker,
     full_list_softmax_ce_loss,
-    sampled_softmax_ce_loss,
 )
 
 
@@ -48,13 +51,14 @@ def test_sampled_matches_reference(seed, label_smoothing, temperature):
         seed, batch_size=4, num_candidates=20, max_positives=3,
         drop_negatives=(1,), pad_tail=3)
     scores_vec = scores_ref.detach().clone().requires_grad_(True)
+    neg_idx, neg_valid = _inject_negatives(
+        pos_mask, valid_mask, num_samples, seed + 500)
 
-    torch.manual_seed(seed)
-    reference = model._softmax_ce_loss(scores_ref, pos_mask.float(), valid_mask.float())
-    torch.manual_seed(seed)
-    vectorized = sampled_softmax_ce_loss(
-        scores_vec, pos_mask, valid_mask, num_samples=num_samples,
-        temperature=temperature, label_smoothing=label_smoothing)
+    reference = reference_softmax_ce_loss(
+        scores_ref, pos_mask.float(), valid_mask.float(), num_samples,
+        temperature, label_smoothing, neg_idx=neg_idx, neg_valid=neg_valid)
+    vectorized = model._softmax_ce_loss(
+        scores_vec, pos_mask, valid_mask, neg_idx=neg_idx, neg_valid=neg_valid)
 
     torch.testing.assert_close(vectorized, reference, rtol=1e-6, atol=1e-7)
     reference.backward()
@@ -63,18 +67,22 @@ def test_sampled_matches_reference(seed, label_smoothing, temperature):
 
 
 def test_sampled_matches_reference_fewer_negatives_than_samples():
-    # n_neg < num_samples exercises the min(S, n_neg) pool width.
-    model = _reference_model(num_samples=50, temperature=1.0, label_smoothing=0.1)
+    # n_neg < num_samples exercises the min(S, n_neg) ragged pool width.
+    num_samples = 50
+    model = _reference_model(num_samples=num_samples, temperature=1.0,
+                             label_smoothing=0.1)
     scores_ref, pos_mask, valid_mask = _random_case(
         seed=11, batch_size=3, num_candidates=6, max_positives=2)
     scores_vec = scores_ref.detach().clone().requires_grad_(True)
+    neg_idx, neg_valid = _inject_negatives(pos_mask, valid_mask, num_samples, 21)
+    assert bool((neg_valid.sum(dim=1) < num_samples).all())
 
-    torch.manual_seed(11)
-    reference = model._softmax_ce_loss(scores_ref, pos_mask.float(), valid_mask.float())
-    torch.manual_seed(11)
-    vectorized = sampled_softmax_ce_loss(
-        scores_vec, pos_mask, valid_mask, num_samples=50,
-        temperature=1.0, label_smoothing=0.1)
+    reference = reference_softmax_ce_loss(
+        scores_ref, pos_mask.float(), valid_mask.float(), num_samples,
+        temperature=1.0, label_smoothing=0.1,
+        neg_idx=neg_idx, neg_valid=neg_valid)
+    vectorized = model._softmax_ce_loss(
+        scores_vec, pos_mask, valid_mask, neg_idx=neg_idx, neg_valid=neg_valid)
 
     torch.testing.assert_close(vectorized, reference, rtol=1e-6, atol=1e-7)
     reference.backward()
@@ -85,13 +93,12 @@ def test_sampled_matches_reference_fewer_negatives_than_samples():
 def test_sampled_injected_negatives_manual():
     # One event, one positive (slot 0), negatives injected as slots [2, 3]:
     # pool = [s0, s2, s3], nll = -s0 + lse(pool); eps=0 keeps it bare.
+    model = _reference_model(num_samples=2, temperature=1.0, label_smoothing=0.0)
     scores = torch.tensor([[1.0, 9.0, -1.0, 0.5]], requires_grad=True)
     pos_mask = torch.tensor([[True, False, False, False]])
     valid_mask = torch.tensor([[True, False, True, True]])
     neg_idx = torch.tensor([[2, 3]])
-    loss = sampled_softmax_ce_loss(
-        scores, pos_mask, valid_mask, num_samples=2, temperature=1.0,
-        label_smoothing=0.0, neg_idx=neg_idx)
+    loss = model._softmax_ce_loss(scores, pos_mask, valid_mask, neg_idx=neg_idx)
     pool = [1.0, -1.0, 0.5]
     expected = -1.0 + math.log(sum(math.exp(value) for value in pool))
     assert loss.item() == pytest.approx(expected, rel=1e-6)
@@ -154,25 +161,24 @@ def test_padding_invariance():
         padded_scores, padded_pos, padded_valid, temperature=1.0, label_smoothing=0.1)
     torch.testing.assert_close(full_a.detach(), full_b.detach(), rtol=1e-6, atol=1e-7)
 
+    # The sampler draws rand(B, S) and ranks over each event's negatives, so
+    # padded-only columns change neither the draw stream nor the mapping.
+    model = _reference_model(num_samples=5, temperature=1.0, label_smoothing=0.1)
     torch.manual_seed(0)
-    sampled_a = sampled_softmax_ce_loss(
-        scores, pos_mask, valid_mask, num_samples=5, temperature=1.0,
-        label_smoothing=0.1)
+    sampled_a = model._softmax_ce_loss(scores, pos_mask, valid_mask)
     torch.manual_seed(0)
-    sampled_b = sampled_softmax_ce_loss(
-        padded_scores, padded_pos, padded_valid, num_samples=5, temperature=1.0,
-        label_smoothing=0.1)
+    sampled_b = model._softmax_ce_loss(padded_scores, padded_pos, padded_valid)
     torch.testing.assert_close(sampled_a.detach(), sampled_b.detach(),
                                rtol=1e-6, atol=1e-7)
 
 
 def test_no_contributing_events_returns_graph_zero():
+    model = _reference_model(num_samples=5, temperature=1.0, label_smoothing=0.1)
     scores = torch.randn(2, 6, requires_grad=True)
     pos_mask = torch.zeros(2, 6, dtype=torch.bool)
     valid_mask = torch.ones(2, 6, dtype=torch.bool)
     for loss in (
-        sampled_softmax_ce_loss(scores, pos_mask, valid_mask, num_samples=5,
-                                temperature=1.0, label_smoothing=0.1),
+        model._softmax_ce_loss(scores, pos_mask, valid_mask),
         full_list_softmax_ce_loss(scores, pos_mask, valid_mask,
                                   temperature=1.0, label_smoothing=0.1),
     ):

@@ -7,6 +7,7 @@ from weaver.nn.model.CoupleReranker import (
     CoupleReranker,
     NanSafeBatchNorm1d,
     ResidualBlock,
+    _positive_slots,
 )
 
 # Stage-4 candidate tables carry the frozen legacy 16-wide ti_/tj_/tk_
@@ -15,100 +16,6 @@ from weaver.nn.model.CoupleReranker import (
 _TRACK_EMBED_DIM = 16
 
 _TRACK_PREFIXES = ('ti_', 'tj_', 'tk_')
-
-
-def _positive_slots(pos_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """pos_mask: (B, N) bool. Returns slots (B, P) long, slot_valid (B, P) bool."""
-    batch_size, num_candidates = pos_mask.shape
-    slot_range = torch.arange(num_candidates, device=pos_mask.device)
-    key = torch.where(pos_mask, slot_range.expand(batch_size, -1),
-                      torch.full((batch_size, num_candidates), num_candidates,
-                                 device=pos_mask.device, dtype=torch.long))
-    sorted_key, _ = key.sort(dim=1)
-    max_positives = int(pos_mask.sum(dim=1).max()) if pos_mask.any() else 0
-    slots = sorted_key[:, :max_positives]
-    slot_valid = slots < num_candidates
-    return slots.clamp_max(max(num_candidates - 1, 0)), slot_valid
-
-
-def _sample_negatives(
-    pos_mask: torch.Tensor,
-    neg_mask: torch.Tensor,
-    num_samples: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """pos_mask, neg_mask: (B, N) bool. Returns neg_idx (B, S) long, neg_valid
-    (B, S) bool, contrib (B,) bool. Consumes the global RNG exactly like the
-    reference loop: one randint(0, n_neg, (min(S, n_neg),)) per contributing event,
-    in event order, skipping 0-pos/0-neg events before the draw."""
-    batch_size = pos_mask.shape[0]
-    neg_idx = torch.zeros(batch_size, num_samples, dtype=torch.long, device=device)
-    neg_valid = torch.zeros(batch_size, num_samples, dtype=torch.bool, device=device)
-    contrib = torch.zeros(batch_size, dtype=torch.bool, device=device)
-    for event in range(batch_size):
-        negative_indices = neg_mask[event].nonzero(as_tuple=True)[0]
-        if not pos_mask[event].any() or len(negative_indices) == 0:
-            continue
-        contrib[event] = True
-        count = min(num_samples, len(negative_indices))
-        draw = torch.randint(0, len(negative_indices), (count,), device=device)
-        neg_idx[event, :count] = negative_indices[draw]
-        neg_valid[event, :count] = True
-    return neg_idx, neg_valid, contrib
-
-
-def sampled_softmax_ce_loss(
-    scores: torch.Tensor,
-    pos_mask: torch.Tensor,
-    valid_mask: torch.Tensor,
-    *,
-    num_samples: int,
-    temperature: float,
-    label_smoothing: float,
-    neg_idx: torch.Tensor | None = None,
-    neg_valid: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """scores: (B, N). pos_mask, valid_mask: (B, N) bool. neg_idx, neg_valid:
-    optional (B, S) injected negatives (tests). Returns scalar loss."""
-    positive = pos_mask & valid_mask
-    negative = ~pos_mask & valid_mask
-    if neg_idx is None:
-        neg_idx, neg_valid, contrib = _sample_negatives(
-            positive, negative, num_samples, scores.device)
-    else:
-        if neg_valid is None:
-            neg_valid = torch.ones_like(neg_idx, dtype=torch.bool)
-        contrib = positive.any(dim=1) & neg_valid.any(dim=1)
-    if not contrib.any():
-        return scores.sum() * 0.0
-
-    slots, slot_valid = _positive_slots(positive)
-    max_positives = slots.shape[1]
-    positive_scores = scores.gather(1, slots)
-    negative_scores = scores.gather(1, neg_idx)
-
-    pool = torch.cat([
-        positive_scores.unsqueeze(2),
-        negative_scores.unsqueeze(1).expand(-1, max_positives, -1),
-    ], dim=2)
-    entry_valid = torch.cat([
-        torch.ones_like(slot_valid).unsqueeze(2),
-        neg_valid.unsqueeze(1).expand(-1, max_positives, -1),
-    ], dim=2)
-
-    scaled = pool / temperature
-    log_normalizer = scaled.masked_fill(~entry_valid, float('-inf')).logsumexp(dim=2)
-    nll = -positive_scores / temperature + log_normalizer
-    if label_smoothing > 0.0:
-        mean_scaled = (scaled * entry_valid).sum(dim=2) / entry_valid.sum(dim=2)
-        per_positive = ((1.0 - label_smoothing) * nll
-                        + label_smoothing * (-mean_scaled + log_normalizer))
-    else:
-        per_positive = nll
-
-    row_valid = slot_valid & contrib.unsqueeze(1)
-    per_event = (per_positive * row_valid).sum(dim=1) / row_valid.sum(dim=1).clamp_min(1)
-    return per_event[contrib].mean()
 
 
 def full_list_softmax_ce_loss(
@@ -317,17 +224,14 @@ class TripletReranker(nn.Module):
                 temperature=self.ranking_temperature,
                 label_smoothing=self.label_smoothing)
         else:
-            ranking_loss = sampled_softmax_ce_loss(
-                scores, pos_mask.bool(), valid_mask.bool(),
-                num_samples=self.ranking_num_samples,
-                temperature=self.ranking_temperature,
-                label_smoothing=self.label_smoothing)
+            ranking_loss = self._softmax_ce_loss(
+                scores, pos_mask.bool(), valid_mask.bool())
         return {
             'total_loss': ranking_loss,
             'ranking_loss': ranking_loss,
             '_scores': scores,
         }
 
-    # InfoNCE top-1 with label smoothing — the couple stage's loop implementation,
-    # kept as the numerical reference the vectorized losses are pinned to.
+    # Sampled InfoNCE top-1 with label smoothing — the couple stage's vectorized
+    # implementation, shared so both stages keep a single loss source.
     _softmax_ce_loss = CoupleReranker._softmax_ce_loss

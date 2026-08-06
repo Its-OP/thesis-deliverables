@@ -19,7 +19,7 @@ class CoupleDumpModel(nn.Module):
         self.k_values_tracks = tuple(k_values_tracks)
 
     def _build_couple_inputs(
-        self, batch: dict[str, torch.Tensor],
+        self, batch: dict[str, torch.Tensor], with_metrics: bool = True,
     ) -> dict[str, torch.Tensor]:
         """batch: features (B,32,K1), points (B,26,K1), lorentz (B,4,K1),
         stage1_scores/stage2_scores/labels (B,K1), original_indices (B,K1)
@@ -78,25 +78,28 @@ class CoupleDumpModel(nn.Module):
                 precomputed_cone=batch.get('precomputed_cone'),
             )
 
-            couple_inputs['n_gt_in_top_k1'] = (
-                batch['labels'] * valid_in_k1.float()
-            ).sum(dim=1)
+            if with_metrics:
+                couple_inputs['n_gt_in_top_k1'] = (
+                    batch['labels'] * valid_in_k1.float()
+                ).sum(dim=1)
 
-            sorted_stage2_indices = torch.argsort(
-                safe_stage2_scores, dim=1, descending=True,
-            )
-            gt_in_k1_mask = (batch['labels'] > 0.5) & valid_in_k1
-            sorted_gt_in_k1 = gt_in_k1_mask.gather(1, sorted_stage2_indices)
-            max_k = sorted_gt_in_k1.shape[1]
-            n_gt_in_top_k_tracks_columns = []
-            for k_tracks in self.k_values_tracks:
-                effective_k = min(k_tracks, max_k)
-                n_gt_in_top_k_tracks_columns.append(
-                    sorted_gt_in_k1[:, :effective_k].sum(dim=1),
+                sorted_stage2_indices = torch.argsort(
+                    safe_stage2_scores, dim=1, descending=True,
                 )
-            couple_inputs['n_gt_in_top_k_tracks'] = torch.stack(
-                n_gt_in_top_k_tracks_columns, dim=1,
-            )
+                gt_in_k1_mask = (batch['labels'] > 0.5) & valid_in_k1
+                sorted_gt_in_k1 = gt_in_k1_mask.gather(
+                    1, sorted_stage2_indices,
+                )
+                max_k = sorted_gt_in_k1.shape[1]
+                n_gt_in_top_k_tracks_columns = []
+                for k_tracks in self.k_values_tracks:
+                    effective_k = min(k_tracks, max_k)
+                    n_gt_in_top_k_tracks_columns.append(
+                        sorted_gt_in_k1[:, :effective_k].sum(dim=1),
+                    )
+                couple_inputs['n_gt_in_top_k_tracks'] = torch.stack(
+                    n_gt_in_top_k_tracks_columns, dim=1,
+                )
         return couple_inputs
 
     @torch.no_grad()
@@ -120,7 +123,9 @@ class CoupleDumpModel(nn.Module):
         cache: torch.Tensor | None = None
         for batch in loader:
             batch = {key: value.to(device) for key, value in batch.items()}
-            couple_inputs = self._build_couple_inputs(batch)
+            couple_inputs = self._build_couple_inputs(
+                batch, with_metrics=False,
+            )
             # h6 block tail layout: [.., cone(4), sv(3), has_sv] — the cone
             # block is channels -8:-4 of the couple vector.
             cone_block = couple_inputs['couple_features'][:, -8:-4, :]
@@ -142,9 +147,11 @@ class CoupleDumpModel(nn.Module):
         return scores, couple_inputs['filter_a_mask']
 
     def compute_loss(
-        self, batch: dict[str, torch.Tensor],
+        self, batch: dict[str, torch.Tensor], with_metrics: bool = True,
     ) -> dict[str, torch.Tensor]:
-        couple_inputs = self._build_couple_inputs(batch)
+        couple_inputs = self._build_couple_inputs(
+            batch, with_metrics=with_metrics,
+        )
         couple_features = couple_inputs['couple_features']
         couple_labels = couple_inputs['couple_labels']
         filter_a_mask = couple_inputs['filter_a_mask']
@@ -156,6 +163,9 @@ class CoupleDumpModel(nn.Module):
         )
         loss_dict['_couple_labels'] = couple_labels
         loss_dict['_couple_mask'] = filter_a_mask
-        loss_dict['_n_gt_in_top_k1'] = couple_inputs['n_gt_in_top_k1']
-        loss_dict['_n_gt_in_top_k_tracks'] = couple_inputs['n_gt_in_top_k_tracks']
+        if with_metrics:
+            loss_dict['_n_gt_in_top_k1'] = couple_inputs['n_gt_in_top_k1']
+            loss_dict['_n_gt_in_top_k_tracks'] = (
+                couple_inputs['n_gt_in_top_k_tracks']
+            )
         return loss_dict
