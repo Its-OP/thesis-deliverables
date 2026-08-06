@@ -43,11 +43,18 @@ class CoupleDumpDataset(torch.utils.data.Dataset):
             name: [] for name in _DUMP_COLUMNS
         }
         for path in parquet_paths:
-            table = pq.read_table(path, columns=list(_DUMP_COLUMNS))
-            for name in _DUMP_COLUMNS:
-                column_chunks[name].append(
-                    table.column(name).to_numpy(zero_copy_only=False),
-                )
+            # Stream record batches instead of read_table: a whole-file read
+            # of a large dump overflows the int32 list offsets ("List index
+            # overflow") once a column's cumulative element count passes
+            # 2^31, and streaming also bounds peak memory.
+            parquet_file = pq.ParquetFile(path)
+            for record_batch in parquet_file.iter_batches(
+                    batch_size=8192, columns=list(_DUMP_COLUMNS)):
+                for name in _DUMP_COLUMNS:
+                    column_chunks[name].append(
+                        record_batch.column(name).to_numpy(
+                            zero_copy_only=False),
+                    )
         self._columns = {
             name: np.concatenate(chunks)
             for name, chunks in column_chunks.items()

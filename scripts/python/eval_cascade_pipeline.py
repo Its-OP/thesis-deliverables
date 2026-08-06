@@ -326,7 +326,10 @@ def _write_parquet(rows: list[dict], output_path: str,
         arrays.append(pa.array(
             [row[field.name] for row in rows], type=field.type))
     table = pa.Table.from_arrays(arrays, schema=schema)
-    pq.write_table(table, output_path, compression='zstd')
+    # Bounded row groups keep every list column's per-group element count
+    # far below the int32 offset limit that breaks whole-group reads.
+    pq.write_table(table, output_path, compression='zstd',
+                   row_group_size=20000)
 
 
 def _composite_key(observers: dict, b: int) -> dict:
