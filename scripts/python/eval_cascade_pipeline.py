@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
@@ -54,20 +55,24 @@ OUTPUT_SCHEMA = pa.schema([
 # the 2-D tensors); padded pool slots carry -inf in k1_stage2_scores. The
 # cone_* lists hold the FULL event's valid tracks (companion-cone
 # candidates), variable length.
+# Tensor blocks are stored as float16 (halves the on-disk footprint; the
+# reader upcasts to float32). The two score columns stay float32 — the
+# top-K2 selection reproduces the cascade's ordering only if scores keep
+# full precision.
 STAGE3_DUMP_SCHEMA = pa.schema(
     list(OUTPUT_SCHEMA)
     + [
-        pa.field('k1_features', pa.list_(pa.float32())),
-        pa.field('k1_points', pa.list_(pa.float32())),
-        pa.field('k1_lorentz', pa.list_(pa.float32())),
+        pa.field('k1_features', pa.list_(pa.float16())),
+        pa.field('k1_points', pa.list_(pa.float16())),
+        pa.field('k1_lorentz', pa.list_(pa.float16())),
         pa.field('k1_stage1_scores', pa.list_(pa.float32())),
         pa.field('k1_stage2_scores', pa.list_(pa.float32())),
         pa.field('k1_labels', pa.list_(pa.int32())),
         pa.field('k1_original_indices', pa.list_(pa.int32())),
-        pa.field('cone_eta', pa.list_(pa.float32())),
-        pa.field('cone_phi', pa.list_(pa.float32())),
-        pa.field('cone_dz', pa.list_(pa.float32())),
-        pa.field('cone_pt', pa.list_(pa.float32())),
+        pa.field('cone_eta', pa.list_(pa.float16())),
+        pa.field('cone_phi', pa.list_(pa.float16())),
+        pa.field('cone_dz', pa.list_(pa.float16())),
+        pa.field('cone_pt', pa.list_(pa.float16())),
     ]
 )
 
@@ -238,20 +243,34 @@ def _evaluate_batch(
             )
             full_valid = mask.squeeze(1) > 0.5
             full_pt = torch.hypot(lorentz[:, 0, :], lorentz[:, 1, :])
+            # numpy per row (fp16 for tensor blocks): 16x lighter in RAM
+            # than python-float lists and directly convertible to the
+            # halffloat parquet columns.
             for b, row in enumerate(rows):
                 valid_b = full_valid[b]
                 row['k1_features'] = (
-                    f_features[b].reshape(-1).tolist())
-                row['k1_points'] = f_points[b].reshape(-1).tolist()
-                row['k1_lorentz'] = f_lorentz[b].reshape(-1).tolist()
-                row['k1_stage1_scores'] = f_s1[b].tolist()
-                row['k1_stage2_scores'] = s2_scores[b].tolist()
-                row['k1_labels'] = k1_labels[b].int().tolist()
-                row['k1_original_indices'] = selected_k1[b].int().tolist()
-                row['cone_eta'] = points[b, 0, valid_b].tolist()
-                row['cone_phi'] = points[b, 1, valid_b].tolist()
-                row['cone_dz'] = points[b, 2, valid_b].tolist()
-                row['cone_pt'] = full_pt[b, valid_b].tolist()
+                    f_features[b].reshape(-1).cpu().numpy()
+                    .astype(np.float16))
+                row['k1_points'] = (
+                    f_points[b].reshape(-1).cpu().numpy().astype(np.float16))
+                row['k1_lorentz'] = (
+                    f_lorentz[b].reshape(-1).cpu().numpy().astype(np.float16))
+                row['k1_stage1_scores'] = (
+                    f_s1[b].cpu().numpy().astype(np.float32))
+                row['k1_stage2_scores'] = (
+                    s2_scores[b].cpu().numpy().astype(np.float32))
+                row['k1_labels'] = (
+                    k1_labels[b].cpu().numpy().astype(np.int32))
+                row['k1_original_indices'] = (
+                    selected_k1[b].cpu().numpy().astype(np.int32))
+                row['cone_eta'] = (
+                    points[b, 0, valid_b].cpu().numpy().astype(np.float16))
+                row['cone_phi'] = (
+                    points[b, 1, valid_b].cpu().numpy().astype(np.float16))
+                row['cone_dz'] = (
+                    points[b, 2, valid_b].cpu().numpy().astype(np.float16))
+                row['cone_pt'] = (
+                    full_pt[b, valid_b].cpu().numpy().astype(np.float16))
         return rows
 
     top_k2_in_k1 = s2_scores.topk(top_k2, dim=1).indices
@@ -302,12 +321,12 @@ def _evaluate_batch(
 def _write_parquet(rows: list[dict], output_path: str,
                    schema: pa.Schema = OUTPUT_SCHEMA) -> None:
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-    columns = {field.name: [] for field in schema}
-    for row in rows:
-        for field in schema:
-            columns[field.name].append(row[field.name])
-    table = pa.table(columns, schema=schema)
-    pq.write_table(table, output_path)
+    arrays = []
+    for field in schema:
+        arrays.append(pa.array(
+            [row[field.name] for row in rows], type=field.type))
+    table = pa.Table.from_arrays(arrays, schema=schema)
+    pq.write_table(table, output_path, compression='zstd')
 
 
 def _composite_key(observers: dict, b: int) -> dict:
