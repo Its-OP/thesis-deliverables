@@ -17,8 +17,8 @@ from torch.utils.data import DataLoader
 
 from networks.lowpt_tau_CascadeReranker import infer_stage1_kwargs
 from utils.couple_features import (
-    COUPLE_FEATURE_DIM,
-    PAIR_PHYSICS_V3_EXTRA_DIM,
+    COUPLE_REST_DIM,
+    TRACK_EMBED_DIM,
     build_couple_features_batched,
 )
 from utils.dataset_helpers import (
@@ -105,7 +105,19 @@ def _load_stage3(path: str, device: str) -> tuple[CoupleReranker, int]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     args = checkpoint.get('args', {}) or {}
     state_dict = checkpoint['couple_reranker_state_dict']
-    rest_dim = COUPLE_FEATURE_DIM + PAIR_PHYSICS_V3_EXTRA_DIM - 32
+    # Feature-layout versioning: checkpoints written after the H6 widening
+    # carry their dims; older ones fall back to the live module constants.
+    feature_layout = checkpoint.get('feature_layout', {}) or {}
+    track_embed_dim = int(feature_layout.get('track_embed_dim',
+                                             TRACK_EMBED_DIM))
+    rest_dim = int(feature_layout.get('rest_dim', COUPLE_REST_DIM))
+    projector_in = state_dict['couple_projector.0.weight'].shape[1]
+    if projector_in != track_embed_dim:
+        raise ValueError(
+            f'Stage-3 checkpoint projector expects {projector_in}-wide '
+            f'track blocks but the resolved layout says {track_embed_dim} — '
+            'checkpoint and feature layout are from different generations.'
+        )
     model = CoupleReranker(
         hidden_dim=args.get('couple_hidden_dim', 256),
         num_residual_blocks=args.get('couple_num_residual_blocks', 4),
@@ -115,6 +127,7 @@ def _load_stage3(path: str, device: str) -> tuple[CoupleReranker, int]:
         label_smoothing=args.get('couple_label_smoothing', 0.10),
         couple_projector_dim=args.get('couple_projector_dim', 32),
         rest_dim=rest_dim,
+        track_embed_dim=track_embed_dim,
     )
     model.load_state_dict(state_dict)
     return model.to(device).eval(), int(args.get('top_k2', 50))
@@ -207,6 +220,10 @@ def _evaluate_batch(
         top_k2_lorentz=k2_lorentz,
         top_k2_stage1_scores=k2_s1,
         top_k2_stage2_scores=k2_s2,
+        full_points=points,
+        full_lorentz=lorentz,
+        full_valid_mask=mask.squeeze(1) > 0.5,
+        member_full_indices=k2_orig,
         track_valid_mask=k2_valid,
     )
     s3_scores = stage3(couple_inputs['couple_features'])

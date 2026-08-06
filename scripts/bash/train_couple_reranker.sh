@@ -21,7 +21,7 @@ CONDA_ENV_NAME="part"
 
 DATA_CONFIG="data/low-pt/lowpt_tau_trackfinder.yaml"
 DATA_DIR="data/low-pt/train/"
-VAL_DATA_DIR="data/low-pt/val/"
+VAL_DATA_DIR="data/low-pt/eval/"
 NETWORK="networks/lowpt_tau_CoupleReranker.py"
 STAGE1_CHECKPOINT="models/prefilter_best.pt"
 STAGE2_CHECKPOINT="models/stage2_best.pt"

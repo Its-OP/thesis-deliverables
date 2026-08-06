@@ -14,7 +14,7 @@ from weaver.utils.dataset import SimpleIterDataset
 
 logger = logging.getLogger('compute_eval_metrics')
 
-K_TRACKS: tuple[int, ...] = (50, 60, 75, 100, 200, 256, 400, 600)
+K_TRACKS: tuple[int, ...] = (50, 60, 70, 75, 80, 100, 125, 150, 200, 256, 400, 600)
 K_COUPLES: tuple[int, ...] = (30, 40, 50, 60, 75, 100, 125, 150, 200)
 
 

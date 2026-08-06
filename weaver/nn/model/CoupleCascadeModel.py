@@ -80,6 +80,11 @@ class CoupleCascadeModel(nn.Module):
             'stage2_scores': top_k2_stage2_scores,
             'track_labels': filtered['track_labels'].squeeze(1).gather(1, top_k2_in_k1),
             'track_valid_mask': track_valid_mask,
+            # Original full-event track index of each pool member — the
+            # couple builder needs it to exclude the members from their own
+            # companion cone.
+            'member_full_indices': filtered['selected_indices'].gather(
+                1, top_k2_in_k1),
             'n_gt_in_top_k1': n_gt_in_top_k1,
             'n_gt_in_top_k_tracks': n_gt_in_top_k_tracks,
         }
@@ -104,6 +109,10 @@ class CoupleCascadeModel(nn.Module):
             top_k2_lorentz=top_k2_data['lorentz_vectors'],
             top_k2_stage1_scores=top_k2_data['stage1_scores'],
             top_k2_stage2_scores=top_k2_data['stage2_scores'],
+            full_points=points,
+            full_lorentz=lorentz_vectors,
+            full_valid_mask=mask.squeeze(1) > 0.5,
+            member_full_indices=top_k2_data['member_full_indices'],
             top_k2_track_labels=top_k2_data['track_labels'],
             track_valid_mask=top_k2_data['track_valid_mask'],
         )

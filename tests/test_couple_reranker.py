@@ -7,9 +7,10 @@ import torch.nn as nn
 from weaver.nn.model.CoupleReranker import CoupleReranker, ResidualBlock
 
 
-# Raw couple feature dim from the cleaned couple_features.py: 32 (track concat)
-# + 19 (physics+geom+cascade) + 5 (pair_physics_v3 always on) = 56.
-RAW_FEATURE_DIM = 56
+# Raw couple feature dim from the cleaned couple_features.py: 64 (track concat)
+# + 19 (physics+geom+cascade) + 5 (pair_physics_v3 always on) + 11 (h6 couple
+# block) = 99.
+RAW_FEATURE_DIM = 99
 
 
 class TestCoupleRerankerConstruction:
@@ -22,9 +23,9 @@ class TestCoupleRerankerConstruction:
         assert len(model.residual_blocks) == 4
 
     def test_default_input_dim_is_4p_plus_rest(self):
-        # projected_infersent: input_dim = 4*p + rest_dim = 4*32 + 24 = 152.
+        # projected_infersent: input_dim = 4*p + rest_dim = 4*32 + 35 = 163.
         model = CoupleReranker()
-        assert model.input_dim == 4 * 32 + 24
+        assert model.input_dim == 4 * 32 + 35
 
     def test_param_count_in_expected_range(self):
         model = CoupleReranker()
@@ -42,11 +43,21 @@ class TestCoupleRerankerConstruction:
     def test_custom_projector_dim_accepted(self):
         model = CoupleReranker(couple_projector_dim=16)
         assert model.couple_projector_dim == 16
-        assert model.input_dim == 4 * 16 + 24
+        assert model.input_dim == 4 * 16 + 35
 
     def test_invalid_projector_dim_rejected(self):
         with pytest.raises(ValueError):
             CoupleReranker(couple_projector_dim=0)
+
+
+class TestConstantsConsistency:
+    def test_track_embed_and_rest_dims_match_couple_features_module(self):
+        # The weaver package cannot import utils directly, so the dimension
+        # constants are duplicated in CoupleReranker and pinned here.
+        from utils.couple_features import COUPLE_REST_DIM, TRACK_EMBED_DIM
+        from weaver.nn.model.CoupleReranker import _REST_DIM, _TRACK_EMBED_DIM
+        assert _TRACK_EMBED_DIM == TRACK_EMBED_DIM
+        assert _REST_DIM == COUPLE_REST_DIM
 
 
 class TestResidualBlock:
@@ -105,6 +116,12 @@ class TestForward:
         x = torch.randn(4, RAW_FEATURE_DIM, 100)
         scores = model(x)
         assert torch.isfinite(scores).all()
+
+    def test_wrong_feature_width_raises_value_error(self):
+        model = CoupleReranker()
+        x = torch.randn(2, RAW_FEATURE_DIM - 1, 10)
+        with pytest.raises(ValueError, match='couple-feature channels'):
+            model(x)
 
     def test_gradient_flows_to_all_params(self):
         model = CoupleReranker()

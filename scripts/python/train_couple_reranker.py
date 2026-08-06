@@ -8,6 +8,11 @@ import os
 import torch
 from torch.utils.data import DataLoader
 
+from utils.couple_features import (
+    COUPLE_FEATURE_DIM_TOTAL,
+    COUPLE_REST_DIM,
+    TRACK_EMBED_DIM,
+)
 from utils.dataset_helpers import (
     extract_label_from_inputs,
     trim_to_max_valid_tracks,
@@ -207,6 +212,11 @@ def main():
             'val_losses': val_losses,
             'val_metrics': val_metrics,
             'args': vars(args),
+            'feature_layout': {
+                'track_embed_dim': TRACK_EMBED_DIM,
+                'rest_dim': COUPLE_REST_DIM,
+                'couple_feature_dim_total': COUPLE_FEATURE_DIM_TOTAL,
+            },
         }
 
     def log_summary(*, epoch, val_metrics, train_eval_metrics, val_losses,
@@ -270,6 +280,11 @@ def main():
             'val_losses': val_losses,
             'val_metrics': val_metrics,
             'args': vars(args),
+            'feature_layout': {
+                'track_embed_dim': TRACK_EMBED_DIM,
+                'rest_dim': COUPLE_REST_DIM,
+                'couple_feature_dim_total': COUPLE_FEATURE_DIM_TOTAL,
+            },
         }, calibrated_path)
         logger.info(f'Saved calibrated checkpoint: {calibrated_path}')
 

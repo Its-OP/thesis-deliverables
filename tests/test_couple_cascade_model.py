@@ -30,7 +30,7 @@ BATCH_SIZE = 2
 NUM_TRACKS = 80
 NUM_PADDED = 10
 NUM_VALID = NUM_TRACKS - NUM_PADDED  # 70
-INPUT_DIM = 16
+INPUT_DIM = 32
 # top_k1 = NUM_VALID means Stage 1 selects all valid tracks (no filtering),
 # which makes the test deterministic regardless of the random Stage 1 scoring.
 TOP_K1 = NUM_VALID
@@ -49,7 +49,11 @@ def _make_inputs(seed: int = 42):
         torch.rand(BATCH_SIZE, 1, NUM_TRACKS, generator=generator) * 2 * 3.14159
         - 3.14159
     )
-    points = torch.cat([eta, phi], dim=1)
+    # 26 point channels (eta, phi + zeroed transport block) — the couple
+    # feature builder requires the full pf_points layout.
+    points = torch.cat(
+        [eta, phi, torch.zeros(BATCH_SIZE, 24, NUM_TRACKS)], dim=1,
+    )
 
     features = torch.randn(
         BATCH_SIZE, INPUT_DIM, NUM_TRACKS, generator=generator,

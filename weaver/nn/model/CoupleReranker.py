@@ -5,11 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as functional
 
 
-_TRACK_EMBED_DIM = 16
+_TRACK_EMBED_DIM = 32
 # Block 2 (10 pairwise physics) + Block 3 (5 derived geom) + Block 4 (4
-# cascade scores) + pair_physics_v3 (5 extra) = 24. v3 is always on after
-# the Stage 3 cleanup (see utils/couple_features.py).
-_REST_DIM = 24
+# cascade scores) + pair_physics_v3 (5 extra) + h6 couple block (11) = 35.
+# Must equal utils/couple_features.COUPLE_REST_DIM (pinned by a test — the
+# weaver package cannot import utils directly).
+_REST_DIM = 35
 
 
 class NanSafeBatchNorm1d(nn.BatchNorm1d):
@@ -61,6 +62,7 @@ class CoupleReranker(nn.Module):
         label_smoothing: float = 0.0,
         couple_projector_dim: int = 32,
         rest_dim: int = _REST_DIM,
+        track_embed_dim: int = _TRACK_EMBED_DIM,
     ):
         super().__init__()
         if couple_projector_dim <= 0:
@@ -75,11 +77,12 @@ class CoupleReranker(nn.Module):
         self.label_smoothing = label_smoothing
         self.couple_projector_dim = couple_projector_dim
         self.rest_dim = rest_dim
+        self.track_embed_dim = track_embed_dim
 
-        # projected-InferSent block-1 rebuild: φ(t) = LayerNorm(ReLU(Linear(16→p)(t)))
+        # projected-InferSent block-1 rebuild: φ(t) = LayerNorm(ReLU(Linear(d→p)(t)))
         # applied to each track, then assembled as [φ_i, φ_j, |φ_i−φ_j|, φ_i⊙φ_j].
         self.couple_projector = nn.Sequential(
-            nn.Linear(_TRACK_EMBED_DIM, couple_projector_dim),
+            nn.Linear(track_embed_dim, couple_projector_dim),
             nn.ReLU(inplace=True),
             nn.LayerNorm(couple_projector_dim),
         )
@@ -107,7 +110,14 @@ class CoupleReranker(nn.Module):
 
     def _rebuild_block1(self, couple_features: torch.Tensor) -> torch.Tensor:
         """couple_features: (B, F, C). Returns (B, 4*p + rest_dim, C)."""
-        d = _TRACK_EMBED_DIM
+        d = self.track_embed_dim
+        expected = 2 * d + self.rest_dim
+        if couple_features.shape[1] != expected:
+            raise ValueError(
+                f'CoupleReranker expected {expected} couple-feature channels '
+                f'(2 x {d} track + {self.rest_dim} rest), got '
+                f'{couple_features.shape[1]}.'
+            )
         track_i = couple_features[:, :d, :]
         track_j = couple_features[:, d:2 * d, :]
         rest = couple_features[:, 2 * d:, :]

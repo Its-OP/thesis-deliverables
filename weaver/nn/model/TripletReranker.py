@@ -7,8 +7,12 @@ from weaver.nn.model.CoupleReranker import (
     CoupleReranker,
     NanSafeBatchNorm1d,
     ResidualBlock,
-    _TRACK_EMBED_DIM,
 )
+
+# Stage-4 candidate tables carry the frozen legacy 16-wide ti_/tj_/tk_
+# per-track blocks; the couple stage has since widened to 32, so this
+# constant is local and intentionally NOT shared with CoupleReranker.
+_TRACK_EMBED_DIM = 16
 
 _TRACK_PREFIXES = ('ti_', 'tj_', 'tk_')
 

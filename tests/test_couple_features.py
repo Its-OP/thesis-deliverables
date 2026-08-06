@@ -1,10 +1,10 @@
 """Unit tests for `utils/couple_features.py`.
 
-Covers the canonical-ordering enumerator, the Filter A mass cut, the 51-dim
-per-couple feature builder, the GT-couple label computation, and the all-in-one
-``enumerate_and_featurize_filter_a`` entry point used by both the trainer and
-the diagnostic. The tests use small synthetic events with hand-computed
-expected values so any drift in the feature ordering or formulas is caught.
+Covers the canonical-ordering enumerator, the Filter A mass cut, the 99-dim
+batched per-couple feature builder, and the GT-couple label computation used
+by both the trainer and the diagnostic. The tests use small synthetic events
+with hand-computed expected values so any drift in the feature ordering or
+formulas is caught.
 """
 from __future__ import annotations
 
@@ -16,15 +16,18 @@ import torch
 from utils.couple_features import (
     CASCADE_SCORE_DIM,
     COUPLE_FEATURE_DIM,
+    COUPLE_FEATURE_DIM_TOTAL,
+    COUPLE_REST_DIM,
     DERIVED_GEOM_DIM,
+    H6_COUPLE_EXTRA_DIM,
     M_TAU_GEV,
+    PAIR_PHYSICS_V3_EXTRA_DIM,
     PAIRWISE_PHYSICS_DIM,
     RHO_MASS_GEV,
-    build_couple_feature_vector,
+    TRACK_EMBED_DIM,
     build_couple_features_batched,
     compute_couple_labels,
     compute_invariant_mass,
-    enumerate_and_featurize_filter_a,
     enumerate_couples_canonical,
     filter_a_mask,
     recover_raw_charges,
@@ -45,23 +48,25 @@ def _make_synthetic_event(seed: int = 42) -> dict[str, torch.Tensor]:
     """
     generator = torch.Generator().manual_seed(seed)
 
-    # 16 standardized features per track. Channel 5 = standardized charge.
+    # 32 standardized features per track (the full pf_features block).
+    # Channel 5 = standardized charge; channels 16-31 stay zero (channel 30
+    # is has_sv — kept 0 so the SV part of the h6 block is gated off).
     # Standardization: raw {-1, +1} → standardized {-1, 0}.
     # We seed it manually to keep charge ordering predictable.
-    features = torch.randn(16, NUM_TRACKS, generator=generator) * 0.5
+    features = torch.zeros(32, NUM_TRACKS)
+    features[:16] = torch.randn(16, NUM_TRACKS, generator=generator) * 0.5
     # Tracks 0 and 2 are positively charged (raw +1, standardized 0)
     # Tracks 1, 3, 4 are negatively charged (raw -1, standardized -1)
     features[5, [0, 2]] = 0.0
     features[5, [1, 3, 4]] = -1.0
 
-    # Raw points (eta, phi) — small spread, easy to verify Δη / Δφ
-    points = torch.tensor(
-        [
-            [0.10, 0.20, 0.30, 0.40, 0.50],   # eta
-            [0.05, 0.10, 0.15, 0.20, 0.25],   # phi
-        ],
-        dtype=torch.float32,
-    )
+    # Raw points — 26 channels (eta, phi + the transport block). Only
+    # eta / phi carry signal (small spread, easy to verify Δη / Δφ); the
+    # transport channels stay zero, which keeps the h6 couple block finite
+    # without exercising it.
+    points = torch.zeros(26, NUM_TRACKS)
+    points[0] = torch.tensor([0.10, 0.20, 0.30, 0.40, 0.50])   # eta
+    points[1] = torch.tensor([0.05, 0.10, 0.15, 0.20, 0.25])   # phi
 
     # Raw 4-vectors. Pion mass = 0.13957 GeV.
     # Construct so all 2-track masses are well below m_τ.
@@ -92,18 +97,45 @@ def _make_synthetic_event(seed: int = 42) -> dict[str, torch.Tensor]:
     }
 
 
+def _full_event_kwargs(
+    points: torch.Tensor, lorentz: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Simplest valid full-event kwargs: the top-K2 pool IS the full event."""
+    batch_size, _, num_tracks = points.shape
+    return {
+        'full_points': points,
+        'full_lorentz': lorentz,
+        'full_valid_mask': torch.ones(batch_size, num_tracks, dtype=torch.bool),
+        'member_full_indices': torch.arange(num_tracks).unsqueeze(0).expand(
+            batch_size, -1,
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Constants and dimension assertions
 # ---------------------------------------------------------------------------
 
 class TestConstants:
-    def test_feature_dim_is_51(self):
-        assert COUPLE_FEATURE_DIM == 51
+    def test_base_feature_dim_is_83(self):
+        assert COUPLE_FEATURE_DIM == 83
+        assert TRACK_EMBED_DIM == 32
         assert PAIRWISE_PHYSICS_DIM == 10
         assert DERIVED_GEOM_DIM == 5
         assert CASCADE_SCORE_DIM == 4
-        # 16 + 16 + 10 + 5 + 4
-        assert 16 * 2 + PAIRWISE_PHYSICS_DIM + DERIVED_GEOM_DIM + CASCADE_SCORE_DIM == 51
+        # 32 + 32 + 10 + 5 + 4
+        assert (
+            TRACK_EMBED_DIM * 2 + PAIRWISE_PHYSICS_DIM + DERIVED_GEOM_DIM
+            + CASCADE_SCORE_DIM
+        ) == 83
+
+    def test_total_feature_dim_is_99(self):
+        assert PAIR_PHYSICS_V3_EXTRA_DIM == 5
+        assert H6_COUPLE_EXTRA_DIM == 11
+        assert COUPLE_FEATURE_DIM_TOTAL == 99
+        # rest = everything after the two 32-wide per-track blocks
+        assert COUPLE_REST_DIM == 35
+        assert COUPLE_REST_DIM == COUPLE_FEATURE_DIM_TOTAL - 2 * TRACK_EMBED_DIM
 
     def test_m_tau_pdg_value(self):
         # PDG 2024 τ mass
@@ -278,97 +310,67 @@ class TestComputeCoupleLabels:
 
 
 # ---------------------------------------------------------------------------
-# Build couple feature vector
+# Couple feature vector layout (channel positions in the 99-dim concat)
 # ---------------------------------------------------------------------------
 
-class TestBuildCoupleFeatureVector:
-    def test_output_shape_is_51_x_n_pairs(self):
-        event = _make_synthetic_event()
-        upper_i, upper_j = enumerate_couples_canonical(NUM_TRACKS, torch.device('cpu'))
-        couple_features = build_couple_feature_vector(
-            top50_features=event['features'],
-            top50_points=event['points'],
-            top50_lorentz=event['lorentz'],
-            top50_stage1_scores=event['stage1_scores'],
-            top50_stage2_scores=event['stage2_scores'],
-            upper_i=upper_i,
-            upper_j=upper_j,
+class TestCoupleFeatureVectorLayout:
+    def _featurize_single_event(self, event: dict[str, torch.Tensor]) -> torch.Tensor:
+        result = build_couple_features_batched(
+            top_k2_features=event['features'].unsqueeze(0),
+            top_k2_points=event['points'].unsqueeze(0),
+            top_k2_lorentz=event['lorentz'].unsqueeze(0),
+            top_k2_stage1_scores=event['stage1_scores'].unsqueeze(0),
+            top_k2_stage2_scores=event['stage2_scores'].unsqueeze(0),
+            **_full_event_kwargs(
+                event['points'].unsqueeze(0), event['lorentz'].unsqueeze(0),
+            ),
         )
+        return result['couple_features'][0]
+
+    def test_output_shape_is_99_x_n_pairs(self):
+        event = _make_synthetic_event()
+        couple_features = self._featurize_single_event(event)
         n_pairs = NUM_TRACKS * (NUM_TRACKS - 1) // 2
-        assert couple_features.shape == (51, n_pairs)
+        assert couple_features.shape == (99, n_pairs)
 
     def test_block_1_is_per_track_concat(self):
-        """First 32 dims should be ``[features_i (16) ‖ features_j (16)]``."""
+        """First 64 dims should be ``[features_i (32) ‖ features_j (32)]``."""
         event = _make_synthetic_event()
-        upper_i, upper_j = enumerate_couples_canonical(NUM_TRACKS, torch.device('cpu'))
-        couple_features = build_couple_feature_vector(
-            top50_features=event['features'],
-            top50_points=event['points'],
-            top50_lorentz=event['lorentz'],
-            top50_stage1_scores=event['stage1_scores'],
-            top50_stage2_scores=event['stage2_scores'],
-            upper_i=upper_i,
-            upper_j=upper_j,
-        )
+        couple_features = self._featurize_single_event(event)
         # Check first couple — should be (i=0, j=1)
-        first_pair_features = couple_features[:32, 0]
+        first_pair_features = couple_features[:64, 0]
         expected = torch.cat([event['features'][:, 0], event['features'][:, 1]])
         assert torch.allclose(first_pair_features, expected, atol=1e-6)
 
     def test_block_3_invariant_mass_matches_compute_function(self):
         """Block 3 dim 0 = m(ij), should match compute_invariant_mass."""
         event = _make_synthetic_event()
+        couple_features = self._featurize_single_event(event)
         upper_i, upper_j = enumerate_couples_canonical(NUM_TRACKS, torch.device('cpu'))
-        couple_features = build_couple_feature_vector(
-            top50_features=event['features'],
-            top50_points=event['points'],
-            top50_lorentz=event['lorentz'],
-            top50_stage1_scores=event['stage1_scores'],
-            top50_stage2_scores=event['stage2_scores'],
-            upper_i=upper_i,
-            upper_j=upper_j,
-        )
-        # m(ij) is at block 1 (32) + block 2 (10) + position 0 of block 3 = index 42
-        m_from_features = couple_features[42, :]
+        # m(ij) is at block 1 (64) + block 2 (10) + position 0 of block 3 = index 74
+        m_from_features = couple_features[74, :]
         m_from_helper = compute_invariant_mass(event['lorentz'], upper_i, upper_j)
         assert torch.allclose(m_from_features, m_from_helper, atol=1e-6)
 
     def test_block_4_cascade_scores_have_correct_order(self):
         """Block 4 = [s1(i), s2(i), s1(j), s2(j)] in that order."""
         event = _make_synthetic_event()
-        upper_i, upper_j = enumerate_couples_canonical(NUM_TRACKS, torch.device('cpu'))
-        couple_features = build_couple_feature_vector(
-            top50_features=event['features'],
-            top50_points=event['points'],
-            top50_lorentz=event['lorentz'],
-            top50_stage1_scores=event['stage1_scores'],
-            top50_stage2_scores=event['stage2_scores'],
-            upper_i=upper_i,
-            upper_j=upper_j,
-        )
-        # Block 4 starts at 32 + 10 + 5 = 47
+        couple_features = self._featurize_single_event(event)
+        # Block 4 starts at 64 + 10 + 5 = 79
         # First couple: i=0, j=1
         # Expected: s1(0)=5, s2(0)=6, s1(1)=4, s2(1)=4.5
         expected = torch.tensor([5.0, 6.0, 4.0, 4.5])
-        assert torch.allclose(couple_features[47:51, 0], expected, atol=1e-6)
+        assert torch.allclose(couple_features[79:83, 0], expected, atol=1e-6)
 
     def test_pairwise_charge_product_at_block_2_position_4(self):
-        """The 5th channel of block 2 (overall index 32 + 4 = 36) is q_i × q_j."""
+        """The 5th channel of block 2 (overall index 64 + 4 = 68) is q_i × q_j."""
         event = _make_synthetic_event()
+        couple_features = self._featurize_single_event(event)
         upper_i, upper_j = enumerate_couples_canonical(NUM_TRACKS, torch.device('cpu'))
-        couple_features = build_couple_feature_vector(
-            top50_features=event['features'],
-            top50_points=event['points'],
-            top50_lorentz=event['lorentz'],
-            top50_stage1_scores=event['stage1_scores'],
-            top50_stage2_scores=event['stage2_scores'],
-            upper_i=upper_i,
-            upper_j=upper_j,
-        )
         # Track 0 is +1 (standardized 0.0), track 1 is -1 (standardized -1.0)
         # First couple (0, 1): q_0 × q_1 = +1 × -1 = -1
         assert torch.allclose(
-            couple_features[36, 0], torch.tensor(-1.0), atol=1e-6,
+            couple_features[68, 0], torch.tensor(-1.0), atol=1e-6,
         )
         # Couple (0, 2): both +1 → product = +1
         # Index of (0, 2) in upper-tri enumeration: depends on order
@@ -376,85 +378,8 @@ class TestBuildCoupleFeatureVector:
         idx_0_2 = 1
         assert (upper_i[idx_0_2].item(), upper_j[idx_0_2].item()) == (0, 2)
         assert torch.allclose(
-            couple_features[36, idx_0_2], torch.tensor(1.0), atol=1e-6,
+            couple_features[68, idx_0_2], torch.tensor(1.0), atol=1e-6,
         )
-
-
-# ---------------------------------------------------------------------------
-# enumerate_and_featurize_filter_a (the all-in-one entry point)
-# ---------------------------------------------------------------------------
-
-class TestEnumerateAndFeaturizeFilterA:
-    def test_returns_expected_keys(self):
-        event = _make_synthetic_event()
-        result = enumerate_and_featurize_filter_a(
-            top50_features=event['features'],
-            top50_points=event['points'],
-            top50_lorentz=event['lorentz'],
-            top50_stage1_scores=event['stage1_scores'],
-            top50_stage2_scores=event['stage2_scores'],
-            top50_track_labels=event['track_labels'],
-        )
-        assert 'upper_i' in result
-        assert 'upper_j' in result
-        assert 'couple_features' in result
-        assert 'couple_labels' in result
-
-    def test_couple_features_dimension_matches_n_kept(self):
-        event = _make_synthetic_event()
-        result = enumerate_and_featurize_filter_a(
-            top50_features=event['features'],
-            top50_points=event['points'],
-            top50_lorentz=event['lorentz'],
-            top50_stage1_scores=event['stage1_scores'],
-            top50_stage2_scores=event['stage2_scores'],
-            top50_track_labels=event['track_labels'],
-        )
-        n_kept = result['upper_i'].shape[0]
-        assert result['couple_features'].shape == (51, n_kept)
-        assert result['couple_labels'].shape == (n_kept,)
-
-    def test_no_track_labels_omits_couple_labels_key(self):
-        event = _make_synthetic_event()
-        result = enumerate_and_featurize_filter_a(
-            top50_features=event['features'],
-            top50_points=event['points'],
-            top50_lorentz=event['lorentz'],
-            top50_stage1_scores=event['stage1_scores'],
-            top50_stage2_scores=event['stage2_scores'],
-            top50_track_labels=None,
-        )
-        assert 'couple_labels' not in result
-
-    def test_filter_a_keeps_only_low_mass_pairs(self):
-        """All synthetic-event pairs are constructed with low mass — Filter A
-        should keep all C(5, 2) = 10 of them."""
-        event = _make_synthetic_event()
-        result = enumerate_and_featurize_filter_a(
-            top50_features=event['features'],
-            top50_points=event['points'],
-            top50_lorentz=event['lorentz'],
-            top50_stage1_scores=event['stage1_scores'],
-            top50_stage2_scores=event['stage2_scores'],
-            top50_track_labels=event['track_labels'],
-        )
-        n_pairs = NUM_TRACKS * (NUM_TRACKS - 1) // 2
-        assert result['upper_i'].shape[0] == n_pairs
-
-    def test_gt_couple_label_correct_for_known_event(self):
-        """In the synthetic event tracks 0 and 2 are GT — exactly one GT couple
-        should exist (the (0, 2) pair)."""
-        event = _make_synthetic_event()
-        result = enumerate_and_featurize_filter_a(
-            top50_features=event['features'],
-            top50_points=event['points'],
-            top50_lorentz=event['lorentz'],
-            top50_stage1_scores=event['stage1_scores'],
-            top50_stage2_scores=event['stage2_scores'],
-            top50_track_labels=event['track_labels'],
-        )
-        n_gt_couples = result['couple_labels'].sum().item()
-        assert n_gt_couples == 1
 
 
 # ---------------------------------------------------------------------------
@@ -481,11 +406,12 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
             top_k2_track_labels=batch['track_labels'],
         )
         n_couples = NUM_TRACKS * (NUM_TRACKS - 1) // 2
-        # 51 base + 5 (pair_physics_v3 always on) = 56.
-        assert result['couple_features'].shape == (3, 56, n_couples)
+        # 83 base + 5 (pair_physics_v3 always on) + 11 (h6 couple block) = 99.
+        assert result['couple_features'].shape == (3, 99, n_couples)
         assert result['filter_a_mask'].shape == (3, n_couples)
         assert result['couple_labels'].shape == (3, n_couples)
         assert result['filter_a_mask'].dtype == torch.bool
@@ -499,37 +425,10 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
             top_k2_track_labels=None,
         )
         assert 'couple_labels' not in result
-
-    def test_batched_first_51_channels_match_per_event(self):
-        """Per-event helper emits 51 base dims; batched also emits the v3
-        extension. First 51 channels must match across paths."""
-        batch = self._make_batch(batch_size=2)
-        batched = build_couple_features_batched(
-            top_k2_features=batch['features'],
-            top_k2_points=batch['points'],
-            top_k2_lorentz=batch['lorentz'],
-            top_k2_stage1_scores=batch['stage1_scores'],
-            top_k2_stage2_scores=batch['stage2_scores'],
-            top_k2_track_labels=batch['track_labels'],
-        )
-        upper_i, upper_j = enumerate_couples_canonical(NUM_TRACKS, torch.device('cpu'))
-        per_event_features_0 = build_couple_feature_vector(
-            top50_features=batch['features'][0],
-            top50_points=batch['points'][0],
-            top50_lorentz=batch['lorentz'][0],
-            top50_stage1_scores=batch['stage1_scores'][0],
-            top50_stage2_scores=batch['stage2_scores'][0],
-            upper_i=upper_i,
-            upper_j=upper_j,
-        )
-        assert torch.allclose(
-            batched['couple_features'][0, :51, :],
-            per_event_features_0,
-            atol=1e-6,
-        )
 
     def test_batched_filter_a_matches_per_event(self):
         batch = self._make_batch(batch_size=2)
@@ -539,6 +438,7 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
             top_k2_track_labels=batch['track_labels'],
         )
         upper_i, upper_j = enumerate_couples_canonical(NUM_TRACKS, torch.device('cpu'))
@@ -553,6 +453,7 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
             top_k2_track_labels=batch['track_labels'],
         )
         upper_i, upper_j = enumerate_couples_canonical(NUM_TRACKS, torch.device('cpu'))
@@ -570,6 +471,7 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
             top_k2_track_labels=None,
         )
         expected_n = NUM_TRACKS * (NUM_TRACKS - 1) // 2
@@ -592,6 +494,7 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
             top_k2_track_labels=batch['track_labels'],
             track_valid_mask=track_valid_mask,
         )
@@ -608,6 +511,7 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
             top_k2_track_labels=batch['track_labels'],
         )
         assert torch.equal(result['filter_a_mask'][1], result_no_mask['filter_a_mask'][1])
@@ -632,6 +536,7 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
             top_k2_track_labels=batch['track_labels'],
             track_valid_mask=track_valid_mask,
         )
@@ -649,6 +554,7 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
             top_k2_track_labels=batch['track_labels'],
             track_valid_mask=None,
         )
@@ -658,6 +564,7 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
             top_k2_track_labels=batch['track_labels'],
         )
         assert torch.equal(result_with['couple_features'], result_without['couple_features'])
@@ -673,6 +580,7 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
             track_valid_mask=all_valid,
         )
         result_no_mask = build_couple_features_batched(
@@ -681,6 +589,7 @@ class TestBuildCoupleFeaturesBatched:
             top_k2_lorentz=batch['lorentz'],
             top_k2_stage1_scores=batch['stage1_scores'],
             top_k2_stage2_scores=batch['stage2_scores'],
+            **_full_event_kwargs(batch['points'], batch['lorentz']),
         )
         assert torch.allclose(
             result_mask['couple_features'], result_no_mask['couple_features'], atol=1e-6,

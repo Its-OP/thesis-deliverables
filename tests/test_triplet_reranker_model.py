@@ -100,7 +100,9 @@ def test_loss_no_positives_returns_zero():
 
 
 def test_track_projector_warm_start_from_couple_checkpoint():
-    couple = CoupleReranker(couple_projector_dim=32)
+    # Warm-start reads the legacy 16-wide couple checkpoint format, so the
+    # couple projector is built at track_embed_dim=16 (not today's 32).
+    couple = CoupleReranker(couple_projector_dim=32, track_embed_dim=16)
     triplet = TripletReranker(input_mode='hierarchical', projector_dim=32,
                               feature_names=FEATURE_NAMES)
     triplet.track_projector.load_state_dict(couple.couple_projector.state_dict())

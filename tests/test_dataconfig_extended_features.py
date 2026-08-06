@@ -45,10 +45,20 @@ POINTS_TRANSPORT_NAMES = [
     'track_vertex_x', 'track_vertex_y', 'track_vertex_z',
     'track_nearest_other_pv_index',
     'track_lifetime_disp_x', 'track_lifetime_disp_y',
+    'track_primary_vertex_x', 'track_primary_vertex_y',
+    'track_sv0_x', 'track_sv0_y', 'track_sv0_z',
+    'track_sv0_dlen_sig', 'track_sv0_mass',
+    'track_sv1_x', 'track_sv1_y', 'track_sv1_z',
+    'track_sv1_dlen_sig', 'track_sv1_mass',
+    'track_sv2_x', 'track_sv2_y', 'track_sv2_z',
+    'track_sv2_dlen_sig', 'track_sv2_mass',
 ]
 TRANSPORT_NEW_VARIABLES = [
     'track_nearest_other_pv_index', 'track_pca_parameter',
     'track_lifetime_disp_x', 'track_lifetime_disp_y',
+    'track_primary_vertex_x', 'track_primary_vertex_y',
+    'track_sv0_x', 'track_sv1_x', 'track_sv2_x',
+    'track_sv0_mass', 'track_sv1_mass', 'track_sv2_mass',
 ]
 
 eval_shard_required = pytest.mark.skipif(
@@ -95,7 +105,7 @@ class TestPointsStructure:
             config = yaml.safe_load(handle)
         return config['inputs']['pf_points']['vars']
 
-    def test_nine_null_standardized_transport_channels(self):
+    def test_transport_channels_names_and_null_standardization(self):
         entries = self.points_entries()
         assert [entry_name(entry) for entry in entries] == (
             POINTS_TRANSPORT_NAMES)

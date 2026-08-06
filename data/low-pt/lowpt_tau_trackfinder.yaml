@@ -80,6 +80,28 @@ new_variables:
    track_lifetime_disp_x: track_vertex_x - event_primary_vertex_x + track_pca_parameter * np.cos(track_phi)
    track_lifetime_disp_y: track_vertex_y - event_primary_vertex_y + track_pca_parameter * np.sin(track_phi)
    ###
+   ### H6 Stage-3 couple transport — PV transverse position (couple-vertex
+   ### displacement/pointing) and the top-3 secondary vertices broadcast per
+   ### track (nearest-SV attach from the couple POCA midpoint). Empty SV
+   ### slots carry coordinate sentinel 1e4 (argmin-safe) and 0 dlen_sig/mass.
+   track_primary_vertex_x: event_primary_vertex_x * ak.ones_like(track_eta)
+   track_primary_vertex_y: event_primary_vertex_y * ak.ones_like(track_eta)
+   track_sv0_x: ak.fill_none(ak.pad_none(sv_x, 3, clip=True), 10000.0)[:, 0] * ak.ones_like(track_eta)
+   track_sv0_y: ak.fill_none(ak.pad_none(sv_y, 3, clip=True), 10000.0)[:, 0] * ak.ones_like(track_eta)
+   track_sv0_z: ak.fill_none(ak.pad_none(sv_z, 3, clip=True), 10000.0)[:, 0] * ak.ones_like(track_eta)
+   track_sv0_dlen_sig: ak.fill_none(ak.pad_none(sv_dlen_sig, 3, clip=True), 0.0)[:, 0] * ak.ones_like(track_eta)
+   track_sv0_mass: ak.fill_none(ak.pad_none(sv_mass, 3, clip=True), 0.0)[:, 0] * ak.ones_like(track_eta)
+   track_sv1_x: ak.fill_none(ak.pad_none(sv_x, 3, clip=True), 10000.0)[:, 1] * ak.ones_like(track_eta)
+   track_sv1_y: ak.fill_none(ak.pad_none(sv_y, 3, clip=True), 10000.0)[:, 1] * ak.ones_like(track_eta)
+   track_sv1_z: ak.fill_none(ak.pad_none(sv_z, 3, clip=True), 10000.0)[:, 1] * ak.ones_like(track_eta)
+   track_sv1_dlen_sig: ak.fill_none(ak.pad_none(sv_dlen_sig, 3, clip=True), 0.0)[:, 1] * ak.ones_like(track_eta)
+   track_sv1_mass: ak.fill_none(ak.pad_none(sv_mass, 3, clip=True), 0.0)[:, 1] * ak.ones_like(track_eta)
+   track_sv2_x: ak.fill_none(ak.pad_none(sv_x, 3, clip=True), 10000.0)[:, 2] * ak.ones_like(track_eta)
+   track_sv2_y: ak.fill_none(ak.pad_none(sv_y, 3, clip=True), 10000.0)[:, 2] * ak.ones_like(track_eta)
+   track_sv2_z: ak.fill_none(ak.pad_none(sv_z, 3, clip=True), 10000.0)[:, 2] * ak.ones_like(track_eta)
+   track_sv2_dlen_sig: ak.fill_none(ak.pad_none(sv_dlen_sig, 3, clip=True), 0.0)[:, 2] * ak.ones_like(track_eta)
+   track_sv2_mass: ak.fill_none(ak.pad_none(sv_mass, 3, clip=True), 0.0)[:, 2] * ak.ones_like(track_eta)
+   ###
    ### Dummy label for weaver compatibility (actual loss uses per-track labels)
    dummy_label: np.ones_like(event_n_tracks, dtype='float32')
 
@@ -104,6 +126,24 @@ inputs:
          - [track_nearest_other_pv_index, null]
          - [track_lifetime_disp_x, null]
          - [track_lifetime_disp_y, null]
+         ### H6 Stage-3 couple transport (raw) — PV xy + top-3 SV slots.
+         - [track_primary_vertex_x, null]
+         - [track_primary_vertex_y, null]
+         - [track_sv0_x, null]
+         - [track_sv0_y, null]
+         - [track_sv0_z, null]
+         - [track_sv0_dlen_sig, null]
+         - [track_sv0_mass, null]
+         - [track_sv1_x, null]
+         - [track_sv1_y, null]
+         - [track_sv1_z, null]
+         - [track_sv1_dlen_sig, null]
+         - [track_sv1_mass, null]
+         - [track_sv2_x, null]
+         - [track_sv2_y, null]
+         - [track_sv2_z, null]
+         - [track_sv2_dlen_sig, null]
+         - [track_sv2_mass, null]
    pf_features:
       length: 2100
       pad_mode: constant

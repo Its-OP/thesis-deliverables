@@ -1,7 +1,7 @@
 import torch
 
 from networks.lowpt_tau_CascadeReranker import infer_stage1_kwargs
-from utils.couple_features import COUPLE_FEATURE_DIM, PAIR_PHYSICS_V3_EXTRA_DIM
+from utils.couple_features import COUPLE_REST_DIM, TRACK_EMBED_DIM
 from weaver.nn.model.CascadeModel import CascadeModel
 from weaver.nn.model.CascadeReranker import CascadeReranker
 from weaver.nn.model.CoupleCascadeModel import CoupleCascadeModel
@@ -116,7 +116,6 @@ def get_model(data_config, **kwargs):
     cascade_params = sum(p.numel() for p in cascade.parameters())
     _logger.info(f'Frozen cascade: {cascade_params:,} params')
 
-    rest_dim = COUPLE_FEATURE_DIM + PAIR_PHYSICS_V3_EXTRA_DIM - 32  # = 24
     couple_reranker = CoupleReranker(
         hidden_dim=couple_hidden_dim,
         num_residual_blocks=couple_num_residual_blocks,
@@ -125,7 +124,8 @@ def get_model(data_config, **kwargs):
         ranking_temperature=couple_ranking_temperature,
         label_smoothing=couple_label_smoothing,
         couple_projector_dim=couple_projector_dim,
-        rest_dim=rest_dim,
+        rest_dim=COUPLE_REST_DIM,
+        track_embed_dim=TRACK_EMBED_DIM,
     )
     couple_params = sum(p.numel() for p in couple_reranker.parameters())
     _logger.info(
