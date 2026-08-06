@@ -1,0 +1,740 @@
+treename: null
+branch_magic: null
+file_magic: null
+selection: event_n_tracks > 0
+test_time_selection: null
+preprocess:
+  method: auto
+  data_fraction: 0.5
+  params:
+    track_eta_raw:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_phi_raw:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_dz:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_vertex_x:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_vertex_y:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_vertex_z:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_nearest_other_pv_index:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_lifetime_disp_x:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_lifetime_disp_y:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_primary_vertex_x:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_primary_vertex_y:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv0_x:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv0_y:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv0_z:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv0_dlen_sig:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv0_mass:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv1_x:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv1_y:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv1_z:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv1_dlen_sig:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv1_mass:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv2_x:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv2_y:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv2_z:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv2_dlen_sig:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv2_mass:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_px:
+      length: 2100
+      pad_mode: constant
+      center: -0.006469251122325659
+      scale: 1.4233942106180126
+      min: -5
+      max: 5
+      pad_value: 0
+    track_py:
+      length: 2100
+      pad_mode: constant
+      center: 0.0029115439392626286
+      scale: 1.438039106844179
+      min: -5
+      max: 5
+      pad_value: 0
+    track_pz:
+      length: 2100
+      pad_mode: constant
+      center: 0.010558634996414185
+      scale: 0.36399709574107947
+      min: -5
+      max: 5
+      pad_value: 0
+    track_eta:
+      length: 2100
+      pad_mode: constant
+      center: 0.01318359375
+      scale: 0.5305012304105686
+      min: -5
+      max: 5
+      pad_value: 0
+    track_phi:
+      length: 2100
+      pad_mode: constant
+      center: 0.0071353912353515625
+      scale: 0.4630746279993888
+      min: -5
+      max: 5
+      pad_value: 0
+    track_charge:
+      length: 2100
+      pad_mode: constant
+      center: 1.0
+      scale: 0.5
+      min: -5
+      max: 5
+      pad_value: 0
+    track_dxy_significance:
+      length: 2100
+      pad_mode: constant
+      center: 0.0014317058958113194
+      scale: 0.7949812517690341
+      min: -5
+      max: 5
+      pad_value: 0
+    track_log_dz_significance:
+      length: 2100
+      pad_mode: constant
+      center: -0.03824715316295624
+      scale: 0.1644520043601814
+      min: -5
+      max: 5
+      pad_value: 0
+    track_log_norm_chi2:
+      length: 2100
+      pad_mode: constant
+      center: 0.0
+      scale: 1.442695036924675
+      min: -5
+      max: 5
+      pad_value: 0
+    track_log_pt_error:
+      length: 2100
+      pad_mode: constant
+      center: -4.272049427032471
+      scale: 1.1910611574378422
+      min: -5
+      max: 5
+      pad_value: 0
+    track_n_valid_pixel_hits:
+      length: 2100
+      pad_mode: constant
+      center: 4.0
+      scale: 1.0
+      min: -5
+      max: 5
+      pad_value: 0
+    track_dca_significance:
+      length: 2100
+      pad_mode: constant
+      center: 0.7576620578765869
+      scale: 0.5694130596837123
+      min: -5
+      max: 5
+      pad_value: 0
+    track_log_covariance_phi_phi:
+      length: 2100
+      pad_mode: constant
+      center: -11.352328300476074
+      scale: 0.7226724191402992
+      min: -5
+      max: 5
+      pad_value: 0
+    track_log_covariance_lambda_lambda:
+      length: 2100
+      pad_mode: constant
+      center: -13.105502128601074
+      scale: 0.6764465294389352
+      min: -5
+      max: 5
+      pad_value: 0
+    track_log_pt:
+      length: 2100
+      pad_mode: constant
+      center: -0.23505373299121857
+      scale: 1.707486200639462
+      min: -5
+      max: 5
+      pad_value: 0
+    track_log_relative_pt_error:
+      length: 2100
+      pad_mode: constant
+      center: -4.127867221832275
+      scale: 1.6998867634864525
+      min: -5
+      max: 5
+      pad_value: 0
+    track_absolute_dxy:
+      length: 2100
+      pad_mode: constant
+      center: 0.008157378993928432
+      scale: 25.392515083268812
+      min: -5
+      max: 5
+      pad_value: 0
+    track_absolute_dz:
+      length: 2100
+      pad_mode: constant
+      center: 3.1985692977905273
+      scale: 0.23097578055355394
+      min: -5
+      max: 5
+      pad_value: 0
+    track_log_covariance_dxy_dxy:
+      length: 2100
+      pad_mode: constant
+      center: -9.003130912780762
+      scale: 0.5715799537972289
+      min: -5
+      max: 5
+      pad_value: 0
+    track_log_covariance_dsz_dsz:
+      length: 2100
+      pad_mode: constant
+      center: -9.063029289245605
+      scale: 0.665466776670686
+      min: -5
+      max: 5
+      pad_value: 0
+    track_log_absolute_covariance_dxy_dsz:
+      length: 2100
+      pad_mode: constant
+      center: -13.967870712280273
+      scale: 0.45377990521729006
+      min: -5
+      max: 5
+      pad_value: 0
+    track_log_absolute_covariance_phi_dxy:
+      length: 2100
+      pad_mode: constant
+      center: -10.199381828308105
+      scale: 0.6263565595118058
+      min: -5
+      max: 5
+      pad_value: 0
+    track_n_valid_hits:
+      length: 2100
+      pad_mode: constant
+      center: 14.0
+      scale: 0.14285714285714285
+      min: -5
+      max: 5
+      pad_value: 0
+    track_pileup_min_gap:
+      length: 2100
+      pad_mode: constant
+      center: 0.992002010345459
+      scale: 0.38590938466543695
+      min: -5
+      max: 5
+      pad_value: 0
+    track_closer_to_other_pv:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_n_pvs:
+      length: 2100
+      pad_mode: constant
+      center: 38.0
+      scale: 0.125
+      min: -5
+      max: 5
+      pad_value: 0
+    track_muon_min_delta_r:
+      length: 2100
+      pad_mode: constant
+      center: 2.0341639518737793
+      scale: 0.7383173358568789
+      min: -5
+      max: 5
+      pad_value: 0
+    track_muon_min_dz_gap:
+      length: 2100
+      pad_mode: constant
+      center: 1.830822229385376
+      scale: 0.256913608249355
+      min: -5
+      max: 5
+      pad_value: 0
+    track_has_soft_muon:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_sv_min_line_distance:
+      length: 2100
+      pad_mode: constant
+      center: 1.2905181646347046
+      scale: 0.3204175201239131
+      min: -5
+      max: 5
+      pad_value: 0
+    track_has_sv:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_pv_line_distance_3d:
+      length: 2100
+      pad_mode: constant
+      center: 1.3159323930740356
+      scale: 0.3220051745106619
+      min: -5
+      max: 5
+      pad_value: 0
+    track_px_raw:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_py_raw:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_pz_raw:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_energy:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_mask:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+    track_label_from_tau:
+      length: 2100
+      pad_mode: constant
+      center: null
+      scale: 1
+      min: -5
+      max: 5
+      pad_value: 0
+new_variables:
+  track_mask: ak.ones_like(track_eta)
+  track_px: track_pt * np.cos(track_phi)
+  track_py: track_pt * np.sin(track_phi)
+  track_pz: track_pt * np.sinh(track_eta)
+  track_energy: np.sqrt(track_px**2 + track_py**2 + track_pz**2 + 0.13957**2)
+  track_log_dz_significance: np.sign(track_dz_significance) * np.log1p(np.abs(track_dz_significance))
+  track_log_norm_chi2: np.log1p(track_norm_chi2)
+  track_log_pt_error: np.log(np.maximum(track_pt_error, 1e-12))
+  track_log_covariance_phi_phi: np.log(np.maximum(track_covariance_phi_phi, 1e-12))
+  track_log_covariance_lambda_lambda: np.log(np.maximum(track_covariance_lambda_lambda,
+    1e-12))
+  track_log_pt: np.log(track_pt + 1e-6)
+  track_log_relative_pt_error: np.log(np.maximum(track_pt_error / (track_pt + 1e-6),
+    1e-12))
+  track_eta_raw: track_eta
+  track_phi_raw: track_phi
+  track_px_raw: track_px
+  track_py_raw: track_py
+  track_pz_raw: track_pz
+  track_absolute_dxy: np.abs(track_dxy)
+  track_absolute_dz: np.abs(track_dz)
+  track_log_covariance_dxy_dxy: np.log(np.maximum(track_covariance_dxy_dxy, 1e-30))
+  track_log_covariance_dsz_dsz: np.log(np.maximum(track_covariance_dsz_dsz, 1e-30))
+  track_log_absolute_covariance_dxy_dsz: np.log(np.abs(track_covariance_dxy_dsz) +
+    1e-30)
+  track_log_absolute_covariance_phi_dxy: np.log(np.abs(track_covariance_phi_dxy) +
+    1e-30)
+  track_global_z: event_primary_vertex_z + track_dz
+  track_pileup_min_gap: ak.min(np.abs(track_global_z[:, :, np.newaxis] - event_other_pv_z[:,
+    np.newaxis, :]), axis=-1)
+  track_closer_to_other_pv: (track_pileup_min_gap < np.abs(track_dz)) * 1.0
+  track_n_pvs: event_n_pvs * ak.ones_like(track_eta)
+  track_muon_min_delta_r: ak.min(np.sqrt((track_eta[:, :, np.newaxis] - muon_eta[muon_soft_id
+    == 1][:, np.newaxis, :])**2 + (np.mod(track_phi[:, :, np.newaxis] - muon_phi[muon_soft_id
+    == 1][:, np.newaxis, :] + np.pi, 2*np.pi) - np.pi)**2), axis=-1)
+  track_muon_min_dz_gap: ak.min(np.abs(track_dz[:, :, np.newaxis] - muon_dz[muon_soft_id
+    == 1][:, np.newaxis, :]), axis=-1)
+  track_has_soft_muon: (ak.sum(muon_soft_id == 1, axis=1) > 0) * ak.ones_like(track_eta)
+  track_direction_x: np.cos(track_phi) / np.cosh(track_eta)
+  track_direction_y: np.sin(track_phi) / np.cosh(track_eta)
+  track_direction_z: np.tanh(track_eta)
+  track_sv_min_line_distance: ak.min(np.sqrt(((sv_y[:, np.newaxis, :] - track_vertex_y[:,
+    :, np.newaxis]) * track_direction_z[:, :, np.newaxis] - (sv_z[:, np.newaxis, :]
+    - track_vertex_z[:, :, np.newaxis]) * track_direction_y[:, :, np.newaxis])**2
+    + ((sv_z[:, np.newaxis, :] - track_vertex_z[:, :, np.newaxis]) * track_direction_x[:,
+    :, np.newaxis] - (sv_x[:, np.newaxis, :] - track_vertex_x[:, :, np.newaxis]) *
+    track_direction_z[:, :, np.newaxis])**2 + ((sv_x[:, np.newaxis, :] - track_vertex_x[:,
+    :, np.newaxis]) * track_direction_y[:, :, np.newaxis] - (sv_y[:, np.newaxis, :]
+    - track_vertex_y[:, :, np.newaxis]) * track_direction_x[:, :, np.newaxis])**2),
+    axis=-1)
+  track_has_sv: (ak.num(sv_x, axis=1) > 0) * ak.ones_like(track_eta)
+  track_pv_line_distance_3d: np.sqrt(((event_primary_vertex_y - track_vertex_y) *
+    track_direction_z - (event_primary_vertex_z - track_vertex_z) * track_direction_y)**2
+    + ((event_primary_vertex_z - track_vertex_z) * track_direction_x - (event_primary_vertex_x
+    - track_vertex_x) * track_direction_z)**2 + ((event_primary_vertex_x - track_vertex_x)
+    * track_direction_y - (event_primary_vertex_y - track_vertex_y) * track_direction_x)**2)
+  track_nearest_other_pv_index: ak.argmin(np.abs(track_global_z[:, :, np.newaxis]
+    - event_other_pv_z[:, np.newaxis, :]), axis=-1) * 1.0
+  track_pca_parameter: (event_primary_vertex_x - track_vertex_x) * np.cos(track_phi)
+    + (event_primary_vertex_y - track_vertex_y) * np.sin(track_phi)
+  track_lifetime_disp_x: track_vertex_x - event_primary_vertex_x + track_pca_parameter
+    * np.cos(track_phi)
+  track_lifetime_disp_y: track_vertex_y - event_primary_vertex_y + track_pca_parameter
+    * np.sin(track_phi)
+  track_primary_vertex_x: event_primary_vertex_x * ak.ones_like(track_eta)
+  track_primary_vertex_y: event_primary_vertex_y * ak.ones_like(track_eta)
+  track_sv0_x: ak.fill_none(ak.pad_none(sv_x, 3, clip=True), 10000.0)[:, 0] * ak.ones_like(track_eta)
+  track_sv0_y: ak.fill_none(ak.pad_none(sv_y, 3, clip=True), 10000.0)[:, 0] * ak.ones_like(track_eta)
+  track_sv0_z: ak.fill_none(ak.pad_none(sv_z, 3, clip=True), 10000.0)[:, 0] * ak.ones_like(track_eta)
+  track_sv0_dlen_sig: ak.fill_none(ak.pad_none(sv_dlen_sig, 3, clip=True), 0.0)[:,
+    0] * ak.ones_like(track_eta)
+  track_sv0_mass: ak.fill_none(ak.pad_none(sv_mass, 3, clip=True), 0.0)[:, 0] * ak.ones_like(track_eta)
+  track_sv1_x: ak.fill_none(ak.pad_none(sv_x, 3, clip=True), 10000.0)[:, 1] * ak.ones_like(track_eta)
+  track_sv1_y: ak.fill_none(ak.pad_none(sv_y, 3, clip=True), 10000.0)[:, 1] * ak.ones_like(track_eta)
+  track_sv1_z: ak.fill_none(ak.pad_none(sv_z, 3, clip=True), 10000.0)[:, 1] * ak.ones_like(track_eta)
+  track_sv1_dlen_sig: ak.fill_none(ak.pad_none(sv_dlen_sig, 3, clip=True), 0.0)[:,
+    1] * ak.ones_like(track_eta)
+  track_sv1_mass: ak.fill_none(ak.pad_none(sv_mass, 3, clip=True), 0.0)[:, 1] * ak.ones_like(track_eta)
+  track_sv2_x: ak.fill_none(ak.pad_none(sv_x, 3, clip=True), 10000.0)[:, 2] * ak.ones_like(track_eta)
+  track_sv2_y: ak.fill_none(ak.pad_none(sv_y, 3, clip=True), 10000.0)[:, 2] * ak.ones_like(track_eta)
+  track_sv2_z: ak.fill_none(ak.pad_none(sv_z, 3, clip=True), 10000.0)[:, 2] * ak.ones_like(track_eta)
+  track_sv2_dlen_sig: ak.fill_none(ak.pad_none(sv_dlen_sig, 3, clip=True), 0.0)[:,
+    2] * ak.ones_like(track_eta)
+  track_sv2_mass: ak.fill_none(ak.pad_none(sv_mass, 3, clip=True), 0.0)[:, 2] * ak.ones_like(track_eta)
+  dummy_label: np.ones_like(event_n_tracks, dtype='float32')
+inputs:
+  pf_points:
+    length: 2100
+    pad_mode: constant
+    vars:
+    - - track_eta_raw
+      - null
+    - - track_phi_raw
+      - null
+    - - track_dz
+      - null
+    - - track_vertex_x
+      - null
+    - - track_vertex_y
+      - null
+    - - track_vertex_z
+      - null
+    - - track_nearest_other_pv_index
+      - null
+    - - track_lifetime_disp_x
+      - null
+    - - track_lifetime_disp_y
+      - null
+    - - track_primary_vertex_x
+      - null
+    - - track_primary_vertex_y
+      - null
+    - - track_sv0_x
+      - null
+    - - track_sv0_y
+      - null
+    - - track_sv0_z
+      - null
+    - - track_sv0_dlen_sig
+      - null
+    - - track_sv0_mass
+      - null
+    - - track_sv1_x
+      - null
+    - - track_sv1_y
+      - null
+    - - track_sv1_z
+      - null
+    - - track_sv1_dlen_sig
+      - null
+    - - track_sv1_mass
+      - null
+    - - track_sv2_x
+      - null
+    - - track_sv2_y
+      - null
+    - - track_sv2_z
+      - null
+    - - track_sv2_dlen_sig
+      - null
+    - - track_sv2_mass
+      - null
+  pf_features:
+    length: 2100
+    pad_mode: constant
+    vars:
+    - track_px
+    - track_py
+    - track_pz
+    - track_eta
+    - track_phi
+    - track_charge
+    - track_dxy_significance
+    - track_log_dz_significance
+    - track_log_norm_chi2
+    - track_log_pt_error
+    - track_n_valid_pixel_hits
+    - track_dca_significance
+    - track_log_covariance_phi_phi
+    - track_log_covariance_lambda_lambda
+    - track_log_pt
+    - track_log_relative_pt_error
+    - track_absolute_dxy
+    - track_absolute_dz
+    - track_log_covariance_dxy_dxy
+    - track_log_covariance_dsz_dsz
+    - track_log_absolute_covariance_dxy_dsz
+    - track_log_absolute_covariance_phi_dxy
+    - track_n_valid_hits
+    - track_pileup_min_gap
+    - - track_closer_to_other_pv
+      - null
+    - track_n_pvs
+    - track_muon_min_delta_r
+    - track_muon_min_dz_gap
+    - - track_has_soft_muon
+      - null
+    - track_sv_min_line_distance
+    - - track_has_sv
+      - null
+    - track_pv_line_distance_3d
+  pf_vectors:
+    length: 2100
+    pad_mode: constant
+    vars:
+    - - track_px_raw
+      - null
+    - - track_py_raw
+      - null
+    - - track_pz_raw
+      - null
+    - - track_energy
+      - null
+  pf_mask:
+    length: 2100
+    pad_mode: constant
+    vars:
+    - - track_mask
+      - null
+  pf_label:
+    length: 2100
+    pad_mode: constant
+    vars:
+    - - track_label_from_tau
+      - null
+labels:
+  type: simple
+  value:
+  - dummy_label
+observers:
+- event_n_tracks
+- event_run
+- event_id
+- event_luminosity_block
+- source_batch_id
+- source_microbatch_id
+monitor_variables: []
+weights: null

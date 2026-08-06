@@ -49,6 +49,28 @@ OUTPUT_SCHEMA = pa.schema([
     pa.field('stage3_couple_scores', pa.list_(pa.float32())),
 ])
 
+# --dump-stage3-inputs: everything the dump-based Stage-3 trainer needs. The
+# k1_* lists are the gathered top-K1 block (fixed length; flat row-major for
+# the 2-D tensors); padded pool slots carry -inf in k1_stage2_scores. The
+# cone_* lists hold the FULL event's valid tracks (companion-cone
+# candidates), variable length.
+STAGE3_DUMP_SCHEMA = pa.schema(
+    list(OUTPUT_SCHEMA)
+    + [
+        pa.field('k1_features', pa.list_(pa.float32())),
+        pa.field('k1_points', pa.list_(pa.float32())),
+        pa.field('k1_lorentz', pa.list_(pa.float32())),
+        pa.field('k1_stage1_scores', pa.list_(pa.float32())),
+        pa.field('k1_stage2_scores', pa.list_(pa.float32())),
+        pa.field('k1_labels', pa.list_(pa.int32())),
+        pa.field('k1_original_indices', pa.list_(pa.int32())),
+        pa.field('cone_eta', pa.list_(pa.float32())),
+        pa.field('cone_phi', pa.list_(pa.float32())),
+        pa.field('cone_dz', pa.list_(pa.float32())),
+        pa.field('cone_pt', pa.list_(pa.float32())),
+    ]
+)
+
 
 def _strip_prefix(state_dict: dict, prefix: str) -> dict:
     full_prefix = prefix if prefix.endswith('.') else f'{prefix}.'
@@ -147,6 +169,8 @@ def _evaluate_batch(
     stage1, stage2, stage3,
     points, features, lorentz, mask,
     top_k1, top_k2, num_couples,
+    dump_stage3_inputs: bool = False,
+    track_labels: torch.Tensor | None = None,
 ) -> list[dict]:
     s1_scores = stage1(points, features, lorentz, mask)
     valid_mask = mask.squeeze(1).bool()
@@ -195,7 +219,7 @@ def _evaluate_batch(
         }
 
     if stage == 'part':
-        return [
+        rows = [
             {
                 **_stage1_row(b),
                 **_stage2_row(b),
@@ -204,6 +228,31 @@ def _evaluate_batch(
             }
             for b in range(batch_size)
         ]
+        if dump_stage3_inputs:
+            pool_valid = torch.isfinite(s2_scores)
+            labels_flat = track_labels.squeeze(1)
+            k1_labels = torch.where(
+                pool_valid,
+                labels_flat.gather(1, selected_k1),
+                torch.zeros_like(s2_scores),
+            )
+            full_valid = mask.squeeze(1) > 0.5
+            full_pt = torch.hypot(lorentz[:, 0, :], lorentz[:, 1, :])
+            for b, row in enumerate(rows):
+                valid_b = full_valid[b]
+                row['k1_features'] = (
+                    f_features[b].reshape(-1).tolist())
+                row['k1_points'] = f_points[b].reshape(-1).tolist()
+                row['k1_lorentz'] = f_lorentz[b].reshape(-1).tolist()
+                row['k1_stage1_scores'] = f_s1[b].tolist()
+                row['k1_stage2_scores'] = s2_scores[b].tolist()
+                row['k1_labels'] = k1_labels[b].int().tolist()
+                row['k1_original_indices'] = selected_k1[b].int().tolist()
+                row['cone_eta'] = points[b, 0, valid_b].tolist()
+                row['cone_phi'] = points[b, 1, valid_b].tolist()
+                row['cone_dz'] = points[b, 2, valid_b].tolist()
+                row['cone_pt'] = full_pt[b, valid_b].tolist()
+        return rows
 
     top_k2_in_k1 = s2_scores.topk(top_k2, dim=1).indices
     k2_orig = selected_k1.gather(1, top_k2_in_k1)
@@ -250,13 +299,14 @@ def _evaluate_batch(
     return rows
 
 
-def _write_parquet(rows: list[dict], output_path: str) -> None:
+def _write_parquet(rows: list[dict], output_path: str,
+                   schema: pa.Schema = OUTPUT_SCHEMA) -> None:
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-    columns = {field.name: [] for field in OUTPUT_SCHEMA}
+    columns = {field.name: [] for field in schema}
     for row in rows:
-        for field in OUTPUT_SCHEMA:
+        for field in schema:
             columns[field.name].append(row[field.name])
-    table = pa.table(columns, schema=OUTPUT_SCHEMA)
+    table = pa.table(columns, schema=schema)
     pq.write_table(table, output_path)
 
 
@@ -282,6 +332,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--stage2-weights')
     parser.add_argument('--stage3-weights')
     parser.add_argument('--num-couples', type=int, default=200)
+    parser.add_argument(
+        '--dump-stage3-inputs', action='store_true',
+        help='with --stage part: additionally dump the top-K1 block '
+             '(features/points/lorentz/scores/labels/indices) and the '
+             'full-event cone candidates for dump-based Stage-3 training.')
     parser.add_argument('--val-data-dir', required=True)
     parser.add_argument('--data-config', required=True)
     parser.add_argument('--output', required=True)
@@ -318,6 +373,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit('--stage2-weights required for stage=part/couples.')
     if args.stage == 'couples' and not args.stage3_weights:
         raise SystemExit('--stage3-weights required for stage=couples.')
+    if args.dump_stage3_inputs and args.stage != 'part':
+        raise SystemExit('--dump-stage3-inputs requires --stage part.')
 
     device = torch.device(args.device)
 
@@ -383,7 +440,8 @@ def main(argv: list[str] | None = None) -> None:
                 continue
             inputs = [X[k].to(device) for k in input_names]
             inputs = trim_to_max_valid_tracks(inputs, mask_idx)
-            model_inputs, _ = extract_label_from_inputs(inputs, label_idx)
+            model_inputs, track_labels = extract_label_from_inputs(
+                inputs, label_idx)
             points, features, lorentz, mask = model_inputs
 
             batch_rows = _evaluate_batch(
@@ -391,6 +449,8 @@ def main(argv: list[str] | None = None) -> None:
                 stage1=stage1, stage2=stage2, stage3=stage3,
                 points=points, features=features, lorentz=lorentz, mask=mask,
                 top_k1=top_k1, top_k2=top_k2, num_couples=args.num_couples,
+                dump_stage3_inputs=args.dump_stage3_inputs,
+                track_labels=track_labels,
             )
             for b, row in enumerate(batch_rows):
                 events_seen += 1
@@ -416,7 +476,10 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         if rows:
             logger.info(f'Total events: {len(rows)} → {args.output}')
-            _write_parquet(rows, args.output)
+            _write_parquet(
+                rows, args.output,
+                schema=(STAGE3_DUMP_SCHEMA if args.dump_stage3_inputs
+                        else OUTPUT_SCHEMA))
         marker = args.output + '.INCOMPLETE'
         if crash is not None:
             with open(marker, 'w') as fh:
