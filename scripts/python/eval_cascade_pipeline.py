@@ -389,6 +389,10 @@ def main(argv: list[str] | None = None) -> None:
         fetch_by_files=True,
         fetch_step=len(parquet_files),
         in_memory=False,
+        # async_load's parent-side executor deadlocks forked DataLoader
+        # workers (same failure utils/training.py guards against) — with it
+        # off, --num-workers N is safe and shards load in parallel.
+        async_load=False,
     )
     data_config = dataset.config
     loader = DataLoader(
