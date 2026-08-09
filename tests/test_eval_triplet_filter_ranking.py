@@ -15,10 +15,21 @@ from utils.triplet_join import FEATURE_NAMES_EXTENDED
 
 def test_each_trained_width_maps_back_to_its_feature_set():
     for name, names in FEATURE_SETS.items():
-        resolved, columns, with_h6 = feature_columns_for_width(len(names))
+        resolved, columns, h6_width = feature_columns_for_width(len(names))
         assert resolved == name
         assert [FEATURE_NAMES_EXTENDED[index] for index in columns] == names
-        assert with_h6 == (len(names) > 89)
+        assert h6_width == max(len(names) - 89, 0)
+
+
+def test_only_the_cone_dependent_sets_request_the_cone_block():
+    from utils.triplet_join import H6_NAMES
+    cone_start = H6_NAMES.index('n_low_ip_in_cone')
+    widths = {name: feature_columns_for_width(len(names))[2]
+              for name, names in FEATURE_SETS.items()}
+    assert widths['full89'] == 0
+    assert widths['vertex'] <= cone_start      # vertex block alone, no cone
+    assert widths['vertex_physics'] > cone_start
+    assert widths['all22'] > cone_start
 
 
 def test_an_unknown_width_is_rejected():

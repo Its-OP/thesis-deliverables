@@ -319,6 +319,19 @@ def test_sv_pointing_cos_is_bounded():
 # Batching
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize('width', [6, 11, 16, 22])
+def test_narrow_widths_match_the_leading_columns_of_the_full_block(width):
+    """Skipping the cone must not change the columns that precede it."""
+    event, h6 = _event(), _h6_inputs()
+    i, j, k = (torch.tensor([value]) for value in (0, 1, 2))
+    full = triplet_feature_columns(
+        i, j, k, torch.tensor([0]), h6_inputs=h6, **event)
+    narrow = triplet_feature_columns(
+        i, j, k, torch.tensor([0]), h6_inputs=h6, h6_width=width, **event)
+    assert narrow.shape[1] == 89 + width
+    assert torch.allclose(narrow, full[:, :89 + width], equal_nan=True)
+
+
 def test_candidate_features_keep_the_legacy_output_without_h6_inputs():
     from utils.triplet_join import triplet_candidate_features
     event = _event()

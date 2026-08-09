@@ -141,6 +141,7 @@ CONE_DZ_MAX = 0.5
 COMPANION_MIN_DR_SENTINEL = 0.4
 LOW_IP_SIGNIFICANCE_MAX = 2.0
 SV_MATCH_RADIUS_CM = 0.5
+CONE_CHUNK_TARGET_ELEMENTS = 2 ** 22
 H6_INPUT_KEYS = (
     "vertex_x", "vertex_y", "vertex_z", "dz_raw",
     "primary_vertex_x", "primary_vertex_y",
@@ -227,41 +228,63 @@ def _cone_sums(
     axis_eta: torch.Tensor, axis_phi: torch.Tensor, axis_dz: torch.Tensor,
     track_eta: torch.Tensor, track_phi: torch.Tensor, track_dz: torch.Tensor,
     track_pt: torch.Tensor, excluded: torch.Tensor | None,
+    low_ip: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """axis_*: (M,). track_*: (P,). excluded: (M, P) bool or None.
-    Returns (count (M,), sum_pt (M,), min_dr (M,), inside (M, P) bool)."""
+    """axis_*: (M,). track_*: (P,). excluded: (M, P) bool or None. low_ip:
+    optional (P,) bool counted inside the cone.
+    Returns (count (M,), sum_pt (M,), min_dr (M,), low_ip_count (M,)).
+
+    Chunked over the candidate axis: M x P is 9.8M entries per event at the
+    full Tier-H multiplicity, and materializing several intermediates that
+    size dominates the run. The counts are returned rather than the (M, P)
+    mask so nothing of that size outlives a chunk."""
     num_candidates = axis_eta.shape[0]
     pool_size = track_eta.shape[0]
+    zeros = torch.zeros(num_candidates, device=axis_eta.device)
     if pool_size == 0:
-        zeros = torch.zeros(num_candidates, device=axis_eta.device)
         return (zeros, zeros.clone(),
                 torch.full_like(zeros, COMPANION_MIN_DR_SENTINEL),
-                torch.zeros(num_candidates, 0, dtype=torch.bool,
-                            device=axis_eta.device))
-    delta_r = _delta_r_squared(
-        axis_eta.unsqueeze(1), axis_phi.unsqueeze(1),
-        track_eta.unsqueeze(0), track_phi.unsqueeze(0)).sqrt()
-    inside = (delta_r <= CONE_DELTA_R_MAX) & (
-        (axis_dz.unsqueeze(1) - track_dz.unsqueeze(0)).abs() <= CONE_DZ_MAX)
-    if excluded is not None:
-        inside &= ~excluded
-    count = inside.sum(dim=1).float()
-    sum_pt = (track_pt.unsqueeze(0) * inside).sum(dim=1)
-    masked_delta_r = torch.where(
-        inside, delta_r, torch.full_like(delta_r, COMPANION_MIN_DR_SENTINEL))
-    min_delta_r = masked_delta_r.min(dim=1).values
-    return count, sum_pt, min_delta_r, inside
+                zeros.clone())
+
+    chunk = max(1, CONE_CHUNK_TARGET_ELEMENTS // max(pool_size, 1))
+    counts, sums, minima, low_counts = [], [], [], []
+    for start in range(0, num_candidates, chunk):
+        stop = min(start + chunk, num_candidates)
+        delta_r = _delta_r_squared(
+            axis_eta[start:stop].unsqueeze(1), axis_phi[start:stop].unsqueeze(1),
+            track_eta.unsqueeze(0), track_phi.unsqueeze(0)).sqrt()
+        inside = (delta_r <= CONE_DELTA_R_MAX) & (
+            (axis_dz[start:stop].unsqueeze(1) - track_dz.unsqueeze(0)).abs()
+            <= CONE_DZ_MAX)
+        if excluded is not None:
+            inside &= ~excluded[start:stop]
+        counts.append(inside.sum(dim=1).float())
+        sums.append((track_pt.unsqueeze(0) * inside).sum(dim=1))
+        minima.append(torch.where(
+            inside, delta_r,
+            torch.full_like(delta_r, COMPANION_MIN_DR_SENTINEL)).min(dim=1).values)
+        low_counts.append((inside & low_ip.unsqueeze(0)).sum(dim=1).float()
+                          if low_ip is not None else zeros[start:stop])
+    return (torch.cat(counts), torch.cat(sums), torch.cat(minima),
+            torch.cat(low_counts))
 
 
 def _compute_h6_columns(
     i: torch.Tensor, j: torch.Tensor, k: torch.Tensor,
     *, lorentz: torch.Tensor, eta: torch.Tensor, phi: torch.Tensor,
-    dxy_sig: torch.Tensor, h6_inputs: dict,
+    dxy_sig: torch.Tensor, h6_inputs: dict, width: int = len(H6_NAMES),
 ) -> torch.Tensor:
-    """i, j, k: (M,) long. Returns (M, 22) in H6_NAMES order."""
+    """i, j, k: (M,) long. width: how many leading H6 columns are wanted —
+    the cone blocks cost O(candidates x tracks) and are skipped when the
+    caller only needs the vertex block. Returns (M, width) in H6_NAMES order."""
     missing = [key for key in H6_INPUT_KEYS if key not in h6_inputs]
     if missing:
         raise ValueError(f"h6_inputs is missing {missing}")
+
+    # n_low_ip_in_cone is the first column that needs the cone; everything from
+    # the isolation block onward needs it too.
+    needs_cone = width > H6_NAMES.index("n_low_ip_in_cone")
+    needs_sv = width > H6_NAMES.index("sv_min_distance")
 
     members = torch.stack([i, j, k], dim=1)
     reference = torch.stack([h6_inputs["vertex_x"], h6_inputs["vertex_y"],
@@ -325,26 +348,32 @@ def _compute_h6_columns(
     axis_phi = torch.atan2(momentum[:, 1], momentum[:, 0])
     axis_dz = member_dz.mean(dim=1)
 
-    pool_pt = torch.hypot(lorentz[0], lorentz[1])
-    pool_index = torch.arange(eta.shape[0], device=eta.device)
-    is_member = (pool_index.view(1, -1) == members.unsqueeze(2)).any(dim=1)
-    kept_count, kept_sum_pt, cone_min_dr, kept_inside = _cone_sums(
-        axis_eta, axis_phi, axis_dz, eta, phi, dz_raw, pool_pt, is_member)
-    n_low_ip_in_cone = (
-        kept_inside & (dxy_sig.abs().unsqueeze(0) <= LOW_IP_SIGNIFICANCE_MAX)
-    ).sum(dim=1).float()
+    if needs_cone:
+        pool_pt = torch.hypot(lorentz[0], lorentz[1])
+        pool_index = torch.arange(eta.shape[0], device=eta.device)
+        is_member = (pool_index.view(1, -1) == members.unsqueeze(2)).any(dim=1)
+        kept_count, kept_sum_pt, cone_min_dr, n_low_ip_in_cone = _cone_sums(
+            axis_eta, axis_phi, axis_dz, eta, phi, dz_raw, pool_pt, is_member,
+            low_ip=dxy_sig.abs() <= LOW_IP_SIGNIFICANCE_MAX)
 
-    other_count, other_sum_pt, _, _ = _cone_sums(
-        axis_eta, axis_phi, axis_dz, h6_inputs["other_eta"],
-        h6_inputs["other_phi"], h6_inputs["other_dz"],
-        h6_inputs["other_pt"], None)
+        other_count, other_sum_pt, _, _ = _cone_sums(
+            axis_eta, axis_phi, axis_dz, h6_inputs["other_eta"],
+            h6_inputs["other_phi"], h6_inputs["other_dz"],
+            h6_inputs["other_pt"], None)
+    else:
+        empty = torch.zeros_like(momentum_pt)
+        kept_count = kept_sum_pt = other_count = other_sum_pt = empty
+        cone_min_dr = n_low_ip_in_cone = empty
 
     # Secondary vertices are matched by proximity to the reconstructed triplet
     # vertex, so no slot ordering is involved; "no vertex" is NaN rather than a
     # sentinel, letting the tree learn a per-split direction for it.
     sv_x, sv_y, sv_z = h6_inputs["sv_x"], h6_inputs["sv_y"], h6_inputs["sv_z"]
     num_candidates = i.shape[0]
-    if sv_x.numel() == 0:
+    if not needs_sv:
+        zero = torch.zeros_like(momentum_pt)
+        sv_columns = [zero] * 6
+    elif sv_x.numel() == 0:
         nan = torch.full((num_candidates,), float("nan"), device=i.device)
         sv_columns = [nan, nan.clone(), nan.clone(), nan.clone(),
                       torch.zeros_like(nan), torch.zeros_like(nan)]
@@ -376,7 +405,7 @@ def _compute_h6_columns(
         kept_count, kept_sum_pt, other_count, other_sum_pt, cone_min_dr,
         *sv_columns,
     ]
-    return torch.stack(columns, dim=1)
+    return torch.stack(columns[:width], dim=1)
 
 
 def _track16(idx, *, lorentz, charge, eta, phi, dxy_sig, dz, norm_chi2,
@@ -558,9 +587,12 @@ def triplet_feature_columns(
     cov_phi_phi: torch.Tensor,
     cov_lambda_lambda: torch.Tensor,
     h6_inputs: dict | None = None,
+    h6_width: int = len(H6_NAMES),
 ) -> torch.Tensor:
     """i, j, k, couple_rank: (M,) long. lorentz: (4, N). per-track inputs: (N,).
-    h6_inputs: optional dict of the H6_INPUT_KEYS arrays.
+    h6_inputs: optional dict of the H6_INPUT_KEYS arrays. h6_width: leading H6
+    columns to compute, so callers that only need the vertex block skip the
+    cone.
 
     Returns (M, 89) in FEATURE_NAMES order, or (M, 111) in
     FEATURE_NAMES_EXTENDED order when h6_inputs is given.
@@ -612,7 +644,7 @@ def triplet_feature_columns(
     if h6_inputs is not None:
         blocks.append(_compute_h6_columns(
             i, j, k, lorentz=lorentz, eta=eta, phi=phi, dxy_sig=dxy_sig,
-            h6_inputs=h6_inputs))
+            h6_inputs=h6_inputs, width=h6_width))
     return torch.cat(blocks, dim=1)
 
 

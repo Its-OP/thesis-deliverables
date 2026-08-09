@@ -17,6 +17,7 @@ from tqdm import tqdm
 from utils.triplet_join import (
     FEATURE_NAMES,
     FEATURE_NAMES_EXTENDED,
+    H6_NAMES,
     M_TAU_GEV,
     build_track_lorentz,
     build_triplet_candidates,
@@ -249,10 +250,11 @@ def _event_candidates(r, couples_all, cols, top_c):
                 kw=kw, reconstructable=reconstructable, n_full=n_full)
 
 
-def _featurize(candidates, rows, r, cols, with_h6):
-    """rows: row indices into the candidate list. Returns (len(rows), F)."""
+def _featurize(candidates, rows, r, cols, with_h6, h6_width=len(H6_NAMES)):
+    """rows: row indices into the candidate list. h6_width: leading H6 columns
+    to compute. Returns (len(rows), F)."""
     if len(rows) == 0:
-        width = len(FEATURE_NAMES_EXTENDED) if with_h6 else len(FEATURE_NAMES)
+        width = (len(FEATURE_NAMES) + h6_width) if with_h6 else len(FEATURE_NAMES)
         return np.zeros((0, width), dtype=np.float32)
     selected = torch.as_tensor(np.asarray(rows), dtype=torch.long)
     triplets = candidates["triplets"][selected]
@@ -260,7 +262,7 @@ def _featurize(candidates, rows, r, cols, with_h6):
     columns = triplet_feature_columns(
         triplets[:, 0], triplets[:, 1], triplets[:, 2],
         candidates["couple_row"][selected], h6_inputs=h6_inputs,
-        **candidates["kw"])
+        h6_width=h6_width, **candidates["kw"])
     return columns.numpy()
 
 

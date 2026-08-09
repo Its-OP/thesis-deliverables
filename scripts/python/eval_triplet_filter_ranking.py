@@ -43,11 +43,14 @@ def deduped_gt_rank(scores, is_gt, triplets):
 
 def feature_columns_for_width(width):
     """The sweep trains on named subsets of the extended layout, so a model's
-    own input width identifies which columns it expects."""
+    own input width identifies which columns it expects. The subsets are
+    prefixes of that layout, so the H6 part is the leading `width - 89`
+    columns and anything past it need never be computed."""
     for name, names in FEATURE_SETS.items():
         if len(names) == width:
             indices = [FEATURE_NAMES_EXTENDED.index(entry) for entry in names]
-            return name, np.asarray(indices), width > len(FEATURE_NAMES)
+            h6_width = max(width - len(FEATURE_NAMES), 0)
+            return name, np.asarray(indices), h6_width
     raise ValueError(
         f"no feature set has {width} columns; known widths are "
         f"{sorted(len(names) for names in FEATURE_SETS.values())}")
@@ -64,14 +67,15 @@ def use_cpu_inference(model):
     return model
 
 
-def _rank_for_event(r, couples, cols, top_c, model, with_h6, columns=None):
+def _rank_for_event(r, couples, cols, top_c, model, h6_width, columns=None):
     candidates = _event_candidates(r, couples, cols, top_c)
     is_gt = candidates["is_gt"]
     n_candidates = len(is_gt)
     if n_candidates == 0:
         return dict(rank=None, n_candidates=0,
                     reconstructable=candidates["reconstructable"])
-    features = _featurize(candidates, np.arange(n_candidates), r, cols, with_h6)
+    features = _featurize(candidates, np.arange(n_candidates), r, cols,
+                          h6_width > 0, h6_width)
     if columns is not None:
         features = features[:, columns]
     scores = model.predict_proba(features)[:, 1]
@@ -84,27 +88,27 @@ def _rank_for_event(r, couples, cols, top_c, model, with_h6, columns=None):
 def _worker_rank(r):
     state = _WORKER_STATE
     return _rank_for_event(r, state["couples"], state["cols"], state["top_c"],
-                           state["model"], state["with_h6"], state["columns"])
+                           state["model"], state["h6_width"], state["columns"])
 
 
 def evaluate(dump_path, src_glob, model, *, top_c=100, max_events=None,
              workers=0):
     width = int(getattr(model, "n_features_in_", len(FEATURE_NAMES)))
-    feature_set, columns, with_h6 = feature_columns_for_width(width)
+    feature_set, columns, h6_width = feature_columns_for_width(width)
     use_cpu_inference(model)
-    print(f'feature set {feature_set} ({width} columns), h6={with_h6}')
+    print(f'feature set {feature_set} ({width} columns), h6 block {h6_width})')
     results = []
     for couples, cols, n in _shard_blocks(dump_path, src_glob, max_events):
         if workers > 1:
             state = dict(couples=couples, cols=cols, top_c=top_c, model=model,
-                         with_h6=with_h6, columns=columns)
+                         h6_width=h6_width, columns=columns)
             with _worker_pool(workers, state) as pool:
                 results.extend(tqdm(
                     pool.imap(_worker_rank, range(n), chunksize=8), total=n,
                     desc=f"rank x{workers} (+{n})"))
         else:
             results.extend(
-                _rank_for_event(r, couples, cols, top_c, model, with_h6, columns)
+                _rank_for_event(r, couples, cols, top_c, model, h6_width, columns)
                 for r in tqdm(range(n), desc=f"rank (+{n})"))
 
     n_events = len(results)
@@ -117,7 +121,7 @@ def evaluate(dump_path, src_glob, model, *, top_c=100, max_events=None,
         n_events=n_events,
         n_features=width,
         feature_set=feature_set,
-        with_h6=bool(with_h6),
+        h6_width=int(h6_width),
         reconstructable=sum(1 for e in results if e["reconstructable"]) / n_events,
         gt_in_list=len(found) / n_events,
         median_rank=float(np.median(found)) if found else float("nan"),
