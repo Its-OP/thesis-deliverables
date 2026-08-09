@@ -363,27 +363,61 @@ def build_train(blocks, top_c, neg_per_event, neg_mode, gen, out_path, with_h6,
     print(f"wrote {out_path} ({tbl.num_rows} rows from {n_events} events)")
 
 
-def build_eval(blocks, top_c, subsample, gen, out_path, with_h6):
+def _eval_rows_for_event(r, couples, cols, top_c, subsample, gen, with_h6):
+    candidates = _event_candidates(r, couples, cols, top_c)
+    is_gt = candidates["is_gt"]
+    gt_row = None
+    if candidates["reconstructable"] and is_gt.any():
+        gt_row = _featurize(
+            candidates, np.flatnonzero(is_gt)[:1], r, cols, with_h6)[0]
+    n_h = len(is_gt)
+    sub_block, weight = None, None
+    if n_h:
+        take = min(subsample, n_h)
+        idx = gen.choice(n_h, take, replace=False)
+        sub_block = _featurize(candidates, idx, r, cols, with_h6)
+        weight = np.full(take, n_h / take)
+    return dict(gt_row=gt_row, sub_block=sub_block, weight=weight,
+                reconstructable=candidates["reconstructable"],
+                n_full=candidates["n_full"])
+
+
+def _build_eval_event(r):
+    state = _WORKER_STATE
+    gen = np.random.default_rng((state["seed"], r))
+    return _eval_rows_for_event(
+        r, state["couples"], state["cols"], state["top_c"],
+        state["subsample"], gen, state["with_h6"])
+
+
+def build_eval(blocks, top_c, subsample, gen, out_path, with_h6, workers=0,
+               seed=0):
     gt_rows, gt_pool, sub_rows, sub_w, sub_pool = [], [], [], [], []
     meta = {POOL: dict(recon=0, n_full=0, n_events=0)}
     for couples, cols, n in blocks:
-        for r in tqdm(range(n), desc=f"eval (+{n})"):
-            candidates = _event_candidates(r, couples, cols, top_c)
-            is_gt = candidates["is_gt"]
-            if candidates["reconstructable"]:
+        if workers > 1:
+            state = dict(couples=couples, cols=cols, top_c=top_c,
+                         subsample=subsample, with_h6=with_h6, seed=seed)
+            with _worker_pool(workers, state) as pool:
+                per_event = list(tqdm(
+                    pool.imap(_build_eval_event, range(n), chunksize=16),
+                    total=n, desc=f"eval x{workers} (+{n})"))
+        else:
+            per_event = [
+                _eval_rows_for_event(r, couples, cols, top_c, subsample,
+                                     np.random.default_rng((seed, r)), with_h6)
+                for r in tqdm(range(n), desc=f"eval (+{n})")]
+        for event in per_event:
+            if event["reconstructable"]:
                 meta[POOL]["recon"] += 1
-            meta[POOL]["n_full"] += candidates["n_full"]
-            if candidates["reconstructable"] and is_gt.any():
-                gt_rows.append(_featurize(
-                    candidates, np.flatnonzero(is_gt)[:1], r, cols, with_h6)[0])
+            meta[POOL]["n_full"] += event["n_full"]
+            if event["gt_row"] is not None:
+                gt_rows.append(event["gt_row"])
                 gt_pool.append(POOL)
-            n_h = len(is_gt)
-            if n_h:
-                take = min(subsample, n_h)
-                idx = gen.choice(n_h, take, replace=False)
-                sub_rows.append(_featurize(candidates, idx, r, cols, with_h6))
-                sub_w.append(np.full(take, n_h / take))
-                sub_pool.append(np.full(take, POOL))
+            if event["sub_block"] is not None:
+                sub_rows.append(event["sub_block"])
+                sub_w.append(event["weight"])
+                sub_pool.append(np.full(len(event["weight"]), POOL))
         meta[POOL]["n_events"] += n
 
     gt_tbl = _to_table(np.stack(gt_rows), {"pool": pa.array(gt_pool)}, with_h6)
@@ -446,7 +480,8 @@ def main():
     else:
         out_name = args.out_name or "triplet_filter_eval.parquet"
         build_eval(blocks, args.top_c, args.subsample, gen,
-                   os.path.join(args.out_dir, out_name), with_h6)
+                   os.path.join(args.out_dir, out_name), with_h6,
+                   workers=args.workers, seed=args.seed)
 
 
 if __name__ == "__main__":

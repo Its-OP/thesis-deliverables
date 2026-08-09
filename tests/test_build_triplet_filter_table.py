@@ -248,6 +248,47 @@ def test_alignment_guard_stops_after_the_sample():
     assert assert_dump_aligned(couples, [5] * 10 + [5], sample=10) == 10
 
 
+def test_parallel_eval_build_matches_the_serial_build():
+    import glob
+    import json
+    import os
+
+    from scripts.python.build_triplet_filter_table import _shard_blocks, build_eval
+
+    root = os.path.join(os.path.dirname(__file__), '..')
+    dump = os.path.join(root, 'data', 'dumps', 'couples_k125_dump.parquet')
+    pattern = os.path.join(root, 'data', 'low-pt', 'eval', '*.parquet')
+    if not (os.path.exists(dump) and glob.glob(pattern)):
+        pytest.skip('eval dump or shards not present')
+
+    outputs = {}
+    for workers in (0, 3):
+        blocks = _shard_blocks(dump, pattern, 24)
+        path = os.path.join(
+            os.path.dirname(__file__), f'_parallel_eval_{workers}.parquet')
+        build_eval(blocks, 100, 20, np.random.default_rng(0), path, True,
+                   workers=workers, seed=0)
+        outputs[workers] = {
+            part: pq.read_table(path.replace('.parquet', f'_{part}.parquet'))
+            for part in ('gt', 'sub')}
+        with open(path.replace('.parquet', '_meta.json')) as handle:
+            outputs[workers]['meta'] = json.load(handle)
+        for suffix in ('_gt.parquet', '_sub.parquet', '_meta.json'):
+            os.remove(path.replace('.parquet', suffix))
+
+    assert outputs[0]['meta'] == outputs[3]['meta']
+    for part in ('gt', 'sub'):
+        serial, parallel = outputs[0][part], outputs[3][part]
+        assert serial.num_rows == parallel.num_rows
+        for name in serial.schema.names:
+            left = np.asarray(serial.column(name))
+            right = np.asarray(parallel.column(name))
+            if left.dtype.kind == 'f':
+                assert np.allclose(left, right, equal_nan=True), f'{part}.{name}'
+            else:
+                assert (left == right).all(), f'{part}.{name}'
+
+
 def test_unknown_negative_mode_is_rejected():
     couple_row, is_gt = _candidate_pool()
     with pytest.raises(ValueError, match="neg_mode"):
