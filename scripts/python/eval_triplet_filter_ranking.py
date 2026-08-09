@@ -1,0 +1,126 @@
+import argparse
+import json
+import os
+
+import joblib
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from scripts.python.build_triplet_filter_table import (
+    ROLE_DEFAULTS,
+    _event_candidates,
+    _featurize,
+    _shard_blocks,
+    _worker_pool,
+    _WORKER_STATE,
+)
+from utils.triplet_join import FEATURE_NAMES, FEATURE_NAMES_EXTENDED
+
+K_VALUES = (1, 5, 10, 20, 50, 100)
+
+
+def deduped_gt_rank(scores, is_gt, triplets):
+    """Rank of the ground-truth 3-set once duplicate 3-sets are collapsed: the
+    same (i, j, k) reaches the list through up to three different couples, and
+    counting those separately would inflate every rank ahead of it."""
+    if not is_gt.any():
+        return None
+    order = np.argsort(-scores, kind="stable")
+    seen = set()
+    rank = 0
+    for index in order:
+        key = tuple(sorted(triplets[index]))
+        if key in seen:
+            continue
+        seen.add(key)
+        if is_gt[index]:
+            return rank
+        rank += 1
+    return None
+
+
+def _rank_for_event(r, couples, cols, top_c, model, with_h6):
+    candidates = _event_candidates(r, couples, cols, top_c)
+    is_gt = candidates["is_gt"]
+    n_candidates = len(is_gt)
+    if n_candidates == 0:
+        return dict(rank=None, n_candidates=0,
+                    reconstructable=candidates["reconstructable"])
+    features = _featurize(candidates, np.arange(n_candidates), r, cols, with_h6)
+    scores = model.predict_proba(features)[:, 1]
+    triplets = candidates["triplets"].numpy()
+    return dict(rank=deduped_gt_rank(scores, is_gt, triplets),
+                n_candidates=n_candidates,
+                reconstructable=candidates["reconstructable"])
+
+
+def _worker_rank(r):
+    state = _WORKER_STATE
+    return _rank_for_event(r, state["couples"], state["cols"], state["top_c"],
+                           state["model"], state["with_h6"])
+
+
+def evaluate(dump_path, src_glob, model, *, top_c=100, max_events=None,
+             workers=0):
+    with_h6 = getattr(model, "n_features_in_", len(FEATURE_NAMES)) > len(FEATURE_NAMES)
+    results = []
+    for couples, cols, n in _shard_blocks(dump_path, src_glob, max_events):
+        if workers > 1:
+            state = dict(couples=couples, cols=cols, top_c=top_c, model=model,
+                         with_h6=with_h6)
+            with _worker_pool(workers, state) as pool:
+                results.extend(tqdm(
+                    pool.imap(_worker_rank, range(n), chunksize=8), total=n,
+                    desc=f"rank x{workers} (+{n})"))
+        else:
+            results.extend(
+                _rank_for_event(r, couples, cols, top_c, model, with_h6)
+                for r in tqdm(range(n), desc=f"rank (+{n})"))
+
+    n_events = len(results)
+    ranks = [entry["rank"] for entry in results]
+    found = [rank for rank in ranks if rank is not None]
+    # T@K denominates by ALL events, matching the cascade's other metrics.
+    metrics = {f"T@{k}": sum(1 for rank in found if rank < k) / n_events
+               for k in K_VALUES}
+    metrics.update(
+        n_events=n_events,
+        n_features=int(getattr(model, "n_features_in_", -1)),
+        with_h6=bool(with_h6),
+        reconstructable=sum(1 for e in results if e["reconstructable"]) / n_events,
+        gt_in_list=len(found) / n_events,
+        median_rank=float(np.median(found)) if found else float("nan"),
+        mean_candidates=float(np.mean([e["n_candidates"] for e in results])),
+    )
+    return metrics
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Deduplicated T@K of a third-pion filter over the full '
+                    'Tier-H survivor list.')
+    parser.add_argument('--model', required=True)
+    parser.add_argument('--dump', default=ROLE_DEFAULTS['eval'][0])
+    parser.add_argument('--src-glob', default=ROLE_DEFAULTS['eval'][1])
+    parser.add_argument('--top-c', type=int, default=100)
+    parser.add_argument('--max-events', type=int, default=None)
+    parser.add_argument('--workers', type=int, default=0)
+    parser.add_argument('--output', default=None)
+    args = parser.parse_args()
+
+    torch.set_num_threads(1)
+    model = joblib.load(args.model)
+    metrics = evaluate(args.dump, args.src_glob, model, top_c=args.top_c,
+                       max_events=args.max_events, workers=args.workers)
+    print(os.path.basename(args.model))
+    for key, value in metrics.items():
+        print(f'  {key}: {value}')
+    if args.output:
+        with open(args.output, 'w') as handle:
+            json.dump({'model': args.model, **metrics}, handle, indent=2)
+        print(f'-> {args.output}')
+
+
+if __name__ == '__main__':
+    main()

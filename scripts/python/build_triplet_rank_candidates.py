@@ -16,18 +16,21 @@ import torch
 from tqdm import tqdm
 
 from utils.triplet_join import (
+    FEATURE_NAMES,
     build_track_lorentz,
     build_triplet_candidates,
     triplet_candidate_features,
 )
 try:
-    # This path scores the legacy 89-feature layout, so it reads only the
-    # track columns those features need — not the H6 block.
+    # SRC_COLS covers the legacy 89-feature layout; H6_SRC_COLS adds what the
+    # extended block needs and is only read when --h6 is given.
     from scripts.python.build_triplet_filter_table import (
-        DUMP, SRC, TRACK_SRC_COLS as SRC_COLS)
+        DUMP, SRC, H6_SRC_COLS, TRACK_SRC_COLS as SRC_COLS,
+        _h6_inputs_for_event)
 except ImportError:  # direct-file invocation: scripts/python is sys.path[0]
     from build_triplet_filter_table import (
-        DUMP, SRC, TRACK_SRC_COLS as SRC_COLS)
+        DUMP, SRC, H6_SRC_COLS, TRACK_SRC_COLS as SRC_COLS,
+        _h6_inputs_for_event)
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'models')
 OUT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'low-pt', 'eval', 'triplet_rank')
@@ -105,14 +108,20 @@ def _list_views(table, name):
     return [flat[offsets[r]:offsets[r + 1]] for r in range(len(array))]
 
 
-def _event_views(dump, src):
+def _event_views(dump, src, src_names=None):
     dump_cols = {name: _list_views(dump, name) for name in DUMP_COLS}
-    src_cols = {name: (src[name].to_numpy(zero_copy_only=False) if name == 'event_n_tracks'
-                       else _list_views(src, name)) for name in SRC_COLS}
+    src_cols = {}
+    for name in (src_names or SRC_COLS):
+        column = src[name]
+        # Scalar columns (track counts, the primary vertex) stay numpy; the
+        # per-track columns become zero-copy row views.
+        is_list = pa.types.is_list(column.type) or pa.types.is_large_list(column.type)
+        src_cols[name] = (_list_views(src, name) if is_list
+                          else column.to_numpy(zero_copy_only=False))
     return dump_cols, src_cols
 
 
-def event_features(r, dump_cols, src_cols, *, top_c):
+def event_features(r, dump_cols, src_cols, *, top_c, with_h6=False):
     s1 = dump_cols['stage1_sorted_indices']
     couples_all = dump_cols['stage3_sorted_couples']
     cols = src_cols
@@ -142,7 +151,9 @@ def event_features(r, dump_cols, src_cols, *, top_c):
     # Features/labels and candidate (i, j, k) indices come from two calls that share the
     # same Tier-H enumeration (charge net +-1, m(ijk) <= m_tau, ascending k per couple);
     # the asserts below pin that order equality.
-    X, _, is_gt, couple_row = triplet_candidate_features(couples, pool, gt_sorted=gt_sorted, **kw)
+    h6_inputs = _h6_inputs_for_event(cols, r) if with_h6 else None
+    X, _, is_gt, couple_row = triplet_candidate_features(
+        couples, pool, gt_sorted=gt_sorted, h6_inputs=h6_inputs, **kw)
     triplets, couple_row_check = build_triplet_candidates(couples, pool, lorentz=lorentz,
                                                           charge=kw['charge'])
     assert torch.equal(couple_row_check, couple_row), f'enumeration order mismatch at row {r}'
@@ -150,7 +161,10 @@ def event_features(r, dump_cols, src_cols, *, top_c):
     assert torch.equal(triplets[:, 1], couples[couple_row, 1]), f'j mismatch at row {r}'
     n_candidates = int(X.shape[0])
     assert n_candidates <= MAX_CANDIDATES_PER_EVENT, f'{n_candidates} candidates at row {r}'
-    assert torch.isfinite(X).all(), f'non-finite features at row {r}'
+    # The H6 secondary-vertex columns are NaN by design when no vertex exists,
+    # so only the legacy block carries a finiteness guarantee.
+    assert torch.isfinite(X[:, :len(FEATURE_NAMES)]).all(), \
+        f'non-finite features at row {r}'
 
     # Frozen-cascade score columns: stage-1 scores scattered back to track order
     # (full coverage), stage-2 scores NaN outside the stage-1 top-K1, and the kept
@@ -195,8 +209,8 @@ def _predict(model, X):
     return model.predict_proba(X)[:, 1].astype(np.float32)
 
 
-def event_candidates(r, dump_cols, src_cols, *, top_c, gbdt_models):
-    row, X = event_features(r, dump_cols, src_cols, top_c=top_c)
+def event_candidates(r, dump_cols, src_cols, *, top_c, gbdt_models, with_h6=False):
+    row, X = event_features(r, dump_cols, src_cols, top_c=top_c, with_h6=with_h6)
     row['gbdt6_score'] = _predict(gbdt_models['gbdt6'], X).tolist()
     row['gbdt8_score'] = _predict(gbdt_models['gbdt8'], X).tolist()
     return row
@@ -228,11 +242,13 @@ def _write_rows(path, rows):
     writer.close()
 
 
-def _process_chunk(chunk_events, offset, dump_cols, src_cols, top_c, gbdt_models):
+def _process_chunk(chunk_events, offset, dump_cols, src_cols, top_c, gbdt_models,
+                   with_h6=False):
     rows, feature_blocks, succeeded = [], [], []
     for g in chunk_events:
         try:
-            row, X = event_features(int(g) - offset, dump_cols, src_cols, top_c=top_c)
+            row, X = event_features(int(g) - offset, dump_cols, src_cols,
+                                    top_c=top_c, with_h6=with_h6)
             rows.append(row)
             feature_blocks.append(X)
             succeeded.append(True)
