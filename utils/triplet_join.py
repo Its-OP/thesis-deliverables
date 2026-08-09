@@ -633,12 +633,16 @@ def triplet_candidate_features(
     cov_phi_phi: torch.Tensor,
     cov_lambda_lambda: torch.Tensor,
     gt_sorted: tuple[int, int, int] | None = None,
+    h6_inputs: dict | None = None,
 ) -> tuple[torch.Tensor, list[str], torch.Tensor, torch.Tensor]:
     """couples: (C, 2) long. pool: (P,) long. lorentz: (4, N). per-track inputs: (N,).
+    h6_inputs: optional dict of the H6_INPUT_KEYS arrays.
 
-    Per Tier-H-surviving candidate: (X (M_H, 89) features in FEATURE_NAMES order,
-    FEATURE_NAMES, is_gt (M_H,), couple_row (M_H,)). Columns 0:4 equal triplet_gate_quantities;
-    the RICH_NAMES block (24) is followed by ti/tj/tk 16-blocks and the couple-unit block (17).
+    Per Tier-H-surviving candidate: (X (M_H, 89 or 111) features, the matching
+    name list, is_gt (M_H,), couple_row (M_H,)). Columns 0:4 equal
+    triplet_gate_quantities; the RICH_NAMES block (24) is followed by ti/tj/tk
+    16-blocks, the couple-unit block (17) and, when h6_inputs is given, the H6
+    block (22).
     """
     track_i, track_j, track_k, couple_row, base = _enumerate(couples, pool)
     h_keep = base.clone()
@@ -651,7 +655,9 @@ def triplet_candidate_features(
         i, j, k, cr, lorentz=lorentz, charge=charge, eta=eta, phi=phi, dz=dz,
         dxy_sig=dxy_sig, dca_sig=dca_sig, n_pixel=n_pixel, norm_chi2=norm_chi2,
         pt_error=pt_error, cov_phi_phi=cov_phi_phi, cov_lambda_lambda=cov_lambda_lambda,
+        h6_inputs=h6_inputs,
     )
+    names = FEATURE_NAMES if h6_inputs is None else FEATURE_NAMES_EXTENDED
 
     if gt_sorted is not None:
         sorted_rows = torch.stack([i, j, k], dim=1).sort(dim=1).values
@@ -659,7 +665,7 @@ def triplet_candidate_features(
         is_gt = (sorted_rows == target).all(dim=1)
     else:
         is_gt = torch.zeros(i.shape[0], dtype=torch.bool, device=i.device)
-    return features, FEATURE_NAMES, is_gt, cr
+    return features, names, is_gt, cr
 
 
 _TIER_DEFAULTS = {

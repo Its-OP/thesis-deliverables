@@ -319,6 +319,33 @@ def test_sv_pointing_cos_is_bounded():
 # Batching
 # ---------------------------------------------------------------------------
 
+def test_candidate_features_keep_the_legacy_output_without_h6_inputs():
+    from utils.triplet_join import triplet_candidate_features
+    event = _event()
+    couples = torch.tensor([[0, 1], [1, 2]])
+    pool = torch.arange(5)
+    features, names, _, _ = triplet_candidate_features(
+        couples, pool, **event)
+    assert features.shape[1] == 89
+    assert names == FEATURE_NAMES
+
+
+def test_candidate_features_widen_and_agree_with_the_legacy_columns():
+    from utils.triplet_join import triplet_candidate_features
+    event, h6 = _event(), _h6_inputs()
+    couples = torch.tensor([[0, 1], [1, 2]])
+    pool = torch.arange(5)
+    legacy, _, legacy_is_gt, legacy_rows = triplet_candidate_features(
+        couples, pool, **event)
+    extended, names, is_gt, rows = triplet_candidate_features(
+        couples, pool, h6_inputs=h6, **event)
+    assert extended.shape[1] == 111
+    assert names == FEATURE_NAMES_EXTENDED
+    assert torch.equal(is_gt, legacy_is_gt)
+    assert torch.equal(rows, legacy_rows)
+    assert torch.allclose(extended[:, :89], legacy, equal_nan=True)
+
+
 def test_batched_candidates_match_per_candidate_evaluation():
     event, h6 = _event(), _h6_inputs()
     triplets = [(0, 1, 2), (0, 1, 3), (1, 2, 3), (0, 2, 4)]
