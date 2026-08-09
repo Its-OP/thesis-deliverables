@@ -349,7 +349,9 @@ def build_train(blocks, top_c, neg_per_event, neg_mode, gen, out_path, with_h6,
                            "event_index": pa.array(np.concatenate(train_event)),
                            "pool": pa.array(np.full(rows.shape[0], POOL))}, with_h6)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    pq.write_table(tbl, out_path)
+    # zstd over snappy: these tables are almost entirely float columns and the
+    # 300k-event builds are large enough for the difference to matter on disk.
+    pq.write_table(tbl, out_path, compression="zstd")
     print(f"wrote {out_path} ({tbl.num_rows} rows from {n_events} events)")
 
 
@@ -381,8 +383,10 @@ def build_eval(blocks, top_c, subsample, gen, out_path, with_h6):
                         {"weight": pa.array(np.concatenate(sub_w)),
                          "pool": pa.array(np.concatenate(sub_pool))}, with_h6)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    pq.write_table(gt_tbl, out_path.replace(".parquet", "_gt.parquet"))
-    pq.write_table(sub_tbl, out_path.replace(".parquet", "_sub.parquet"))
+    pq.write_table(gt_tbl, out_path.replace(".parquet", "_gt.parquet"),
+                   compression="zstd")
+    pq.write_table(sub_tbl, out_path.replace(".parquet", "_sub.parquet"),
+                   compression="zstd")
     with open(out_path.replace(".parquet", "_meta.json"), "w") as fh:
         json.dump(meta, fh, indent=2)
     print(f"wrote {out_path.replace('.parquet', '_{gt,sub}.parquet')} + _meta.json "
