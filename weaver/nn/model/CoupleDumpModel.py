@@ -77,6 +77,7 @@ class CoupleDumpModel(nn.Module):
                 track_valid_mask=track_valid_mask,
                 precomputed_cone=batch.get('precomputed_cone'),
             )
+            couple_inputs['member_full_indices'] = member_full_indices
 
             if with_metrics:
                 couple_inputs['n_gt_in_top_k1'] = (

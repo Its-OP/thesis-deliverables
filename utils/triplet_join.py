@@ -114,6 +114,270 @@ COUPLE_UNIT_NAMES = [
 FEATURE_NAMES = RICH_NAMES + TRACK_I_NAMES + TRACK_J_NAMES + TRACK_K_NAMES + COUPLE_UNIT_NAMES
 GATE4_NAMES = FEATURE_NAMES[:4]
 
+# H6 block: vertex/lifetime, LHCb-style triplet physics, isolation cones and
+# secondary-vertex attachment. Appended after the legacy 89 so every existing
+# checkpoint keeps its column layout.
+H6_VERTEX_NAMES = [
+    "poca_max", "poca_mean", "crossing_z_gap_max", "raw_dz_gap_max",
+    "lifetime_positive_count", "dxy_sig_spread",
+]
+H6_PHYSICS_NAMES = [
+    "corrected_mass", "signed_ip_k", "min_pt_ijk", "scalar_sum_pt_ijk",
+    "n_low_ip_in_cone",
+]
+H6_ISOLATION_NAMES = [
+    "kept_cone_count", "kept_cone_sum_pt", "other_cone_count",
+    "other_cone_sum_pt", "cone_min_dr",
+]
+H6_SV_NAMES = [
+    "sv_min_distance", "sv_nearest_dlen_sig", "sv_nearest_mass",
+    "sv_pointing_cos", "n_sv_matched", "has_sv",
+]
+H6_NAMES = H6_VERTEX_NAMES + H6_PHYSICS_NAMES + H6_ISOLATION_NAMES + H6_SV_NAMES
+FEATURE_NAMES_EXTENDED = FEATURE_NAMES + H6_NAMES
+
+CONE_DELTA_R_MAX = 0.4
+CONE_DZ_MAX = 0.5
+COMPANION_MIN_DR_SENTINEL = 0.4
+LOW_IP_SIGNIFICANCE_MAX = 2.0
+SV_MATCH_RADIUS_CM = 0.5
+H6_INPUT_KEYS = (
+    "vertex_x", "vertex_y", "vertex_z", "dz_raw",
+    "primary_vertex_x", "primary_vertex_y",
+    "sv_x", "sv_y", "sv_z", "sv_dlen_sig", "sv_mass",
+    "other_pt", "other_eta", "other_phi", "other_dz",
+)
+
+
+def _unit_direction(eta: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+    """eta, phi: (M,). Returns (M, 3) unit momentum direction."""
+    cosh_eta = torch.cosh(eta)
+    return torch.stack([
+        torch.cos(phi) / cosh_eta,
+        torch.sin(phi) / cosh_eta,
+        torch.tanh(eta),
+    ], dim=1)
+
+
+def _closest_approach(
+    reference_a: torch.Tensor, direction_a: torch.Tensor,
+    reference_b: torch.Tensor, direction_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All inputs (M, 3). Returns (distance (M,), midpoint (M, 3)) of the
+    skew-line closest approach; parallel pairs fall back to point-to-line."""
+    separation = reference_a - reference_b
+    a_squared = (direction_a * direction_a).sum(dim=1, keepdim=True)
+    b_squared = (direction_b * direction_b).sum(dim=1, keepdim=True)
+    cross_dot = (direction_a * direction_b).sum(dim=1, keepdim=True)
+    separation_a = (direction_a * separation).sum(dim=1, keepdim=True)
+    separation_b = (direction_b * separation).sum(dim=1, keepdim=True)
+    denominator = a_squared * b_squared - cross_dot ** 2
+    parallel = denominator < 1e-12
+    # torch.where evaluates both branches, so guard the denominators first.
+    safe_denominator = torch.where(
+        parallel, torch.ones_like(denominator), denominator)
+    safe_b_squared = torch.where(
+        b_squared > 0, b_squared, torch.ones_like(b_squared))
+    parameter_a = torch.where(
+        parallel, torch.zeros_like(denominator),
+        (cross_dot * separation_b - b_squared * separation_a)
+        / safe_denominator)
+    parameter_b = torch.where(
+        parallel, separation_b / safe_b_squared,
+        (a_squared * separation_b - cross_dot * separation_a)
+        / safe_denominator)
+    closest_a = reference_a + parameter_a * direction_a
+    closest_b = reference_b + parameter_b * direction_b
+    distance = (closest_a - closest_b).square().sum(dim=1).sqrt()
+    return distance, 0.5 * (closest_a + closest_b)
+
+
+def _transverse_crossing_z_gap(
+    reference_a: torch.Tensor, direction_a: torch.Tensor,
+    reference_b: torch.Tensor, direction_b: torch.Tensor,
+) -> torch.Tensor:
+    """All inputs (M, 3). Returns (M,) |z_a - z_b| where the two transverse
+    projections cross; NaN when they are transversely parallel."""
+    determinant = (direction_a[:, 0] * direction_b[:, 1]
+                   - direction_a[:, 1] * direction_b[:, 0])
+    degenerate = determinant.abs() < 1e-12
+    safe_determinant = torch.where(
+        degenerate, torch.ones_like(determinant), determinant)
+    offset_x = reference_b[:, 0] - reference_a[:, 0]
+    offset_y = reference_b[:, 1] - reference_a[:, 1]
+    parameter_a = (offset_x * direction_b[:, 1]
+                   - offset_y * direction_b[:, 0]) / safe_determinant
+    parameter_b = (offset_x * direction_a[:, 1]
+                   - offset_y * direction_a[:, 0]) / safe_determinant
+    gap = ((reference_a[:, 2] + parameter_a * direction_a[:, 2])
+           - (reference_b[:, 2] + parameter_b * direction_b[:, 2])).abs()
+    return torch.where(degenerate, torch.full_like(gap, float("nan")), gap)
+
+
+def _nan_aware_max(values: torch.Tensor) -> torch.Tensor:
+    """values: (M, K). Returns (M,) max ignoring NaN, NaN where all are NaN."""
+    finite = ~torch.isnan(values)
+    filled = torch.where(finite, values, torch.full_like(values, -float("inf")))
+    maximum = filled.max(dim=1).values
+    return torch.where(finite.any(dim=1), maximum,
+                       torch.full_like(maximum, float("nan")))
+
+
+def _cone_sums(
+    axis_eta: torch.Tensor, axis_phi: torch.Tensor, axis_dz: torch.Tensor,
+    track_eta: torch.Tensor, track_phi: torch.Tensor, track_dz: torch.Tensor,
+    track_pt: torch.Tensor, excluded: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """axis_*: (M,). track_*: (P,). excluded: (M, P) bool or None.
+    Returns (count (M,), sum_pt (M,), min_dr (M,), inside (M, P) bool)."""
+    num_candidates = axis_eta.shape[0]
+    pool_size = track_eta.shape[0]
+    if pool_size == 0:
+        zeros = torch.zeros(num_candidates, device=axis_eta.device)
+        return (zeros, zeros.clone(),
+                torch.full_like(zeros, COMPANION_MIN_DR_SENTINEL),
+                torch.zeros(num_candidates, 0, dtype=torch.bool,
+                            device=axis_eta.device))
+    delta_r = _delta_r_squared(
+        axis_eta.unsqueeze(1), axis_phi.unsqueeze(1),
+        track_eta.unsqueeze(0), track_phi.unsqueeze(0)).sqrt()
+    inside = (delta_r <= CONE_DELTA_R_MAX) & (
+        (axis_dz.unsqueeze(1) - track_dz.unsqueeze(0)).abs() <= CONE_DZ_MAX)
+    if excluded is not None:
+        inside &= ~excluded
+    count = inside.sum(dim=1).float()
+    sum_pt = (track_pt.unsqueeze(0) * inside).sum(dim=1)
+    masked_delta_r = torch.where(
+        inside, delta_r, torch.full_like(delta_r, COMPANION_MIN_DR_SENTINEL))
+    min_delta_r = masked_delta_r.min(dim=1).values
+    return count, sum_pt, min_delta_r, inside
+
+
+def _compute_h6_columns(
+    i: torch.Tensor, j: torch.Tensor, k: torch.Tensor,
+    *, lorentz: torch.Tensor, eta: torch.Tensor, phi: torch.Tensor,
+    dxy_sig: torch.Tensor, h6_inputs: dict,
+) -> torch.Tensor:
+    """i, j, k: (M,) long. Returns (M, 22) in H6_NAMES order."""
+    missing = [key for key in H6_INPUT_KEYS if key not in h6_inputs]
+    if missing:
+        raise ValueError(f"h6_inputs is missing {missing}")
+
+    members = torch.stack([i, j, k], dim=1)
+    reference = torch.stack([h6_inputs["vertex_x"], h6_inputs["vertex_y"],
+                             h6_inputs["vertex_z"]], dim=1)
+    direction = _unit_direction(eta, phi)
+
+    pair_distances, pair_gaps, midpoints = [], [], []
+    for first, second in ((0, 1), (0, 2), (1, 2)):
+        index_a, index_b = members[:, first], members[:, second]
+        distance, midpoint = _closest_approach(
+            reference[index_a], direction[index_a],
+            reference[index_b], direction[index_b])
+        pair_distances.append(distance)
+        midpoints.append(midpoint)
+        pair_gaps.append(_transverse_crossing_z_gap(
+            reference[index_a], direction[index_a],
+            reference[index_b], direction[index_b]))
+    poca = torch.stack(pair_distances, dim=1)
+    vertex_estimate = torch.stack(midpoints, dim=0).mean(dim=0)
+
+    dz_raw = h6_inputs["dz_raw"]
+    member_dz = dz_raw[members]
+    raw_dz_gap_max = (member_dz.unsqueeze(2)
+                      - member_dz.unsqueeze(1)).abs().amax(dim=(1, 2))
+
+    momentum = torch.stack([
+        lorentz[axis][members].sum(dim=1) for axis in range(3)], dim=1)
+    momentum_pt = torch.hypot(momentum[:, 0], momentum[:, 1])
+
+    primary_x = h6_inputs["primary_vertex_x"].reshape(())
+    primary_y = h6_inputs["primary_vertex_y"].reshape(())
+    member_displacement_x = reference[members][:, :, 0] - primary_x
+    member_displacement_y = reference[members][:, :, 1] - primary_y
+    member_projection = (member_displacement_x * momentum[:, 0:1]
+                         + member_displacement_y * momentum[:, 1:2])
+    lifetime_positive_count = (member_projection > 0).sum(dim=1).float()
+    dxy_sig_spread = dxy_sig[members].std(dim=1, unbiased=False)
+
+    # LHCb corrected mass: the triplet mass corrected for the momentum
+    # transverse to the flight direction, which absorbs the unseen neutrino.
+    flight_x = vertex_estimate[:, 0] - primary_x
+    flight_y = vertex_estimate[:, 1] - primary_y
+    flight_pt = torch.hypot(flight_x, flight_y)
+    along_flight = (momentum[:, 0] * flight_x + momentum[:, 1] * flight_y) \
+        / torch.clamp_min(flight_pt, 1e-12)
+    missing_pt = torch.sqrt(torch.clamp_min(
+        momentum_pt ** 2 - along_flight ** 2, 0.0))
+    mass = _mass(lorentz, i, j, k)
+    corrected_mass = torch.sqrt(mass ** 2 + missing_pt ** 2) + missing_pt
+
+    displacement_k_x = reference[k, 0] - primary_x
+    displacement_k_y = reference[k, 1] - primary_y
+    signed_ip_k = dxy_sig[k].abs() * torch.sign(
+        displacement_k_x * momentum[:, 0] + displacement_k_y * momentum[:, 1])
+
+    member_pt = torch.hypot(lorentz[0][members], lorentz[1][members])
+    min_pt_ijk = member_pt.amin(dim=1)
+    scalar_sum_pt_ijk = member_pt.sum(dim=1)
+
+    axis_eta = torch.asinh(momentum[:, 2] / torch.clamp_min(momentum_pt, 1e-12))
+    axis_phi = torch.atan2(momentum[:, 1], momentum[:, 0])
+    axis_dz = member_dz.mean(dim=1)
+
+    pool_pt = torch.hypot(lorentz[0], lorentz[1])
+    pool_index = torch.arange(eta.shape[0], device=eta.device)
+    is_member = (pool_index.view(1, -1) == members.unsqueeze(2)).any(dim=1)
+    kept_count, kept_sum_pt, cone_min_dr, kept_inside = _cone_sums(
+        axis_eta, axis_phi, axis_dz, eta, phi, dz_raw, pool_pt, is_member)
+    n_low_ip_in_cone = (
+        kept_inside & (dxy_sig.abs().unsqueeze(0) <= LOW_IP_SIGNIFICANCE_MAX)
+    ).sum(dim=1).float()
+
+    other_count, other_sum_pt, _, _ = _cone_sums(
+        axis_eta, axis_phi, axis_dz, h6_inputs["other_eta"],
+        h6_inputs["other_phi"], h6_inputs["other_dz"],
+        h6_inputs["other_pt"], None)
+
+    # Secondary vertices are matched by proximity to the reconstructed triplet
+    # vertex, so no slot ordering is involved; "no vertex" is NaN rather than a
+    # sentinel, letting the tree learn a per-split direction for it.
+    sv_x, sv_y, sv_z = h6_inputs["sv_x"], h6_inputs["sv_y"], h6_inputs["sv_z"]
+    num_candidates = i.shape[0]
+    if sv_x.numel() == 0:
+        nan = torch.full((num_candidates,), float("nan"), device=i.device)
+        sv_columns = [nan, nan.clone(), nan.clone(), nan.clone(),
+                      torch.zeros_like(nan), torch.zeros_like(nan)]
+    else:
+        sv_position = torch.stack([sv_x, sv_y, sv_z], dim=1)
+        separation = (vertex_estimate.unsqueeze(1)
+                      - sv_position.unsqueeze(0)).square().sum(dim=2).sqrt()
+        nearest = separation.argmin(dim=1)
+        sv_min_distance = separation.gather(1, nearest.unsqueeze(1)).squeeze(1)
+        sv_flight_x = sv_x[nearest] - primary_x
+        sv_flight_y = sv_y[nearest] - primary_y
+        sv_flight_pt = torch.hypot(sv_flight_x, sv_flight_y)
+        sv_columns = [
+            sv_min_distance,
+            h6_inputs["sv_dlen_sig"][nearest],
+            h6_inputs["sv_mass"][nearest],
+            (sv_flight_x * momentum[:, 0] + sv_flight_y * momentum[:, 1])
+            / torch.clamp_min(sv_flight_pt * momentum_pt, 1e-12),
+            (separation <= SV_MATCH_RADIUS_CM).sum(dim=1).float(),
+            torch.ones(num_candidates, device=i.device),
+        ]
+
+    columns = [
+        poca.amax(dim=1), poca.mean(dim=1), _nan_aware_max(
+            torch.stack(pair_gaps, dim=1)),
+        raw_dz_gap_max, lifetime_positive_count, dxy_sig_spread,
+        corrected_mass, signed_ip_k, min_pt_ijk, scalar_sum_pt_ijk,
+        n_low_ip_in_cone,
+        kept_count, kept_sum_pt, other_count, other_sum_pt, cone_min_dr,
+        *sv_columns,
+    ]
+    return torch.stack(columns, dim=1)
+
 
 def _track16(idx, *, lorentz, charge, eta, phi, dxy_sig, dz, norm_chi2,
              pt_error, n_pixel, dca_sig, cov_phi_phi, cov_lambda_lambda):
@@ -293,10 +557,13 @@ def triplet_feature_columns(
     pt_error: torch.Tensor,
     cov_phi_phi: torch.Tensor,
     cov_lambda_lambda: torch.Tensor,
+    h6_inputs: dict | None = None,
 ) -> torch.Tensor:
     """i, j, k, couple_rank: (M,) long. lorentz: (4, N). per-track inputs: (N,).
+    h6_inputs: optional dict of the H6_INPUT_KEYS arrays.
 
-    Returns (M, 89) features in FEATURE_NAMES order for the given candidates.
+    Returns (M, 89) in FEATURE_NAMES order, or (M, 111) in
+    FEATURE_NAMES_EXTENDED order when h6_inputs is given.
     """
     cr = couple_rank
     dz_ij = (dz[i] - dz[j]).abs()
@@ -333,7 +600,7 @@ def triplet_feature_columns(
     track_kw = dict(lorentz=lorentz, charge=charge, eta=eta, phi=phi, dxy_sig=dxy_sig,
                     dz=dz, norm_chi2=norm_chi2, pt_error=pt_error, n_pixel=n_pixel,
                     dca_sig=dca_sig, cov_phi_phi=cov_phi_phi, cov_lambda_lambda=cov_lambda_lambda)
-    return torch.cat([
+    blocks = [
         torch.stack(columns, dim=1),
         _track16(i, **track_kw),
         _track16(j, **track_kw),
@@ -341,7 +608,12 @@ def triplet_feature_columns(
         _couple_unit(i, j, lorentz=lorentz, charge=charge, eta=eta, phi=phi, dz=dz,
                      dxy_sig=dxy_sig, dca_sig=dca_sig, cov_phi_phi=cov_phi_phi,
                      cov_lambda_lambda=cov_lambda_lambda),
-    ], dim=1)
+    ]
+    if h6_inputs is not None:
+        blocks.append(_compute_h6_columns(
+            i, j, k, lorentz=lorentz, eta=eta, phi=phi, dxy_sig=dxy_sig,
+            h6_inputs=h6_inputs))
+    return torch.cat(blocks, dim=1)
 
 
 def triplet_candidate_features(

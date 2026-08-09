@@ -21,9 +21,13 @@ from utils.triplet_join import (
     triplet_candidate_features,
 )
 try:
-    from scripts.python.build_triplet_filter_table import DUMP, SRC, SRC_COLS
+    # This path scores the legacy 89-feature layout, so it reads only the
+    # track columns those features need — not the H6 block.
+    from scripts.python.build_triplet_filter_table import (
+        DUMP, SRC, TRACK_SRC_COLS as SRC_COLS)
 except ImportError:  # direct-file invocation: scripts/python is sys.path[0]
-    from build_triplet_filter_table import DUMP, SRC, SRC_COLS
+    from build_triplet_filter_table import (
+        DUMP, SRC, TRACK_SRC_COLS as SRC_COLS)
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'models')
 OUT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'low-pt', 'eval', 'triplet_rank')

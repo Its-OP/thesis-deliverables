@@ -38,10 +38,11 @@ def _row_tensor(row: np.ndarray, dtype: type) -> torch.Tensor:
 
 
 class CoupleDumpDataset(torch.utils.data.Dataset):
-    def __init__(self, parquet_paths: list[str]):
+    def __init__(self, parquet_paths: list[str], max_events: int | None = None):
         column_chunks: dict[str, list[np.ndarray]] = {
             name: [] for name in _DUMP_COLUMNS
         }
+        loaded = 0
         for path in parquet_paths:
             # Stream record batches instead of read_table: a whole-file read
             # of a large dump overflows the int32 list offsets ("List index
@@ -50,11 +51,19 @@ class CoupleDumpDataset(torch.utils.data.Dataset):
             parquet_file = pq.ParquetFile(path)
             for record_batch in parquet_file.iter_batches(
                     batch_size=8192, columns=list(_DUMP_COLUMNS)):
+                if max_events is not None:
+                    record_batch = record_batch.slice(
+                        0, max_events - loaded)
                 for name in _DUMP_COLUMNS:
                     column_chunks[name].append(
                         record_batch.column(name).to_numpy(
                             zero_copy_only=False),
                     )
+                loaded += record_batch.num_rows
+                if max_events is not None and loaded >= max_events:
+                    break
+            if max_events is not None and loaded >= max_events:
+                break
         self._columns = {
             name: np.concatenate(chunks)
             for name, chunks in column_chunks.items()

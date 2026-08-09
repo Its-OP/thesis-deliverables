@@ -5,43 +5,155 @@ import glob
 import json
 import os
 
+import joblib
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from tqdm import tqdm
 
-from utils.triplet_join import FEATURE_NAMES, build_track_lorentz, triplet_candidate_features
-from utils.triplet_split import write_split
+from utils.triplet_join import (
+    FEATURE_NAMES,
+    FEATURE_NAMES_EXTENDED,
+    M_TAU_GEV,
+    build_track_lorentz,
+    build_triplet_candidates,
+    triplet_feature_columns,
+)
 
-EVAL_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "low-pt", "eval")
-# VAL = "the eval set": train + held-out for the triplet filter (split 80/20).
-DUMP = os.path.join(EVAL_DIR, "perstage_couples_val.parquet")
-SRC = "/Users/oleh/Projects/masters/part/data/low-pt/val/val_*.parquet"
-# Cascade TEST set — reserved for a future final-performance report; not used by default.
-TEST_DUMP = os.path.join(EVAL_DIR, "stage3_dump_test.parquet")
-TEST_SRC = "/Users/oleh/Downloads/test_dataset_unzipped/test_*.parquet"
-SPLIT_JSON = os.path.join(EVAL_DIR, "triplet_split.json")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "low-pt")
+DUMP_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "dumps")
+EVAL_DIR = os.path.join(DATA_DIR, "eval")
+# Train and eval come from disjoint shard sets, so events never cross sides.
+ROLE_DEFAULTS = {
+    "train": (os.path.join(DUMP_DIR, "perstage_couples_train.parquet"),
+              os.path.join(DATA_DIR, "train", "*.parquet")),
+    "eval": (os.path.join(DUMP_DIR, "perstage_couples_eval.parquet"),
+             os.path.join(DATA_DIR, "eval", "*.parquet")),
+}
 POOL = "P2"
+# Back-compatible aliases for the inference-side builder, which defaults to the
+# eval role.
+DUMP, SRC = ROLE_DEFAULTS["eval"]
 
-SRC_COLS = ["event_n_tracks", "track_pt", "track_eta", "track_phi", "track_charge",
-            "track_dz_significance", "track_dxy_significance", "track_dca_significance",
-            "track_n_valid_pixel_hits", "track_norm_chi2", "track_pt_error",
-            "track_covariance_phi_phi", "track_covariance_lambda_lambda", "track_label_from_tau"]
+TRACK_SRC_COLS = ["event_n_tracks", "track_pt", "track_eta", "track_phi", "track_charge",
+                  "track_dz_significance", "track_dxy_significance", "track_dca_significance",
+                  "track_n_valid_pixel_hits", "track_norm_chi2", "track_pt_error",
+                  "track_covariance_phi_phi", "track_covariance_lambda_lambda",
+                  "track_label_from_tau"]
+# H6 raw inputs: vertex geometry, the raw longitudinal impact parameter, the
+# primary vertex, the secondary-vertex collection and the sub-cutoff companions.
+H6_SRC_COLS = ["track_vertex_x", "track_vertex_y", "track_vertex_z", "track_dz",
+               "event_primary_vertex_x", "event_primary_vertex_y",
+               "sv_x", "sv_y", "sv_z", "sv_dlen_sig", "sv_mass",
+               "other_track_pt", "other_track_eta", "other_track_phi", "other_track_dz"]
+SRC_COLS = TRACK_SRC_COLS + H6_SRC_COLS
 
 
-def _load(dump_path, src_glob, max_events):
-    dump = pq.read_table(dump_path, columns=["stage1_sorted_indices", "stage3_sorted_couples"])
-    src = pa.concat_tables([pq.read_table(s, columns=SRC_COLS) for s in sorted(glob.glob(src_glob))])
-    assert dump.num_rows == src.num_rows, f"row mismatch {dump.num_rows} vs {src.num_rows}"
-    n = dump.num_rows if max_events is None else min(max_events, dump.num_rows)
-    return dump.slice(0, n), src.slice(0, n), n
+def _h6_inputs_for_event(cols, r):
+    """cols: per-column lists over events. Returns the h6_inputs dict for event r."""
+    def track_tensor(key):
+        return torch.tensor(cols[key][r], dtype=torch.float32)
+
+    return dict(
+        vertex_x=track_tensor("track_vertex_x"),
+        vertex_y=track_tensor("track_vertex_y"),
+        vertex_z=track_tensor("track_vertex_z"),
+        dz_raw=track_tensor("track_dz"),
+        primary_vertex_x=torch.tensor(cols["event_primary_vertex_x"][r], dtype=torch.float32),
+        primary_vertex_y=torch.tensor(cols["event_primary_vertex_y"][r], dtype=torch.float32),
+        sv_x=track_tensor("sv_x"),
+        sv_y=track_tensor("sv_y"),
+        sv_z=track_tensor("sv_z"),
+        sv_dlen_sig=track_tensor("sv_dlen_sig"),
+        sv_mass=track_tensor("sv_mass"),
+        other_pt=track_tensor("other_track_pt"),
+        other_eta=track_tensor("other_track_eta"),
+        other_phi=track_tensor("other_track_phi"),
+        other_dz=track_tensor("other_track_dz"),
+    )
 
 
-def _event_features(r, dump_cols, src_cols, top_c):
-    s1, couples_all = dump_cols
-    cols = src_cols
-    assert len(s1[r]) == cols["event_n_tracks"][r]
+def _select_hard_negative_rows(is_gt, scores, hard_top, random_count, gen):
+    """is_gt, scores: (M,) over Tier-H survivors. Returns the top-scoring
+    negatives plus a uniform draw from the rest — the distribution the current
+    filter actually confuses, rather than the easy bulk."""
+    negatives = np.flatnonzero(~is_gt)
+    if len(negatives) == 0:
+        return negatives
+    ranked = negatives[np.argsort(-scores[negatives], kind="stable")]
+    hard = ranked[:hard_top]
+    remainder = ranked[hard_top:]
+    take = min(random_count, len(remainder))
+    sampled = remainder[gen.choice(len(remainder), take, replace=False)] if take else remainder[:0]
+    return np.concatenate([hard, sampled])
+
+
+def _sample_negative_rows(is_gt, couple_row, neg_per_event, neg_mode, gen):
+    """is_gt, couple_row: (M,) over Tier-H survivors. Returns the sampled
+    negative row indices."""
+    negatives = np.flatnonzero(~is_gt)
+    if neg_mode == "uniform":
+        take = min(neg_per_event, len(negatives))
+        return negatives[gen.choice(len(negatives), take, replace=False)] if take else negatives
+    if neg_mode != "per_couple":
+        raise ValueError(f"unknown neg_mode {neg_mode!r}")
+    # Round-robin over the couples that produced the candidates: every couple
+    # contributes one negative before any contributes a second, so the hard
+    # same-couple confusions are represented rather than drowned out by the
+    # couples that happen to survive most often.
+    order = gen.permutation(negatives)
+    per_couple = {}
+    for row in order:
+        per_couple.setdefault(int(couple_row[row]), []).append(int(row))
+    chosen = []
+    groups = [per_couple[key] for key in sorted(per_couple)]
+    depth = 0
+    while len(chosen) < neg_per_event and any(len(g) > depth for g in groups):
+        for group in groups:
+            if len(group) > depth:
+                chosen.append(group[depth])
+                if len(chosen) == neg_per_event:
+                    break
+        depth += 1
+    return np.asarray(chosen, dtype=np.int64)
+
+
+def _shard_blocks(dump_path, src_glob, max_events):
+    """Yields (dump_couples, src_cols, n_events) one source shard at a time so
+    peak memory stays at one shard rather than the whole dataset."""
+    shards = sorted(glob.glob(src_glob))
+    assert shards, f"no source shards matched {src_glob}"
+    dump_file = pq.ParquetFile(dump_path)
+    dump_rows = dump_file.metadata.num_rows
+    src_rows = sum(pq.read_metadata(shard).num_rows for shard in shards)
+    assert dump_rows == src_rows, f"row mismatch {dump_rows} vs {src_rows}"
+
+    # The couples column stays in Arrow (a few hundred MB); only the shard's
+    # own slice is materialized as Python objects.
+    couples_column = pq.read_table(
+        dump_path, columns=["stage3_sorted_couples"])["stage3_sorted_couples"]
+
+    offset, emitted = 0, 0
+    for shard in shards:
+        src = pq.read_table(shard, columns=SRC_COLS)
+        n = src.num_rows
+        if max_events is not None:
+            n = min(n, max_events - emitted)
+            src = src.slice(0, n)
+        src_cols = {name: src[name].to_pylist() for name in SRC_COLS}
+        couples = couples_column.slice(offset, n).to_pylist()
+        yield couples, src_cols, n
+        offset += n
+        emitted += n
+        if max_events is not None and emitted >= max_events:
+            break
+
+
+def _event_candidates(r, couples_all, cols, top_c):
+    """Tier-H enumeration only. Features are computed later for the sampled
+    rows alone — the H6 cone block costs O(candidates x tracks), so
+    featurizing the whole survivor list would dominate the build."""
     n_tracks = cols["event_n_tracks"][r]
     lorentz = build_track_lorentz(torch.tensor(cols["track_pt"][r], dtype=torch.float32),
                                   torch.tensor(cols["track_eta"][r], dtype=torch.float32),
@@ -60,67 +172,106 @@ def _event_features(r, dump_cols, src_cols, top_c):
     gt_set = set(gt.tolist())
     has_gt_couple = any(set(c).issubset(gt_set) for c in couples_np.tolist())
     pool = torch.arange(n_tracks, dtype=torch.long)  # P2: entire input track set
-    pool_set = set(pool.tolist())
-    reconstructable = gt.size == 3 and gt_set.issubset(pool_set) and has_gt_couple
-    gt_sorted = tuple(sorted(gt.tolist())) if reconstructable else None
-    members = sum((int(c[0]) in pool_set) + (int(c[1]) in pool_set) for c in couples_np)
+    reconstructable = gt.size == 3 and gt_set.issubset(set(pool.tolist())) and has_gt_couple
+    members = sum((int(c[0]) < n_tracks) + (int(c[1]) < n_tracks) for c in couples_np.tolist())
     n_full = couples.shape[0] * pool.shape[0] - members
-    X, _, is_gt, _ = triplet_candidate_features(couples, pool, gt_sorted=gt_sorted, **kw)
-    return dict(X=X.numpy(), is_gt=is_gt.numpy(), reconstructable=reconstructable, n_full=n_full)
+
+    triplets, couple_row = build_triplet_candidates(
+        couples, pool, lorentz=lorentz, charge=kw["charge"], eta=kw["eta"],
+        phi=kw["phi"], dz=kw["dz"], charge_gate=True, mass_max=M_TAU_GEV)
+    if reconstructable:
+        target = torch.tensor(sorted(gt.tolist()))
+        is_gt = (triplets.sort(dim=1).values == target).all(dim=1)
+    else:
+        is_gt = torch.zeros(triplets.shape[0], dtype=torch.bool)
+    return dict(triplets=triplets, couple_row=couple_row, is_gt=is_gt.numpy(),
+                kw=kw, reconstructable=reconstructable, n_full=n_full)
 
 
-def _to_table(rows, extra):
-    arrays = {FEATURE_NAMES[c]: pa.array(rows[:, c]) for c in range(len(FEATURE_NAMES))}
+def _featurize(candidates, rows, r, cols, with_h6):
+    """rows: row indices into the candidate list. Returns (len(rows), F)."""
+    if len(rows) == 0:
+        width = len(FEATURE_NAMES_EXTENDED) if with_h6 else len(FEATURE_NAMES)
+        return np.zeros((0, width), dtype=np.float32)
+    selected = torch.as_tensor(np.asarray(rows), dtype=torch.long)
+    triplets = candidates["triplets"][selected]
+    h6_inputs = _h6_inputs_for_event(cols, r) if with_h6 else None
+    columns = triplet_feature_columns(
+        triplets[:, 0], triplets[:, 1], triplets[:, 2],
+        candidates["couple_row"][selected], h6_inputs=h6_inputs,
+        **candidates["kw"])
+    return columns.numpy()
+
+
+def _to_table(rows, extra, with_h6):
+    names = FEATURE_NAMES_EXTENDED if with_h6 else FEATURE_NAMES
+    arrays = {names[c]: pa.array(rows[:, c]) for c in range(len(names))}
     arrays.update(extra)
     return pa.table(arrays)
 
 
-def build_train(dump_cols, src_cols, event_idx, top_c, neg_per_event, gen, out_path):
-    train_rows, train_label = [], []
-    for r in tqdm(event_idx, desc="train"):
-        f = _event_features(int(r), dump_cols, src_cols, top_c)
-        X, is_gt = f["X"], f["is_gt"]
-        pos = X[is_gt]
-        neg_all = X[~is_gt]
-        if len(neg_all):
-            take = min(neg_per_event, len(neg_all))
-            neg = neg_all[gen.choice(len(neg_all), take, replace=False)]
-        else:
-            neg = neg_all
-        for block, lab in ((pos, 1), (neg, 0)):
-            if len(block):
-                train_rows.append(block)
-                train_label.append(np.full(len(block), lab, np.int8))
+def build_train(blocks, top_c, neg_per_event, neg_mode, gen, out_path, with_h6,
+                hard_model=None, hard_top=30):
+    train_rows, train_label, train_event, n_events = [], [], [], 0
+    for couples, cols, n in blocks:
+        for r in tqdm(range(n), desc=f"train (+{n})"):
+            candidates = _event_candidates(r, couples, cols, top_c)
+            is_gt = candidates["is_gt"]
+            positives = np.flatnonzero(is_gt)
+            if neg_mode == "hard":
+                # Legacy features are cheap to compute for the whole survivor
+                # list; only the selected rows pay for the H6 block.
+                all_rows = np.arange(len(is_gt))
+                legacy = _featurize(candidates, all_rows, r, cols, False)
+                scores = hard_model.predict_proba(legacy)[:, 1]
+                negatives = _select_hard_negative_rows(
+                    is_gt, scores, hard_top, neg_per_event - hard_top, gen)
+            else:
+                negatives = _sample_negative_rows(
+                    is_gt, candidates["couple_row"].numpy(), neg_per_event, neg_mode, gen)
+            for rows, label in ((positives, 1), (negatives, 0)):
+                if len(rows):
+                    train_rows.append(_featurize(candidates, rows, r, cols, with_h6))
+                    train_label.append(np.full(len(rows), label, np.int8))
+                    # Event key: grouped CV and per-event ranking metrics both
+                    # need rows from one event to stay together.
+                    train_event.append(np.full(len(rows), n_events + r, np.int32))
+        n_events += n
     rows = np.concatenate(train_rows)
     tbl = _to_table(rows, {"is_gt": pa.array(np.concatenate(train_label)),
-                           "pool": pa.array(np.full(rows.shape[0], POOL))})
+                           "event_index": pa.array(np.concatenate(train_event)),
+                           "pool": pa.array(np.full(rows.shape[0], POOL))}, with_h6)
     pq.write_table(tbl, out_path)
-    print(f"wrote {out_path} ({tbl.num_rows} rows)")
+    print(f"wrote {out_path} ({tbl.num_rows} rows from {n_events} events)")
 
 
-def build_eval(dump_cols, src_cols, event_idx, top_c, subsample, gen, out_path):
+def build_eval(blocks, top_c, subsample, gen, out_path, with_h6):
     gt_rows, gt_pool, sub_rows, sub_w, sub_pool = [], [], [], [], []
-    meta = {POOL: dict(recon=0, n_full=0, n_events=len(event_idx))}
-    for r in tqdm(event_idx, desc="eval"):
-        f = _event_features(int(r), dump_cols, src_cols, top_c)
-        X, is_gt = f["X"], f["is_gt"]
-        if f["reconstructable"]:
-            meta[POOL]["recon"] += 1
-        meta[POOL]["n_full"] += f["n_full"]
-        if f["reconstructable"] and is_gt.any():
-            gt_rows.append(X[is_gt][0])
-            gt_pool.append(POOL)
-        n_h = len(X)
-        if n_h:
-            take = min(subsample, n_h)
-            idx = gen.choice(n_h, take, replace=False)
-            sub_rows.append(X[idx])
-            sub_w.append(np.full(take, n_h / take))
-            sub_pool.append(np.full(take, POOL))
+    meta = {POOL: dict(recon=0, n_full=0, n_events=0)}
+    for couples, cols, n in blocks:
+        for r in tqdm(range(n), desc=f"eval (+{n})"):
+            candidates = _event_candidates(r, couples, cols, top_c)
+            is_gt = candidates["is_gt"]
+            if candidates["reconstructable"]:
+                meta[POOL]["recon"] += 1
+            meta[POOL]["n_full"] += candidates["n_full"]
+            if candidates["reconstructable"] and is_gt.any():
+                gt_rows.append(_featurize(
+                    candidates, np.flatnonzero(is_gt)[:1], r, cols, with_h6)[0])
+                gt_pool.append(POOL)
+            n_h = len(is_gt)
+            if n_h:
+                take = min(subsample, n_h)
+                idx = gen.choice(n_h, take, replace=False)
+                sub_rows.append(_featurize(candidates, idx, r, cols, with_h6))
+                sub_w.append(np.full(take, n_h / take))
+                sub_pool.append(np.full(take, POOL))
+        meta[POOL]["n_events"] += n
 
-    gt_tbl = _to_table(np.stack(gt_rows), {"pool": pa.array(gt_pool)})
+    gt_tbl = _to_table(np.stack(gt_rows), {"pool": pa.array(gt_pool)}, with_h6)
     sub_tbl = _to_table(np.concatenate(sub_rows),
-                        {"weight": pa.array(np.concatenate(sub_w)), "pool": pa.array(np.concatenate(sub_pool))})
+                        {"weight": pa.array(np.concatenate(sub_w)),
+                         "pool": pa.array(np.concatenate(sub_pool))}, with_h6)
     pq.write_table(gt_tbl, out_path.replace(".parquet", "_gt.parquet"))
     pq.write_table(sub_tbl, out_path.replace(".parquet", "_sub.parquet"))
     with open(out_path.replace(".parquet", "_meta.json"), "w") as fh:
@@ -131,31 +282,47 @@ def build_eval(dump_cols, src_cols, event_idx, top_c, subsample, gen, out_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dump", default=DUMP, help="cascade dump (default: VAL)")
-    ap.add_argument("--src-glob", default=SRC, help="per-track source parquet glob (default: VAL)")
+    ap.add_argument("--role", choices=sorted(ROLE_DEFAULTS), required=True,
+                    help="train builds the classifier table; eval builds the "
+                         "gt/sub frontier tables from the held-out shards")
+    ap.add_argument("--dump", default=None, help="per-stage couples dump (default: by role)")
+    ap.add_argument("--src-glob", default=None, help="per-track source parquet glob (default: by role)")
     ap.add_argument("--top-c", type=int, default=100)
     ap.add_argument("--max-events", type=int, default=None)
     ap.add_argument("--neg-per-event", type=int, default=80)
+    ap.add_argument("--neg-mode", choices=("uniform", "per_couple", "hard"), default="uniform")
+    ap.add_argument("--hard-model", default=os.path.join(
+        os.path.dirname(__file__), "..", "..", "models",
+        "third_pion_filter_gbdt_full_P2.joblib"),
+        help="miner for --neg-mode hard: scores the survivor list on the "
+             "legacy 89 features and the top ones become negatives")
+    ap.add_argument("--hard-top", type=int, default=30)
     ap.add_argument("--subsample", type=int, default=100)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--frac-train", type=float, default=0.8)
+    ap.add_argument("--no-h6", action="store_true", help="emit the legacy 89 columns only")
     ap.add_argument("--out-dir", default=EVAL_DIR)
-    ap.add_argument("--split-json", default=SPLIT_JSON)
+    ap.add_argument("--out-name", default=None)
     args = ap.parse_args()
 
-    dump, src, n = _load(args.dump, args.src_glob, args.max_events)
-    train_idx, test_idx = write_split(args.split_json, n, frac_train=args.frac_train, seed=args.seed)
-    print(f"split: {n} events -> {len(train_idx)} train / {len(test_idx)} test "
-          f"(seed {args.seed}) -> {args.split_json}")
-
-    dump_cols = (dump["stage1_sorted_indices"].to_pylist(), dump["stage3_sorted_couples"].to_pylist())
-    src_cols = {c: src[c].to_pylist() for c in SRC_COLS}
+    default_dump, default_src = ROLE_DEFAULTS[args.role]
+    dump_path = args.dump or default_dump
+    src_glob = args.src_glob or default_src
+    with_h6 = not args.no_h6
     gen = np.random.default_rng(args.seed)
+    blocks = _shard_blocks(dump_path, src_glob, args.max_events)
+    print(f"role={args.role} dump={dump_path} src={src_glob} "
+          f"neg_mode={args.neg_mode} h6={with_h6}")
 
-    build_train(dump_cols, src_cols, train_idx, args.top_c, args.neg_per_event, gen,
-                os.path.join(args.out_dir, "triplet_filter_train.parquet"))
-    build_eval(dump_cols, src_cols, test_idx, args.top_c, args.subsample, gen,
-               os.path.join(args.out_dir, "triplet_filter_eval.parquet"))
+    if args.role == "train":
+        out_name = args.out_name or f"triplet_filter_train_{args.neg_mode}.parquet"
+        hard_model = joblib.load(args.hard_model) if args.neg_mode == "hard" else None
+        build_train(blocks, args.top_c, args.neg_per_event, args.neg_mode, gen,
+                    os.path.join(args.out_dir, out_name), with_h6,
+                    hard_model=hard_model, hard_top=args.hard_top)
+    else:
+        out_name = args.out_name or "triplet_filter_eval.parquet"
+        build_eval(blocks, args.top_c, args.subsample, gen,
+                   os.path.join(args.out_dir, out_name), with_h6)
 
 
 if __name__ == "__main__":
