@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import torch
 
 from scripts.python.build_triplet_filter_table import (
+    IDENTITY_COLS,
     SRC_COLS,
+    assert_dump_aligned,
+    dump_row_order,
+    identity_keys,
     _h6_inputs_for_event,
     _sample_negative_rows,
     _select_hard_negative_rows,
@@ -181,6 +186,66 @@ def test_parallel_build_matches_the_serial_build():
             assert np.allclose(serial, parallel, equal_nan=True), name
         else:
             assert (serial == parallel).all(), name
+
+
+def _identity_table(keys):
+    columns = {name: [key[index] for key in keys]
+               for index, name in enumerate(IDENTITY_COLS)}
+    return pa.table(columns)
+
+
+def test_identity_keys_reads_all_five_columns():
+    keys = [(1, 10, 100, 9, 1), (1, 10, 100, 9, 2)]
+    assert identity_keys(_identity_table(keys)) == keys
+
+
+def test_dump_row_order_inverts_a_permuted_dump():
+    source = [(1, 10, 100, 9, index) for index in range(5)]
+    permuted = [source[index] for index in (3, 0, 4, 1, 2)]
+    order = dump_row_order(permuted, source)
+    assert [permuted[index] for index in order] == source
+
+
+def test_dump_row_order_is_identity_for_an_aligned_dump():
+    source = [(1, 10, 100, 9, index) for index in range(4)]
+    assert dump_row_order(source, source).tolist() == [0, 1, 2, 3]
+
+
+def test_dump_row_order_rejects_a_duplicated_key():
+    duplicated = [(1, 10, 100, 9, 1), (1, 10, 100, 9, 1)]
+    with pytest.raises(ValueError, match='duplicate identity key'):
+        dump_row_order(duplicated, duplicated)
+
+
+def test_dump_row_order_rejects_a_dump_missing_source_events():
+    source = [(1, 10, 100, 9, index) for index in range(3)]
+    with pytest.raises(ValueError, match='absent from the dump'):
+        dump_row_order(source[:2], source)
+
+
+def test_identity_columns_are_the_documented_five():
+    assert IDENTITY_COLS == ['event_run', 'event_id', 'event_luminosity_block',
+                             'source_batch_id', 'source_microbatch_id']
+
+
+def test_alignment_guard_accepts_an_aligned_dump():
+    couples = [[[0, 1], [2, 3]], [[0, 4]]]
+    assert assert_dump_aligned(couples, [5, 5]) == 2
+
+
+def test_alignment_guard_rejects_an_out_of_range_track_index():
+    couples = [[[0, 1]], [[3, 630]]]
+    with pytest.raises(ValueError, match="not aligned"):
+        assert_dump_aligned(couples, [5, 474])
+
+
+def test_alignment_guard_skips_events_without_couples():
+    assert assert_dump_aligned([[], [[0, 1]]], [5, 5]) == 1
+
+
+def test_alignment_guard_stops_after_the_sample():
+    couples = [[[0, 1]]] * 10 + [[[999, 1000]]]
+    assert assert_dump_aligned(couples, [5] * 10 + [5], sample=10) == 10
 
 
 def test_unknown_negative_mode_is_rejected():

@@ -120,6 +120,62 @@ def _sample_negative_rows(is_gt, couple_row, neg_per_event, neg_mode, gen):
     return np.asarray(chosen, dtype=np.int64)
 
 
+IDENTITY_COLS = ["event_run", "event_id", "event_luminosity_block",
+                 "source_batch_id", "source_microbatch_id"]
+
+
+def identity_keys(table):
+    """table: arrow table carrying IDENTITY_COLS. Returns the per-row key tuples.
+    (run, id, lumi) alone collides heavily — 1,019 distinct values over 67,500
+    events — but the two source_* columns travel with the data from the
+    original parquets and make the 5-tuple unique."""
+    columns = [np.asarray(table.column(name)).tolist() for name in IDENTITY_COLS]
+    return list(zip(*columns))
+
+
+def dump_row_order(dump_keys, source_keys):
+    """Returns, for each source row in order, the dump row describing the same
+    event. Dumps written with several loader workers are permuted relative to
+    the shards, and this is what puts them back."""
+    position = {}
+    for index, key in enumerate(dump_keys):
+        if key in position:
+            raise ValueError(
+                f"duplicate identity key in the dump: {key}. The 5-column key "
+                "must be unique for the reorder to be well defined.")
+        position[key] = index
+    missing = [key for key in source_keys if key not in position]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} source events are absent from the dump, e.g. "
+            f"{missing[0]}. The dump and the shards describe different sets.")
+    return np.array([position[key] for key in source_keys], dtype=np.int64)
+
+
+def assert_dump_aligned(couples, n_tracks, sample=512):
+    """Couples carry original track indices, so an index at or beyond the
+    event's track count proves the dump row and the source row describe
+    different events. Dumps written with several loader workers interleave
+    shards and are silently misordered, which this catches at the first shard
+    instead of thousands of events later."""
+    checked = 0
+    for row in range(min(sample, len(couples))):
+        event_couples = couples[row]
+        if not event_couples:
+            continue
+        highest = max(max(pair) for pair in event_couples)
+        if highest >= n_tracks[row]:
+            raise ValueError(
+                f"dump is not aligned with the source shards: row {row} "
+                f"references track {highest} in an event with "
+                f"{n_tracks[row]} tracks. Regenerate the per-stage dump with "
+                f"--num-workers 0; several loader workers interleave shards "
+                f"and the (run, id, lumi) key is not unique enough to "
+                f"restore the order.")
+        checked += 1
+    return checked
+
+
 def _shard_blocks(dump_path, src_glob, max_events):
     """Yields (dump_couples, src_cols, n_events) one source shard at a time so
     peak memory stays at one shard rather than the whole dataset."""
@@ -130,22 +186,25 @@ def _shard_blocks(dump_path, src_glob, max_events):
     src_rows = sum(pq.read_metadata(shard).num_rows for shard in shards)
     assert dump_rows == src_rows, f"row mismatch {dump_rows} vs {src_rows}"
 
-    # The couples column stays in Arrow (a few hundred MB); only the shard's
-    # own slice is materialized as Python objects.
-    couples_column = pq.read_table(
-        dump_path, columns=["stage3_sorted_couples"])["stage3_sorted_couples"]
+    # The dump stays in Arrow (a few hundred MB); each shard takes only the
+    # rows describing its own events, matched on the 5-column identity key
+    # rather than on position.
+    dump_table = pq.read_table(
+        dump_path, columns=IDENTITY_COLS + ["stage3_sorted_couples"])
+    dump_keys = identity_keys(dump_table)
 
-    offset, emitted = 0, 0
+    emitted = 0
     for shard in shards:
-        src = pq.read_table(shard, columns=SRC_COLS)
+        src = pq.read_table(shard, columns=SRC_COLS + IDENTITY_COLS)
         n = src.num_rows
         if max_events is not None:
             n = min(n, max_events - emitted)
             src = src.slice(0, n)
         src_cols = {name: src[name].to_pylist() for name in SRC_COLS}
-        couples = couples_column.slice(offset, n).to_pylist()
+        order = dump_row_order(dump_keys, identity_keys(src))
+        couples = dump_table.take(order)["stage3_sorted_couples"].to_pylist()
+        assert_dump_aligned(couples, src_cols["event_n_tracks"])
         yield couples, src_cols, n
-        offset += n
         emitted += n
         if max_events is not None and emitted >= max_events:
             break
