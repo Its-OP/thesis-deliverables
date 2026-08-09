@@ -3,7 +3,68 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from scripts.python.eval_triplet_filter_ranking import K_VALUES, deduped_gt_rank
+from scripts.python.eval_triplet_filter_ranking import (
+    K_VALUES,
+    deduped_gt_rank,
+    feature_columns_for_width,
+    use_cpu_inference,
+)
+from scripts.python.probe_triplet_features import FEATURE_SETS
+from utils.triplet_join import FEATURE_NAMES_EXTENDED
+
+
+def test_each_trained_width_maps_back_to_its_feature_set():
+    for name, names in FEATURE_SETS.items():
+        resolved, columns, with_h6 = feature_columns_for_width(len(names))
+        assert resolved == name
+        assert [FEATURE_NAMES_EXTENDED[index] for index in columns] == names
+        assert with_h6 == (len(names) > 89)
+
+
+def test_an_unknown_width_is_rejected():
+    with pytest.raises(ValueError, match='no feature set'):
+        feature_columns_for_width(77)
+
+
+def test_selected_columns_are_positions_in_the_extended_layout():
+    _, columns, _ = feature_columns_for_width(len(FEATURE_SETS['vertex']))
+    assert len(columns) == 95
+    assert columns.max() < len(FEATURE_NAMES_EXTENDED)
+
+
+class _Booster:
+    def __init__(self):
+        self.params = {}
+
+    def set_param(self, params):
+        self.params.update(params)
+
+
+class _GpuModel:
+    def __init__(self):
+        self._booster = _Booster()
+        self.device = 'cuda'
+
+    def get_booster(self):
+        return self._booster
+
+    def set_params(self, **kwargs):
+        self.device = kwargs.get('device', self.device)
+
+
+def test_gpu_models_are_switched_to_cpu_for_forked_inference():
+    model = _GpuModel()
+    use_cpu_inference(model)
+    assert model.device == 'cpu'
+    assert model.get_booster().params['device'] == 'cpu'
+
+
+def test_estimators_without_a_device_are_left_alone():
+    class _Plain:
+        pass
+
+    plain = _Plain()
+    assert use_cpu_inference(plain) is plain
 
 
 def test_rank_is_zero_when_the_truth_scores_highest():

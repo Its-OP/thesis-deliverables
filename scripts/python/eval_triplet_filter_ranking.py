@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from scripts.python.probe_triplet_features import FEATURE_SETS
 from scripts.python.build_triplet_filter_table import (
     ROLE_DEFAULTS,
     _event_candidates,
@@ -15,7 +16,7 @@ from scripts.python.build_triplet_filter_table import (
     _worker_pool,
     _WORKER_STATE,
 )
-from utils.triplet_join import FEATURE_NAMES, FEATURE_NAMES_EXTENDED
+from utils.triplet_join import FEATURE_NAMES, FEATURE_NAMES_EXTENDED  # noqa: F401
 
 K_VALUES = (1, 5, 10, 20, 50, 100)
 
@@ -40,7 +41,30 @@ def deduped_gt_rank(scores, is_gt, triplets):
     return None
 
 
-def _rank_for_event(r, couples, cols, top_c, model, with_h6):
+def feature_columns_for_width(width):
+    """The sweep trains on named subsets of the extended layout, so a model's
+    own input width identifies which columns it expects."""
+    for name, names in FEATURE_SETS.items():
+        if len(names) == width:
+            indices = [FEATURE_NAMES_EXTENDED.index(entry) for entry in names]
+            return name, np.asarray(indices), width > len(FEATURE_NAMES)
+    raise ValueError(
+        f"no feature set has {width} columns; known widths are "
+        f"{sorted(len(names) for names in FEATURE_SETS.values())}")
+
+
+def use_cpu_inference(model):
+    """XGBoost boosters trained on the GPU keep device='cuda', and CUDA cannot
+    be initialized in a forked worker. Inference is cheap on CPU."""
+    try:
+        model.get_booster().set_param({"device": "cpu"})
+        model.set_params(device="cpu")
+    except AttributeError:
+        pass  # sklearn estimators have no device to set
+    return model
+
+
+def _rank_for_event(r, couples, cols, top_c, model, with_h6, columns=None):
     candidates = _event_candidates(r, couples, cols, top_c)
     is_gt = candidates["is_gt"]
     n_candidates = len(is_gt)
@@ -48,6 +72,8 @@ def _rank_for_event(r, couples, cols, top_c, model, with_h6):
         return dict(rank=None, n_candidates=0,
                     reconstructable=candidates["reconstructable"])
     features = _featurize(candidates, np.arange(n_candidates), r, cols, with_h6)
+    if columns is not None:
+        features = features[:, columns]
     scores = model.predict_proba(features)[:, 1]
     triplets = candidates["triplets"].numpy()
     return dict(rank=deduped_gt_rank(scores, is_gt, triplets),
@@ -58,24 +84,27 @@ def _rank_for_event(r, couples, cols, top_c, model, with_h6):
 def _worker_rank(r):
     state = _WORKER_STATE
     return _rank_for_event(r, state["couples"], state["cols"], state["top_c"],
-                           state["model"], state["with_h6"])
+                           state["model"], state["with_h6"], state["columns"])
 
 
 def evaluate(dump_path, src_glob, model, *, top_c=100, max_events=None,
              workers=0):
-    with_h6 = getattr(model, "n_features_in_", len(FEATURE_NAMES)) > len(FEATURE_NAMES)
+    width = int(getattr(model, "n_features_in_", len(FEATURE_NAMES)))
+    feature_set, columns, with_h6 = feature_columns_for_width(width)
+    use_cpu_inference(model)
+    print(f'feature set {feature_set} ({width} columns), h6={with_h6}')
     results = []
     for couples, cols, n in _shard_blocks(dump_path, src_glob, max_events):
         if workers > 1:
             state = dict(couples=couples, cols=cols, top_c=top_c, model=model,
-                         with_h6=with_h6)
+                         with_h6=with_h6, columns=columns)
             with _worker_pool(workers, state) as pool:
                 results.extend(tqdm(
                     pool.imap(_worker_rank, range(n), chunksize=8), total=n,
                     desc=f"rank x{workers} (+{n})"))
         else:
             results.extend(
-                _rank_for_event(r, couples, cols, top_c, model, with_h6)
+                _rank_for_event(r, couples, cols, top_c, model, with_h6, columns)
                 for r in tqdm(range(n), desc=f"rank (+{n})"))
 
     n_events = len(results)
@@ -86,7 +115,8 @@ def evaluate(dump_path, src_glob, model, *, top_c=100, max_events=None,
                for k in K_VALUES}
     metrics.update(
         n_events=n_events,
-        n_features=int(getattr(model, "n_features_in_", -1)),
+        n_features=width,
+        feature_set=feature_set,
         with_h6=bool(with_h6),
         reconstructable=sum(1 for e in results if e["reconstructable"]) / n_events,
         gt_in_list=len(found) / n_events,
