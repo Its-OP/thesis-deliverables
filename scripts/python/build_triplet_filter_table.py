@@ -5,6 +5,7 @@ import glob
 import json
 import multiprocessing as mp
 import os
+import sys
 
 import joblib
 import numpy as np
@@ -273,14 +274,20 @@ def _to_table(rows, extra, with_h6):
 _WORKER_STATE = {}
 
 
-def _worker_init(couples, cols, top_c, neg_per_event, neg_mode, with_h6,
-                 hard_model, hard_top, seed):
-    # fork shares the shard columns copy-on-write, so workers do not each
-    # materialize their own copy of the event table.
-    _WORKER_STATE.update(
-        couples=couples, cols=cols, top_c=top_c, neg_per_event=neg_per_event,
-        neg_mode=neg_mode, with_h6=with_h6, hard_model=hard_model,
-        hard_top=hard_top, seed=seed)
+def _worker_init(state):
+    _WORKER_STATE.clear()
+    _WORKER_STATE.update(state)
+
+
+def _worker_pool(workers, state):
+    """A shard's columns are ~1.5 GB of Python lists. Passing them through
+    initargs pickles that to every worker, which costs more than the work
+    itself; under fork the children inherit them for free instead."""
+    if sys.platform.startswith("linux"):
+        _worker_init(state)
+        return mp.get_context("fork").Pool(workers)
+    return mp.get_context().Pool(
+        workers, initializer=_worker_init, initargs=(state,))
 
 
 def _build_train_event(r):
@@ -322,10 +329,11 @@ def build_train(blocks, top_c, neg_per_event, neg_mode, gen, out_path, with_h6,
     train_rows, train_label, train_event, n_events = [], [], [], 0
     for couples, cols, n in blocks:
         if workers > 1:
-            with mp.Pool(workers, initializer=_worker_init,
-                         initargs=(couples, cols, top_c, neg_per_event,
-                                   neg_mode, with_h6, hard_model, hard_top,
-                                   seed)) as pool:
+            state = dict(couples=couples, cols=cols, top_c=top_c,
+                         neg_per_event=neg_per_event, neg_mode=neg_mode,
+                         with_h6=with_h6, hard_model=hard_model,
+                         hard_top=hard_top, seed=seed)
+            with _worker_pool(workers, state) as pool:
                 per_event = list(tqdm(
                     pool.imap(_build_train_event, range(n), chunksize=16),
                     total=n, desc=f"train x{workers} (+{n})"))
