@@ -348,6 +348,7 @@ def build_train(blocks, top_c, neg_per_event, neg_mode, gen, out_path, with_h6,
     tbl = _to_table(rows, {"is_gt": pa.array(np.concatenate(train_label)),
                            "event_index": pa.array(np.concatenate(train_event)),
                            "pool": pa.array(np.full(rows.shape[0], POOL))}, with_h6)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     pq.write_table(tbl, out_path)
     print(f"wrote {out_path} ({tbl.num_rows} rows from {n_events} events)")
 
@@ -379,6 +380,7 @@ def build_eval(blocks, top_c, subsample, gen, out_path, with_h6):
     sub_tbl = _to_table(np.concatenate(sub_rows),
                         {"weight": pa.array(np.concatenate(sub_w)),
                          "pool": pa.array(np.concatenate(sub_pool))}, with_h6)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     pq.write_table(gt_tbl, out_path.replace(".parquet", "_gt.parquet"))
     pq.write_table(sub_tbl, out_path.replace(".parquet", "_sub.parquet"))
     with open(out_path.replace(".parquet", "_meta.json"), "w") as fh:
