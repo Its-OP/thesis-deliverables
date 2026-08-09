@@ -5,5 +5,8 @@ pyarrow>=15
 PyYAML>=6.0
 tqdm>=4.66
 matplotlib>=3.8
-scikit-learn>=1.4
+# 1.8.0 exactly: the third-pion filter joblibs were pickled with it and newer
+# releases fail to unpickle them.
+scikit-learn==1.8.0
 joblib>=1.3
+xgboost>=2.1

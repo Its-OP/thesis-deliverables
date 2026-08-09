@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import multiprocessing as mp
 import os
 
 import joblib
@@ -210,32 +211,79 @@ def _to_table(rows, extra, with_h6):
     return pa.table(arrays)
 
 
+_WORKER_STATE = {}
+
+
+def _worker_init(couples, cols, top_c, neg_per_event, neg_mode, with_h6,
+                 hard_model, hard_top, seed):
+    # fork shares the shard columns copy-on-write, so workers do not each
+    # materialize their own copy of the event table.
+    _WORKER_STATE.update(
+        couples=couples, cols=cols, top_c=top_c, neg_per_event=neg_per_event,
+        neg_mode=neg_mode, with_h6=with_h6, hard_model=hard_model,
+        hard_top=hard_top, seed=seed)
+
+
+def _build_train_event(r):
+    state = _WORKER_STATE
+    # Per-event seeding keeps the sampling reproducible and independent of how
+    # the work is distributed over workers.
+    gen = np.random.default_rng((state["seed"], r))
+    return _train_rows_for_event(
+        r, state["couples"], state["cols"], state["top_c"],
+        state["neg_per_event"], state["neg_mode"], gen, state["with_h6"],
+        state["hard_model"], state["hard_top"])
+
+
+def _train_rows_for_event(r, couples, cols, top_c, neg_per_event, neg_mode,
+                          gen, with_h6, hard_model, hard_top):
+    candidates = _event_candidates(r, couples, cols, top_c)
+    is_gt = candidates["is_gt"]
+    positives = np.flatnonzero(is_gt)
+    if neg_mode == "hard":
+        # Legacy features are cheap to compute for the whole survivor list;
+        # only the selected rows pay for the H6 block.
+        legacy = _featurize(candidates, np.arange(len(is_gt)), r, cols, False)
+        scores = hard_model.predict_proba(legacy)[:, 1]
+        negatives = _select_hard_negative_rows(
+            is_gt, scores, hard_top, neg_per_event - hard_top, gen)
+    else:
+        negatives = _sample_negative_rows(
+            is_gt, candidates["couple_row"].numpy(), neg_per_event, neg_mode, gen)
+    blocks = []
+    for rows, label in ((positives, 1), (negatives, 0)):
+        if len(rows):
+            blocks.append((_featurize(candidates, rows, r, cols, with_h6),
+                           np.full(len(rows), label, np.int8)))
+    return blocks
+
+
 def build_train(blocks, top_c, neg_per_event, neg_mode, gen, out_path, with_h6,
-                hard_model=None, hard_top=30):
+                hard_model=None, hard_top=30, workers=0, seed=0):
     train_rows, train_label, train_event, n_events = [], [], [], 0
     for couples, cols, n in blocks:
-        for r in tqdm(range(n), desc=f"train (+{n})"):
-            candidates = _event_candidates(r, couples, cols, top_c)
-            is_gt = candidates["is_gt"]
-            positives = np.flatnonzero(is_gt)
-            if neg_mode == "hard":
-                # Legacy features are cheap to compute for the whole survivor
-                # list; only the selected rows pay for the H6 block.
-                all_rows = np.arange(len(is_gt))
-                legacy = _featurize(candidates, all_rows, r, cols, False)
-                scores = hard_model.predict_proba(legacy)[:, 1]
-                negatives = _select_hard_negative_rows(
-                    is_gt, scores, hard_top, neg_per_event - hard_top, gen)
-            else:
-                negatives = _sample_negative_rows(
-                    is_gt, candidates["couple_row"].numpy(), neg_per_event, neg_mode, gen)
-            for rows, label in ((positives, 1), (negatives, 0)):
-                if len(rows):
-                    train_rows.append(_featurize(candidates, rows, r, cols, with_h6))
-                    train_label.append(np.full(len(rows), label, np.int8))
-                    # Event key: grouped CV and per-event ranking metrics both
-                    # need rows from one event to stay together.
-                    train_event.append(np.full(len(rows), n_events + r, np.int32))
+        if workers > 1:
+            with mp.Pool(workers, initializer=_worker_init,
+                         initargs=(couples, cols, top_c, neg_per_event,
+                                   neg_mode, with_h6, hard_model, hard_top,
+                                   seed)) as pool:
+                per_event = list(tqdm(
+                    pool.imap(_build_train_event, range(n), chunksize=16),
+                    total=n, desc=f"train x{workers} (+{n})"))
+        else:
+            per_event = [
+                _train_rows_for_event(
+                    r, couples, cols, top_c, neg_per_event, neg_mode,
+                    np.random.default_rng((seed, r)), with_h6, hard_model,
+                    hard_top)
+                for r in tqdm(range(n), desc=f"train (+{n})")]
+        for r, event_blocks in enumerate(per_event):
+            for features, labels in event_blocks:
+                train_rows.append(features)
+                train_label.append(labels)
+                # Event key: grouped CV and per-event ranking metrics both
+                # need rows from one event to stay together.
+                train_event.append(np.full(len(labels), n_events + r, np.int32))
         n_events += n
     rows = np.concatenate(train_rows)
     tbl = _to_table(rows, {"is_gt": pa.array(np.concatenate(train_label)),
@@ -297,6 +345,8 @@ def main():
         help="miner for --neg-mode hard: scores the survivor list on the "
              "legacy 89 features and the top ones become negatives")
     ap.add_argument("--hard-top", type=int, default=30)
+    ap.add_argument("--workers", type=int, default=0,
+                    help="processes over events within a shard (0/1 = serial)")
     ap.add_argument("--subsample", type=int, default=100)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-h6", action="store_true", help="emit the legacy 89 columns only")
@@ -318,7 +368,8 @@ def main():
         hard_model = joblib.load(args.hard_model) if args.neg_mode == "hard" else None
         build_train(blocks, args.top_c, args.neg_per_event, args.neg_mode, gen,
                     os.path.join(args.out_dir, out_name), with_h6,
-                    hard_model=hard_model, hard_top=args.hard_top)
+                    hard_model=hard_model, hard_top=args.hard_top,
+                    workers=args.workers, seed=args.seed)
     else:
         out_name = args.out_name or "triplet_filter_eval.parquet"
         build_eval(blocks, args.top_c, args.subsample, gen,

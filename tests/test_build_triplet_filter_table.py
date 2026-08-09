@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -146,6 +147,40 @@ def test_hard_mode_never_returns_the_positive_rows():
         is_gt, scores, hard_top=5, random_count=5,
         gen=np.random.default_rng(0))
     assert not is_gt[rows].any()
+
+
+def test_parallel_build_matches_the_serial_build():
+    """Workers must change only the wall clock: per-event seeding makes the
+    sampling independent of how events are distributed over processes."""
+    import glob
+    import os
+
+    from scripts.python.build_triplet_filter_table import _shard_blocks, build_train
+
+    root = os.path.join(os.path.dirname(__file__), '..')
+    dump = os.path.join(root, 'data', 'dumps', 'couples_k125_dump.parquet')
+    shards = sorted(glob.glob(os.path.join(root, 'data', 'low-pt', 'eval', '*.parquet')))
+    if not (os.path.exists(dump) and shards):
+        pytest.skip('eval dump or shards not present')
+
+    outputs = {}
+    for workers in (0, 3):
+        blocks = _shard_blocks(dump, os.path.join(root, 'data', 'low-pt', 'eval', '*.parquet'), 24)
+        path = os.path.join(
+            os.path.dirname(__file__), f'_parallel_probe_{workers}.parquet')
+        build_train(blocks, 100, 20, 'uniform', np.random.default_rng(0), path,
+                    True, workers=workers, seed=0)
+        outputs[workers] = pq.read_table(path)
+        os.remove(path)
+
+    assert outputs[0].num_rows == outputs[3].num_rows
+    for name in outputs[0].schema.names:
+        serial = np.asarray(outputs[0].column(name))
+        parallel = np.asarray(outputs[3].column(name))
+        if serial.dtype.kind == 'f':
+            assert np.allclose(serial, parallel, equal_nan=True), name
+        else:
+            assert (serial == parallel).all(), name
 
 
 def test_unknown_negative_mode_is_rejected():

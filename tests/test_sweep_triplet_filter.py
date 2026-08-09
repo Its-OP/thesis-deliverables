@@ -10,7 +10,9 @@ from scripts.python.sweep_triplet_filter import (
     REFINEMENT_GRID,
     arm_name,
     block_permutation_importance,
+    build_estimator,
     enumerate_arms,
+    xgboost_parameters,
 )
 from utils.triplet_join import (
     H6_ISOLATION_NAMES,
@@ -60,6 +62,34 @@ def test_attribution_blocks_cover_the_h6_groups_without_overlap():
     assert sorted(covered) == sorted(
         H6_VERTEX_NAMES + H6_PHYSICS_NAMES + H6_ISOLATION_NAMES + H6_SV_NAMES)
     assert len(set(covered)) == len(covered)
+
+
+def test_xgboost_translation_maps_the_sklearn_arguments():
+    params = dict(max_leaf_nodes=63, max_depth=8, learning_rate=0.05,
+                  max_iter=400, min_samples_leaf=100)
+    translated = xgboost_parameters(params, None, 100, 900)
+    assert translated['max_leaves'] == 63
+    assert translated['n_estimators'] == 400
+    assert translated['learning_rate'] == 0.05
+    assert translated['min_child_weight'] == 100
+    assert translated['device'] == 'cuda'
+    assert translated['grow_policy'] == 'lossguide'
+    assert 'scale_pos_weight' not in translated
+
+
+def test_balanced_class_weight_becomes_scale_pos_weight():
+    translated = xgboost_parameters(dict(), 'balanced', 100, 900)
+    assert translated['scale_pos_weight'] == pytest.approx(9.0)
+
+
+def test_scale_pos_weight_survives_an_empty_positive_class():
+    translated = xgboost_parameters(dict(), 'balanced', 0, 500)
+    assert translated['scale_pos_weight'] == pytest.approx(500.0)
+
+
+def test_unknown_backend_is_rejected():
+    with pytest.raises(ValueError, match='backend'):
+        build_estimator('lightgbm', dict(), None, np.array([0.0, 1.0]))
 
 
 class _SignalModel:

@@ -45,6 +45,39 @@ ATTRIBUTION_BLOCKS = {
 }
 
 
+def xgboost_parameters(params, class_weight, positive_count, negative_count):
+    """Translates the sklearn HistGradientBoosting arguments this project uses
+    into their XGBoost equivalents. `class_weight='balanced'` becomes
+    scale_pos_weight, which is the same reweighting expressed per class."""
+    translated = dict(
+        tree_method="hist", grow_policy="lossguide", device="cuda",
+        max_leaves=params.get("max_leaf_nodes", 31),
+        max_depth=params.get("max_depth", 0),
+        learning_rate=params.get("learning_rate", 0.1),
+        n_estimators=params.get("max_iter", 200),
+        min_child_weight=params.get("min_samples_leaf", 20),
+        reg_lambda=params.get("l2_regularization", 0.0),
+        random_state=0,
+    )
+    if class_weight == "balanced":
+        translated["scale_pos_weight"] = (
+            negative_count / max(positive_count, 1))
+    return translated
+
+
+def build_estimator(backend, params, class_weight, labels):
+    if backend == "sklearn":
+        return HistGradientBoostingClassifier(
+            class_weight=class_weight, random_state=0, **params)
+    if backend != "xgboost":
+        raise ValueError(f"unknown backend {backend!r}")
+    from xgboost import XGBClassifier
+    positive_count = int((labels > 0.5).sum())
+    negative_count = int((labels <= 0.5).sum())
+    return XGBClassifier(**xgboost_parameters(
+        params, class_weight, positive_count, negative_count))
+
+
 def enumerate_arms(feature_sets, neg_modes, class_weights, refine=False):
     """Returns the list of arm dicts the sweep will fit, in a stable order."""
     arms = []
@@ -70,17 +103,17 @@ def arm_name(arm):
             + "_".join(f'{key}{value}' for key, value in sorted(arm["params"].items())))
 
 
-def fit_arm(arm, train_table, gt_table, sub_table, meta, pool="P2"):
+def fit_arm(arm, train_table, gt_table, sub_table, meta, pool="P2",
+            backend="sklearn"):
     """Fits one arm and returns (model, metrics dict of compression at floors)."""
     names = FEATURE_SETS[arm["feature_set"]]
     train_rows = train_table["pool"].to_numpy(zero_copy_only=False) == pool
     gt_rows = gt_table["pool"].to_numpy(zero_copy_only=False) == pool
     sub_rows = sub_table["pool"].to_numpy(zero_copy_only=False) == pool
 
-    model = HistGradientBoostingClassifier(
-        class_weight=arm["class_weight"], random_state=0, **arm["params"])
-    model.fit(_cols(train_table, names)[train_rows],
-              train_table["is_gt"].to_numpy()[train_rows])
+    labels = train_table["is_gt"].to_numpy()[train_rows]
+    model = build_estimator(backend, arm["params"], arm["class_weight"], labels)
+    model.fit(_cols(train_table, names)[train_rows], labels)
     gt_scores = model.predict_proba(_cols(gt_table, names)[gt_rows])[:, 1]
     sub_scores = model.predict_proba(_cols(sub_table, names)[sub_rows])[:, 1]
     points = _curve(gt_scores, sub_scores,
@@ -129,6 +162,8 @@ def main() -> None:
     parser.add_argument('--eval-prefix', required=True)
     parser.add_argument('--feature-sets', default='full89,vertex,all22')
     parser.add_argument('--class-weights', default='balanced,none')
+    parser.add_argument('--backend', choices=('sklearn', 'xgboost'),
+                        default='sklearn')
     parser.add_argument('--refine', action='store_true')
     parser.add_argument('--save-models', action='store_true')
     parser.add_argument('--attribution', action='store_true')
@@ -155,7 +190,8 @@ def main() -> None:
     for index, arm in enumerate(arms, start=1):
         name = arm_name(arm)
         model, metrics = fit_arm(arm, train_tables[arm['neg_mode']],
-                                 gt_table, sub_table, meta)
+                                 gt_table, sub_table, meta,
+                                 backend=args.backend)
         results[name] = {key: value for key, value in metrics.items()
                          if key != 'points'}
         results[name]['arm'] = {key: arm[key] for key in
