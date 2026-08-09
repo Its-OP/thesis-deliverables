@@ -275,6 +275,10 @@ _WORKER_STATE = {}
 
 
 def _worker_init(state):
+    # Each worker would otherwise inherit torch's default intra-op pool sized
+    # to every core, so N workers ask for N x cores threads and the machine
+    # thrashes. The per-event work is small and serial; one thread each.
+    torch.set_num_threads(1)
     _WORKER_STATE.clear()
     _WORKER_STATE.update(state)
 
@@ -285,7 +289,8 @@ def _worker_pool(workers, state):
     itself; under fork the children inherit them for free instead."""
     if sys.platform.startswith("linux"):
         _worker_init(state)
-        return mp.get_context("fork").Pool(workers)
+        return mp.get_context("fork").Pool(
+            workers, initializer=torch.set_num_threads, initargs=(1,))
     return mp.get_context().Pool(
         workers, initializer=_worker_init, initargs=(state,))
 
