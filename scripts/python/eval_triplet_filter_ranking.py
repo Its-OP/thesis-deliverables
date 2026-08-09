@@ -57,8 +57,12 @@ def feature_columns_for_width(width):
 
 
 def use_cpu_inference(model):
-    """XGBoost boosters trained on the GPU keep device='cuda', and CUDA cannot
-    be initialized in a forked worker. Inference is cheap on CPU."""
+    """XGBoost boosters trained on the GPU keep device='cuda'. Setting the
+    device back is not enough: every predict call still probes CUDA, which
+    cannot initialize in a forked worker and stalls for tens of seconds each
+    time. Hiding the device makes the booster take the CPU path directly —
+    measured 200 events in 13 s against 9 minutes for 100."""
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
     try:
         model.get_booster().set_param({"device": "cpu"})
         model.set_params(device="cpu")
