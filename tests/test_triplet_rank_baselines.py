@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import glob
 import json
 import os
 import sys
@@ -12,15 +11,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts', 'pyt
 
 from eval_triplet_rank_baselines import (
     OPERATING_POINTS,
+    ORDERINGS,
     deduped_gt_rank,
-    evaluate_baselines,
+    load_operating_points,
 )
-
-_DELIVERABLES = os.path.join(os.path.dirname(__file__), '..')
-_DUMP = os.path.join(_DELIVERABLES, 'data', 'low-pt', 'eval', 'perstage_couples_val.parquet')
-_SRC_GLOB = '/Users/oleh/Projects/masters/part/data/low-pt/val/val_*.parquet'
-_GBDT6 = os.path.join(_DELIVERABLES, 'models', 'third_pion_filter_gbdt_full_P2.joblib')
-_HAVE_REAL_VAL = os.path.exists(_DUMP) and glob.glob(_SRC_GLOB) and os.path.exists(_GBDT6)
 
 
 def test_deduped_gt_rank_manual():
@@ -47,37 +41,40 @@ def test_deduped_gt_rank_manual():
     assert deduped_gt_rank(keys, np.zeros(len(keys), dtype=bool)) is None
 
 
-def test_operating_points_frozen():
-    # tau canon: TRAIN-trained filters, recall floors on a held-out 60k TRAIN slice.
-    assert OPERATING_POINTS['d6@0.99'] == ('gbdt6_score', pytest.approx(0.025128))
-    assert OPERATING_POINTS['d8@0.95'] == ('gbdt8_score', pytest.approx(0.158525))
-    assert OPERATING_POINTS['tierH'][1] == 0.0
+def test_dedup_encoding_survives_track_indices_beyond_2048():
+    # The eval shards pad to 2,100 tracks; the old base-2048 encoding collided
+    # there. Two DISTINCT 3-sets that collide under radix 2048:
+    # (0, 0, 2099) -> 0*2048^2 + 0*2048 + 2099 = 2099
+    # (0, 1, 51)   -> 0*2048^2 + 1*2048 + 51   = 2099
+    keys = np.array([
+        [0, 1, 51],
+        [0, 0, 2099],
+    ])
+    is_gt = np.array([False, True])
+    assert deduped_gt_rank(keys, is_gt) == 2
 
 
-@pytest.fixture(scope='module')
-def real_artifact(tmp_path_factory):
-    if not _HAVE_REAL_VAL:
-        pytest.skip('real VAL dump/src/models not present')
-    from build_triplet_rank_candidates import main as build_main
-    out_dir = str(tmp_path_factory.mktemp('triplet_rank_baselines'))
-    build_main(['--out-dir', out_dir, '--tag', 'val', '--max-events', '60'])
-    return out_dir
+def test_tierh_applies_no_learned_gate():
+    assert OPERATING_POINTS['tierH'] == ('filter_score', -np.inf)
 
 
-def test_evaluate_baselines_consistency(real_artifact):
-    result = evaluate_baselines(
-        os.path.join(real_artifact, 'candidates_val.parquet'),
-        operating_point='d6@0.99', seed=0,
-    )
-    assert result['n_events'] == 60
-    ceiling = result['ceiling']
-    assert 0.0 < ceiling <= 1.0
-    for ordering in ['gbdt', 'couple_rank_lex', 'random']:
-        curve = result['t_at_k'][ordering]
-        values = [curve[str(k)] for k in result['k_values']]
-        # Monotone in K, bounded by the ceiling, and the loosest K reaches it only
-        # if every surviving GT ranks inside max(K).
-        assert all(a <= b + 1e-9 for a, b in zip(values, values[1:]))
-        assert values[-1] <= ceiling + 1e-9
-    # GBDT ordering at K>=1 can't beat the ceiling and must find at least one event.
-    assert result['t_at_k']['gbdt']['100'] > 0.0
+def test_stale_gbdt_taus_are_gone():
+    assert 'd6@0.99' not in OPERATING_POINTS
+    assert 'd8@0.95' not in OPERATING_POINTS
+
+
+def test_operating_points_load_from_json(tmp_path):
+    path = tmp_path / 'operating_points.json'
+    path.write_text(json.dumps({
+        'score_column': 'filter_score',
+        'taus': {'p99': 0.026845, 'p95': 0.264811},
+    }))
+    points = load_operating_points(str(path))
+    assert points['tierH'] == ('filter_score', -np.inf)
+    assert points['p99'] == ('filter_score', pytest.approx(0.026845))
+    assert points['p95'] == ('filter_score', pytest.approx(0.264811))
+
+
+def test_orderings_rank_by_the_single_filter_score():
+    assert 'filter' in ORDERINGS
+    assert 'gbdt' not in ORDERINGS

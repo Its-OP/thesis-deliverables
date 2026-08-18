@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import glob
-import multiprocessing
+import hashlib
+import json
 import os
-import shutil
+import subprocess
 import traceback
 
 import joblib
@@ -15,44 +16,55 @@ import pyarrow.parquet as pq
 import torch
 from tqdm import tqdm
 
-from utils.triplet_join import (
-    FEATURE_NAMES,
-    build_track_lorentz,
-    build_triplet_candidates,
-    triplet_candidate_features,
-)
 try:
-    # SRC_COLS covers the legacy 89-feature layout; H6_SRC_COLS adds what the
-    # extended block needs and is only read when --h6 is given.
     from scripts.python.build_triplet_filter_table import (
-        DUMP, SRC, H6_SRC_COLS, TRACK_SRC_COLS as SRC_COLS,
-        _h6_inputs_for_event)
+        ROLE_DEFAULTS, IDENTITY_COLS, SRC_COLS,
+        _event_candidates, _featurize, _h6_inputs_for_event,  # noqa: F401
+        _worker_pool, _WORKER_STATE,
+        assert_dump_aligned, dump_row_order, identity_keys)
+    from scripts.python.eval_triplet_filter_ranking import use_cpu_inference
 except ImportError:  # direct-file invocation: scripts/python is sys.path[0]
     from build_triplet_filter_table import (
-        DUMP, SRC, H6_SRC_COLS, TRACK_SRC_COLS as SRC_COLS,
-        _h6_inputs_for_event)
+        ROLE_DEFAULTS, IDENTITY_COLS, SRC_COLS,
+        _event_candidates, _featurize, _h6_inputs_for_event,  # noqa: F401
+        _worker_pool, _WORKER_STATE,
+        assert_dump_aligned, dump_row_order, identity_keys)
+    from eval_triplet_filter_ranking import use_cpu_inference
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'models')
-OUT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'low-pt', 'eval', 'triplet_rank')
+OUT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data',
+                       'triplet_rank_v2')
+FILTER_MODEL_GLOB = os.path.join(
+    MODELS_DIR, 'sweep',
+    'sweep_vertex_physics__uniform__balanced__d8__*.joblib')
+# vertex (6) + physics (5): the h6s4 champion's feature set; isolation and
+# secondary-vertex blocks measured inert and are never computed here.
+H6_WIDTH = 11
 MAX_CANDIDATES_PER_EVENT = 32768
 CHUNK_SIZE = 500
+WINDOW = 2048
+TAIL_SAMPLE = 512
 
 DUMP_COLS = ['stage1_sorted_indices', 'stage1_scores', 'stage2_sorted_indices',
              'stage2_scores', 'stage3_sorted_couples', 'stage3_couple_scores']
 
-# One row per event; cand_*/couple_rank/gbdt*/is_gt list columns are parallel across
-# the event's Tier-H candidates; track_s1/track_s2 are per-track (track_s2 is NaN
-# outside the stage-1 top-K1) and couple_scores is per-kept-couple.
+# One row per event, written in SOURCE-SHARD order (the 5-column identity key
+# joins the worker-permuted dump back to the shards). Stored candidate rows =
+# top-`window` by filter_score, descending (stored position = filter rank),
+# then GT rows the window missed (row_kind 1), then a uniform tail sample for
+# unbiased full-list losses (row_kind 2, train side only). The gate tau is a
+# runtime parameter — scores are stored ungated.
 CANDIDATE_SCHEMA = pa.schema([
     pa.field('n_tracks', pa.int32()),
-    pa.field('n_candidates', pa.int32()),
+    pa.field('n_tierh', pa.int32()),
+    pa.field('n_tail_total', pa.int32()),
     pa.field('cand_i', pa.list_(pa.int16())),
     pa.field('cand_j', pa.list_(pa.int16())),
     pa.field('cand_k', pa.list_(pa.int16())),
     pa.field('couple_rank', pa.list_(pa.int16())),
-    pa.field('gbdt6_score', pa.list_(pa.float32())),
-    pa.field('gbdt8_score', pa.list_(pa.float32())),
+    pa.field('filter_score', pa.list_(pa.float32())),
     pa.field('is_gt', pa.list_(pa.bool_())),
+    pa.field('row_kind', pa.list_(pa.uint8())),
     pa.field('gt_i', pa.int16()),
     pa.field('gt_j', pa.int16()),
     pa.field('gt_k', pa.int16()),
@@ -60,26 +72,44 @@ CANDIDATE_SCHEMA = pa.schema([
     pa.field('track_s1', pa.list_(pa.float32())),
     pa.field('track_s2', pa.list_(pa.float32())),
     pa.field('couple_scores', pa.list_(pa.float32())),
+    pa.field('event_run', pa.int64()),
+    pa.field('event_id', pa.int64()),
+    pa.field('event_luminosity_block', pa.int64()),
+    pa.field('source_batch_id', pa.int64()),
+    pa.field('source_microbatch_id', pa.int64()),
 ])
 
 
-def _load_prefix(dump_path, src_glob, max_events):
-    # A dump may cover only a row-prefix of the source (smoke dumps, crash-partial
-    # dumps); build candidates for exactly the dumped prefix.
-    dump = pq.read_table(dump_path, columns=DUMP_COLS)
-    src = pa.concat_tables([pq.read_table(s, columns=SRC_COLS)
-                            for s in sorted(glob.glob(src_glob))])
-    assert dump.num_rows <= src.num_rows, \
-        f'dump rows {dump.num_rows} exceed src rows {src.num_rows}'
-    n = dump.num_rows if max_events is None else min(max_events, dump.num_rows)
-    return dump.slice(0, n), src.slice(0, n), n
+def load_filter_model(path_glob):
+    matches = sorted(glob.glob(path_glob))
+    assert len(matches) == 1, \
+        f'expected exactly one filter model at {path_glob}, found {matches}'
+    model = joblib.load(matches[0])
+    width = int(getattr(model, 'n_features_in_', -1))
+    assert width == 89 + H6_WIDTH, \
+        f'{matches[0]} expects {width} features, the builder produces {89 + H6_WIDTH}'
+    return use_cpu_inference(model)
 
 
-def load_gbdt_models():
-    return {
-        'gbdt6': joblib.load(os.path.join(MODELS_DIR, 'third_pion_filter_gbdt_full_P2.joblib')),
-        'gbdt8': joblib.load(os.path.join(MODELS_DIR, 'third_pion_filter_gbdt8_full_P2.joblib')),
-    }
+def _window_selection(scores, is_gt, *, window, tail_sample, generator):
+    """scores: (M,) filter scores; is_gt: (M,) bool. Returns (row indices,
+    row kinds, tail-population size). Window rows come first in descending
+    score order, then forced-GT rows the window missed, then the tail sample."""
+    order = np.argsort(-scores, kind='stable')
+    if window is None:
+        return order, np.zeros(len(order), dtype=np.uint8), 0
+    head = order[:window]
+    outside = order[window:]
+    forced = outside[is_gt[outside]]
+    tail_pool = outside[~is_gt[outside]]
+    take = min(tail_sample, len(tail_pool))
+    tail = (tail_pool[generator.choice(len(tail_pool), take, replace=False)]
+            if take else tail_pool[:0])
+    rows = np.concatenate([head, forced, tail])
+    kinds = np.concatenate([np.zeros(len(head), dtype=np.uint8),
+                            np.ones(len(forced), dtype=np.uint8),
+                            np.full(len(tail), 2, dtype=np.uint8)])
+    return rows, kinds, int(len(tail_pool))
 
 
 def _plain_array(column):
@@ -108,124 +138,138 @@ def _list_views(table, name):
     return [flat[offsets[r]:offsets[r + 1]] for r in range(len(array))]
 
 
-def _event_views(dump, src, src_names=None):
-    dump_cols = {name: _list_views(dump, name) for name in DUMP_COLS}
-    src_cols = {}
-    for name in (src_names or SRC_COLS):
-        column = src[name]
-        # Scalar columns (track counts, the primary vertex) stay numpy; the
-        # per-track columns become zero-copy row views.
-        is_list = pa.types.is_list(column.type) or pa.types.is_large_list(column.type)
-        src_cols[name] = (_list_views(src, name) if is_list
-                          else column.to_numpy(zero_copy_only=False))
-    return dump_cols, src_cols
+def _dump_blocks(dump_path, src_glob, max_events):
+    """Yields (dump_views, couples, src_cols, identity_rows, n) one source
+    shard at a time, with the dump reordered onto the shard by the 5-column
+    identity key."""
+    shards = sorted(glob.glob(src_glob))
+    assert shards, f'no source shards matched {src_glob}'
+    dump_table = pq.read_table(dump_path, columns=DUMP_COLS + IDENTITY_COLS)
+    src_rows = sum(pq.read_metadata(shard).num_rows for shard in shards)
+    assert dump_table.num_rows == src_rows, \
+        f'row mismatch: dump {dump_table.num_rows} vs shards {src_rows}'
+    dump_keys = identity_keys(dump_table)
+
+    emitted = 0
+    for shard in shards:
+        src = pq.read_table(shard, columns=SRC_COLS + IDENTITY_COLS)
+        n = src.num_rows
+        if max_events is not None:
+            n = min(n, max_events - emitted)
+            src = src.slice(0, n)
+        if n == 0:
+            break
+        order = dump_row_order(dump_keys, identity_keys(src))
+        block = dump_table.take(order)
+        couples = block['stage3_sorted_couples'].to_pylist()
+        src_cols = {name: src[name].to_pylist() for name in SRC_COLS}
+        assert_dump_aligned(couples, src_cols['event_n_tracks'])
+        dump_views = {name: _list_views(block, name) for name in DUMP_COLS
+                      if name != 'stage3_sorted_couples'}
+        identity_rows = {name: src[name].to_pylist() for name in IDENTITY_COLS}
+        yield dump_views, couples, src_cols, identity_rows, n
+        emitted += n
+        if max_events is not None and emitted >= max_events:
+            break
 
 
-def event_features(r, dump_cols, src_cols, *, top_c, with_h6=False):
-    s1 = dump_cols['stage1_sorted_indices']
-    couples_all = dump_cols['stage3_sorted_couples']
-    cols = src_cols
-    assert len(s1[r]) == cols['event_n_tracks'][r], f'alignment break at row {r}'
-    n_tracks = int(cols['event_n_tracks'][r])
-    lorentz = build_track_lorentz(torch.tensor(cols['track_pt'][r], dtype=torch.float32),
-                                  torch.tensor(cols['track_eta'][r], dtype=torch.float32),
-                                  torch.tensor(cols['track_phi'][r], dtype=torch.float32))
-    t = lambda key: torch.tensor(cols[key][r], dtype=torch.float32)
-    kw = dict(lorentz=lorentz, charge=t('track_charge'), eta=t('track_eta'), phi=t('track_phi'),
-              dz=t('track_dz_significance'), dxy_sig=t('track_dxy_significance'),
-              dca_sig=t('track_dca_significance'), n_pixel=t('track_n_valid_pixel_hits'),
-              norm_chi2=t('track_norm_chi2'), pt_error=t('track_pt_error'),
-              cov_phi_phi=t('track_covariance_phi_phi'),
-              cov_lambda_lambda=t('track_covariance_lambda_lambda'))
+def event_row(r, dump_views, couples, src_cols, identity_rows, *, top_c, model,
+              window, tail_sample, seed):
+    candidates = _event_candidates(r, couples, src_cols, top_c)
+    is_gt = np.asarray(candidates['is_gt'], dtype=bool)
+    n_tierh = len(is_gt)
+    assert n_tierh <= MAX_CANDIDATES_PER_EVENT, \
+        f'{n_tierh} candidates at row {r}'
+    n_tracks = int(src_cols['event_n_tracks'][r])
 
-    labels = np.asarray(cols['track_label_from_tau'][r])
-    gt = np.where(labels > 0.5)[0]
-    couples_np = np.asarray(couples_all[r][:top_c], dtype=np.int64).reshape(-1, 2)
-    couples = torch.tensor(couples_np, dtype=torch.long)
-    pool = torch.arange(n_tracks, dtype=torch.long)  # P2: entire input track set
-    gt_set = set(gt.tolist())
-    has_gt_couple = any(set(c).issubset(gt_set) for c in couples_np.tolist())
-    reconstructable = gt.size == 3 and has_gt_couple
-    gt_sorted = tuple(sorted(gt.tolist())) if reconstructable else None
+    features = _featurize(candidates, np.arange(n_tierh), r, src_cols, True,
+                          H6_WIDTH)
+    scores = (model.predict_proba(features)[:, 1].astype(np.float32)
+              if n_tierh else np.zeros(0, np.float32))
+    rows, kinds, n_tail_total = _window_selection(
+        scores, is_gt, window=window, tail_sample=tail_sample,
+        generator=np.random.default_rng(seed))
 
-    # Features/labels and candidate (i, j, k) indices come from two calls that share the
-    # same Tier-H enumeration (charge net +-1, m(ijk) <= m_tau, ascending k per couple);
-    # the asserts below pin that order equality.
-    h6_inputs = _h6_inputs_for_event(cols, r) if with_h6 else None
-    X, _, is_gt, couple_row = triplet_candidate_features(
-        couples, pool, gt_sorted=gt_sorted, h6_inputs=h6_inputs, **kw)
-    triplets, couple_row_check = build_triplet_candidates(couples, pool, lorentz=lorentz,
-                                                          charge=kw['charge'])
-    assert torch.equal(couple_row_check, couple_row), f'enumeration order mismatch at row {r}'
-    assert torch.equal(triplets[:, 0], couples[couple_row, 0]), f'i mismatch at row {r}'
-    assert torch.equal(triplets[:, 1], couples[couple_row, 1]), f'j mismatch at row {r}'
-    n_candidates = int(X.shape[0])
-    assert n_candidates <= MAX_CANDIDATES_PER_EVENT, f'{n_candidates} candidates at row {r}'
-    # The H6 secondary-vertex columns are NaN by design when no vertex exists,
-    # so only the legacy block carries a finiteness guarantee.
-    assert torch.isfinite(X[:, :len(FEATURE_NAMES)]).all(), \
-        f'non-finite features at row {r}'
+    triplets = candidates['triplets'].numpy()
+    couple_row = candidates['couple_row'].numpy()
 
-    # Frozen-cascade score columns: stage-1 scores scattered back to track order
-    # (full coverage), stage-2 scores NaN outside the stage-1 top-K1, and the kept
-    # couples' stage-3 scores indexed by couple_rank.
+    # Frozen-cascade context: stage-1 scores scattered back to track order
+    # (full coverage), stage-2 scores NaN outside the stage-1 top-K1, and the
+    # kept couples' stage-3 scores indexed by couple_rank.
     track_s1 = np.full(n_tracks, np.nan, dtype=np.float32)
-    track_s1[np.asarray(s1[r], dtype=np.int64)] = \
-        np.asarray(dump_cols['stage1_scores'][r], dtype=np.float32)
+    track_s1[np.asarray(dump_views['stage1_sorted_indices'][r], dtype=np.int64)] = \
+        np.asarray(dump_views['stage1_scores'][r], dtype=np.float32)
     assert np.isfinite(track_s1).all(), f'incomplete stage-1 coverage at row {r}'
     track_s2 = np.full(n_tracks, np.nan, dtype=np.float32)
-    track_s2[np.asarray(dump_cols['stage2_sorted_indices'][r], dtype=np.int64)] = \
-        np.asarray(dump_cols['stage2_scores'][r], dtype=np.float32)
-    couple_scores = np.asarray(dump_cols['stage3_couple_scores'][r],
+    track_s2[np.asarray(dump_views['stage2_sorted_indices'][r], dtype=np.int64)] = \
+        np.asarray(dump_views['stage2_scores'][r], dtype=np.float32)
+    couple_scores = np.asarray(dump_views['stage3_couple_scores'][r],
                                dtype=np.float32)[:top_c]
-    if n_candidates:
-        assert np.isfinite(track_s2[triplets[:, 0].numpy()]).all() \
-            and np.isfinite(track_s2[triplets[:, 1].numpy()]).all(), \
+    if n_tierh:
+        assert np.isfinite(track_s2[triplets[:, 0]]).all() \
+            and np.isfinite(track_s2[triplets[:, 1]]).all(), \
             f'couple member outside the stage-2 set at row {r}'
         assert int(couple_row.max()) < len(couple_scores), \
             f'couple_rank exceeds kept couple scores at row {r}'
 
-    gt_i, gt_j, gt_k = (gt_sorted if gt_sorted is not None else (-1, -1, -1))
+    labels = np.asarray(src_cols['track_label_from_tau'][r])
+    gt = np.where(labels > 0.5)[0]
+    reconstructable = bool(candidates['reconstructable'])
+    gt_i, gt_j, gt_k = (sorted(gt.tolist()) if reconstructable
+                        else (-1, -1, -1))
+
     row = {
         'n_tracks': n_tracks,
-        'n_candidates': n_candidates,
-        'cand_i': triplets[:, 0].to(torch.int16).tolist(),
-        'cand_j': triplets[:, 1].to(torch.int16).tolist(),
-        'cand_k': triplets[:, 2].to(torch.int16).tolist(),
-        'couple_rank': couple_row.to(torch.int16).tolist(),
-        'is_gt': is_gt.tolist(),
+        'n_tierh': n_tierh,
+        'n_tail_total': n_tail_total,
+        'cand_i': triplets[rows, 0].astype(np.int16).tolist(),
+        'cand_j': triplets[rows, 1].astype(np.int16).tolist(),
+        'cand_k': triplets[rows, 2].astype(np.int16).tolist(),
+        'couple_rank': couple_row[rows].astype(np.int16).tolist(),
+        'filter_score': scores[rows].tolist(),
+        'is_gt': is_gt[rows].tolist(),
+        'row_kind': kinds.tolist(),
         'gt_i': gt_i, 'gt_j': gt_j, 'gt_k': gt_k,
-        'recon': bool(reconstructable),
+        'recon': reconstructable,
         'track_s1': track_s1.tolist(),
         'track_s2': track_s2.tolist(),
         'couple_scores': couple_scores.tolist(),
     }
-    return row, X.numpy()
-
-
-def _predict(model, X):
-    if not len(X):
-        return np.zeros(0, np.float32)
-    return model.predict_proba(X)[:, 1].astype(np.float32)
-
-
-def event_candidates(r, dump_cols, src_cols, *, top_c, gbdt_models, with_h6=False):
-    row, X = event_features(r, dump_cols, src_cols, top_c=top_c, with_h6=with_h6)
-    row['gbdt6_score'] = _predict(gbdt_models['gbdt6'], X).tolist()
-    row['gbdt8_score'] = _predict(gbdt_models['gbdt8'], X).tolist()
+    for name in IDENTITY_COLS:
+        row[name] = int(identity_rows[name][r])
     return row
 
 
-def _empty_row(src_cols, r):
+def _empty_row(src_cols, identity_rows, r):
     try:
         n_tracks = int(src_cols['event_n_tracks'][r])
     except Exception:
         n_tracks = 0
-    return {'n_tracks': n_tracks, 'n_candidates': 0,
-            'cand_i': [], 'cand_j': [], 'cand_k': [], 'couple_rank': [],
-            'gbdt6_score': [], 'gbdt8_score': [], 'is_gt': [],
-            'gt_i': -1, 'gt_j': -1, 'gt_k': -1, 'recon': False,
-            'track_s1': [], 'track_s2': [], 'couple_scores': []}
+    row = {'n_tracks': n_tracks, 'n_tierh': 0, 'n_tail_total': 0,
+           'cand_i': [], 'cand_j': [], 'cand_k': [], 'couple_rank': [],
+           'filter_score': [], 'is_gt': [], 'row_kind': [],
+           'gt_i': -1, 'gt_j': -1, 'gt_k': -1, 'recon': False,
+           'track_s1': [], 'track_s2': [], 'couple_scores': []}
+    for name in IDENTITY_COLS:
+        try:
+            row[name] = int(identity_rows[name][r])
+        except Exception:
+            row[name] = -1
+    return row
+
+
+def _worker_row(r):
+    state = _WORKER_STATE
+    try:
+        return event_row(
+            r, state['dump_views'], state['couples'], state['src_cols'],
+            state['identity_rows'], top_c=state['top_c'], model=state['model'],
+            window=state['window'], tail_sample=state['tail_sample'],
+            seed=state['seed'] + state['offset'] + r), True
+    except Exception:
+        print(f'event {state["offset"] + r} failed, writing empty row:\n'
+              f'{traceback.format_exc()}', flush=True)
+        return _empty_row(state['src_cols'], state['identity_rows'], r), False
 
 
 def _valid_rows(path):
@@ -236,43 +280,17 @@ def _valid_rows(path):
 
 
 def _write_rows(path, rows):
-    columns = {field.name: [row[field.name] for row in rows] for field in CANDIDATE_SCHEMA}
-    writer = pq.ParquetWriter(path, CANDIDATE_SCHEMA)
+    columns = {field.name: [row[field.name] for row in rows]
+               for field in CANDIDATE_SCHEMA}
+    writer = pq.ParquetWriter(path, CANDIDATE_SCHEMA, compression='zstd')
     writer.write_table(pa.table(columns, schema=CANDIDATE_SCHEMA))
     writer.close()
 
 
-def _process_chunk(chunk_events, offset, dump_cols, src_cols, top_c, gbdt_models,
-                   with_h6=False):
-    rows, feature_blocks, succeeded = [], [], []
-    for g in chunk_events:
-        try:
-            row, X = event_features(int(g) - offset, dump_cols, src_cols,
-                                    top_c=top_c, with_h6=with_h6)
-            rows.append(row)
-            feature_blocks.append(X)
-            succeeded.append(True)
-        except Exception:
-            print(f'event {g} failed, writing empty row:\n{traceback.format_exc()}',
-                  flush=True)
-            rows.append(_empty_row(src_cols, int(g) - offset))
-            succeeded.append(False)
-    if feature_blocks:
-        # One predict_proba per model per chunk amortizes sklearn call overhead.
-        lengths = [block.shape[0] for block in feature_blocks]
-        stacked = np.vstack(feature_blocks)
-        for name in ('gbdt6', 'gbdt8'):
-            split = iter(np.split(_predict(gbdt_models[name], stacked), np.cumsum(lengths)[:-1]))
-            for row, ok in zip(rows, succeeded):
-                if ok:
-                    row[f'{name}_score'] = next(split).tolist()
-    return rows, succeeded.count(False)
-
-
-def _chunk_grid(events, chunk_size, out_path):
-    for start in range(0, len(events), chunk_size):
-        chunk_events = events[start:start + chunk_size]
-        yield chunk_events, f'{out_path}.chunk{chunk_events[0]:06d}'
+def _chunk_grid_range(offset, n_events, chunk_size, out_path):
+    for start in range(offset, offset + n_events, chunk_size):
+        size = min(chunk_size, offset + n_events - start)
+        yield start, size, f'{out_path}.chunk{start:06d}'
 
 
 def _finalize_if_complete(out_path, n_events):
@@ -285,166 +303,150 @@ def _finalize_if_complete(out_path, n_events):
 
 
 def _assemble(out_path, chunk_specs):
-    missing = [path for path, expected in chunk_specs if _valid_rows(path) != expected]
+    missing = [path for _, expected, path in chunk_specs
+               if _valid_rows(path) != expected]
     if missing:
         raise RuntimeError(f'{len(missing)} incomplete chunks, e.g. {missing[:3]}')
-    writer = pq.ParquetWriter(out_path, CANDIDATE_SCHEMA)
-    for path, _ in chunk_specs:
+    writer = pq.ParquetWriter(out_path, CANDIDATE_SCHEMA, compression='zstd')
+    for _, _, path in chunk_specs:
         writer.write_table(pq.read_table(path))
     writer.close()
-    for path, _ in chunk_specs:
+    for _, _, path in chunk_specs:
         os.remove(path)
 
 
-def write_candidates(dump_cols, src_cols, event_range, top_c, gbdt_models, out_path,
-                     chunk_size=CHUNK_SIZE):
-    events = list(event_range)
-    if _finalize_if_complete(out_path, len(events)):
-        return
-
-    # Each chunk is written as its own closed parquet file, so a killed run loses at
-    # most one chunk and a rerun skips every complete chunk.
-    n_failed = 0
-    progress = tqdm(total=len(events), desc='candidates', mininterval=30)
-    for chunk_events, chunk_path in _chunk_grid(events, chunk_size, out_path):
-        if _valid_rows(chunk_path) == len(chunk_events):
-            progress.update(len(chunk_events))
-            continue
-        rows, failed = _process_chunk(chunk_events, 0, dump_cols, src_cols, top_c, gbdt_models)
-        n_failed += failed
-        _write_rows(chunk_path, rows)
-        progress.update(len(chunk_events))
-    progress.close()
-
-    _assemble(out_path, [(path, len(ev)) for ev, path in _chunk_grid(events, chunk_size, out_path)])
-    if n_failed:
-        print(f'WARNING: {n_failed}/{len(events)} events failed and were written empty')
-    print(f'wrote {out_path} ({len(events)} rows)')
-
-
-def _worker_ranges(n, chunk_size, workers):
-    n_chunks = (n + chunk_size - 1) // chunk_size
-    boundaries = [min(round(w * n_chunks / workers) * chunk_size, n) for w in range(workers + 1)]
-    return [(boundaries[w], boundaries[w + 1]) for w in range(workers)
-            if boundaries[w] < boundaries[w + 1]]
-
-
-def _write_worker_slices(dump_path, src_glob, ranges, tmp_dir):
-    """Read the dump + full source glob ONCE in the main process and write each
-    worker's [start, end) row range to its own small self-contained parquet pair.
-
-    Table.slice() is zero-copy: a worker that reads the FULL file and slices it
-    keeps the entire file's Arrow buffers resident for its whole lifetime, so N
-    concurrent workers each pin a full copy -- fine at VAL scale, OOMs at TRAIN
-    scale (5.7x more events). Pre-slicing here means each worker's own read is
-    already bounded to its assigned range.
-    """
-    dump = pq.read_table(dump_path, columns=DUMP_COLS)
-    src = pa.concat_tables([pq.read_table(s, columns=SRC_COLS) for s in sorted(glob.glob(src_glob))])
-    paths = []
-    for w, (start, end) in enumerate(ranges):
-        dump_path_w = os.path.join(tmp_dir, f'dump_{w:04d}.parquet')
-        src_path_w = os.path.join(tmp_dir, f'src_{w:04d}.parquet')
-        pq.write_table(dump.slice(start, end - start), dump_path_w)
-        pq.write_table(src.slice(start, end - start), src_path_w)
-        paths.append((dump_path_w, src_path_w))
-    del dump, src
-    return paths
-
-
-def _worker_main(dump_slice_path, src_slice_path, start, end, top_c, chunk_size, out_path,
-                 worker_id):
-    torch.set_num_threads(1)
-    dump = pq.read_table(dump_slice_path, columns=DUMP_COLS)
-    src = pq.read_table(src_slice_path, columns=SRC_COLS)
-    dump_cols, src_cols = _event_views(dump, src)
-    gbdt_models = load_gbdt_models()
-    events = list(range(start, end))
-    n_failed = 0
-    for chunk_events, chunk_path in _chunk_grid(events, chunk_size, out_path):
-        if _valid_rows(chunk_path) == len(chunk_events):
-            continue
-        rows, failed = _process_chunk(chunk_events, start, dump_cols, src_cols, top_c, gbdt_models)
-        n_failed += failed
-        _write_rows(chunk_path, rows)
-        print(f'worker {worker_id}: chunk {chunk_events[0]} done '
-              f'({chunk_events[-1] - start + 1}/{end - start} events)', flush=True)
-    if n_failed:
-        print(f'worker {worker_id}: WARNING {n_failed} events failed', flush=True)
-
-
-def _run_workers(args, n, out_path):
-    if _finalize_if_complete(out_path, n):
-        return
-    os.environ['OMP_NUM_THREADS'] = str(max(1, (os.cpu_count() or 8) // max(1, args.workers)))
-    ranges = _worker_ranges(n, args.chunk_size, args.workers)
-    print(f'launching {len(ranges)} workers over {n} events...', flush=True)
-
-    tmp_dir = out_path + '.worker_slices'
-    os.makedirs(tmp_dir, exist_ok=True)
+def _git_sha():
     try:
-        slice_paths = _write_worker_slices(args.dump, args.src_glob, ranges, tmp_dir)
-        context = multiprocessing.get_context('spawn')
-        processes = [context.Process(target=_worker_main,
-                                     args=(dump_path_w, src_path_w, start, end, args.top_c,
-                                           args.chunk_size, out_path, w))
-                     for w, ((start, end), (dump_path_w, src_path_w))
-                     in enumerate(zip(ranges, slice_paths))]
-        for process in processes:
-            process.start()
-        for process in processes:
-            process.join()
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    bad = [process.exitcode for process in processes if process.exitcode != 0]
-    if bad:
-        raise RuntimeError(f'{len(bad)} workers exited nonzero: {bad}')
-    _assemble(out_path, [(path, len(ev))
-                         for ev, path in _chunk_grid(list(range(n)), args.chunk_size, out_path)])
-    print(f'wrote {out_path} ({n} rows)')
+        return subprocess.run(
+            ['git', '-C', os.path.dirname(__file__), 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        return 'unknown'
 
 
-def write_tracks(src, n_events, out_path):
-    pq.write_table(src.slice(0, n_events), out_path)
-    print(f'wrote {out_path} ({n_events} rows)')
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1 << 20), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def build(args):
+    out_path = os.path.join(args.out_dir, f'candidates_{args.tag}.parquet')
+    os.makedirs(args.out_dir, exist_ok=True)
+    model = load_filter_model(args.filter_model)
+    window = None if args.role == 'eval' else args.window
+    tail_sample = 0 if args.role == 'eval' else args.tail_sample
+
+    gt_scores = []
+    chunk_specs, offset, n_failed = [], 0, 0
+    progress = None
+    for dump_views, couples, src_cols, identity_rows, n in _dump_blocks(
+            args.dump, args.src_glob, args.max_events):
+        if progress is None:
+            progress = tqdm(desc=f'candidates[{args.tag}]', mininterval=30)
+        # A killed run resumes at shard granularity: a shard whose chunk files
+        # are all complete is never refeaturized.
+        shard_chunks = list(_chunk_grid_range(offset, n, args.chunk_size,
+                                              out_path))
+        chunk_specs.extend(shard_chunks)
+        if all(_valid_rows(path) == size for _, size, path in shard_chunks):
+            progress.update(n)
+            offset += n
+            for _, _, path in shard_chunks:
+                block = pq.read_table(path, columns=['filter_score', 'is_gt'])
+                for scores, flags in zip(block['filter_score'].to_pylist(),
+                                         block['is_gt'].to_pylist()):
+                    gt_scores.extend(s for s, f in zip(scores, flags) if f)
+            continue
+        state = dict(dump_views=dump_views, couples=couples, src_cols=src_cols,
+                     identity_rows=identity_rows, top_c=args.top_c, model=model,
+                     window=window, tail_sample=tail_sample, seed=args.seed,
+                     offset=offset)
+        if args.workers > 1:
+            with _worker_pool(args.workers, state) as pool:
+                results = list(pool.imap(_worker_row, range(n), chunksize=8))
+        else:
+            _WORKER_STATE.clear()
+            _WORKER_STATE.update(state)
+            results = [_worker_row(r) for r in range(n)]
+        for row, ok in results:
+            n_failed += 0 if ok else 1
+            gt_scores.extend(score for score, flag
+                             in zip(row['filter_score'], row['is_gt']) if flag)
+        rows = [row for row, _ in results]
+        for start, size, path in shard_chunks:
+            _write_rows(path, rows[start - offset:start - offset + size])
+        progress.update(n)
+        offset += n
+    if progress is not None:
+        progress.close()
+    total = offset
+
+    _assemble(out_path, chunk_specs)
+    if n_failed:
+        print(f'WARNING: {n_failed}/{total} events failed and were written empty')
+    print(f'wrote {out_path} ({total} rows)')
+
+    filter_path = sorted(glob.glob(args.filter_model))[0]
+    manifest = dict(
+        git_sha=_git_sha(), role=args.role, dump=os.path.abspath(args.dump),
+        src_glob=args.src_glob, n_events=total, n_failed=n_failed,
+        filter_model=os.path.abspath(filter_path),
+        filter_sha256=_file_sha256(filter_path),
+        top_c=args.top_c, window=window, tail_sample=tail_sample,
+        h6_width=H6_WIDTH, seed=args.seed,
+    )
+    manifest_path = os.path.join(args.out_dir, f'build_manifest_{args.tag}.json')
+    with open(manifest_path, 'w') as handle:
+        json.dump(manifest, handle, indent=2)
+    print(f'wrote {manifest_path}')
+
+    if args.role == 'train':
+        scores = np.asarray(gt_scores, dtype=np.float64)
+        points = dict(score_column='filter_score',
+                      taus={'p99': float(np.quantile(scores, 0.01)),
+                            'p95': float(np.quantile(scores, 0.05))},
+                      n_gt=int(len(scores)), derived_from=args.tag)
+        points_path = os.path.join(args.out_dir, 'operating_points.json')
+        with open(points_path, 'w') as handle:
+            json.dump(points, handle, indent=2)
+        print(f'wrote {points_path}')
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument('--dump', default=DUMP, help='cascade dump (default: VAL)')
-    ap.add_argument('--src-glob', default=SRC, help='per-track source parquet glob (default: VAL)')
-    ap.add_argument('--tag', default='val', help='artifact suffix: candidates_<tag>.parquet')
+    ap.add_argument('--role', choices=sorted(ROLE_DEFAULTS), required=True,
+                    help='train stores a top-window + GT + tail sample; eval '
+                         'stores the full Tier-H list, gate applied at runtime')
+    ap.add_argument('--dump', default=None,
+                    help='per-stage couples dump (default: by role)')
+    ap.add_argument('--src-glob', default=None,
+                    help='per-track source parquet glob (default: by role)')
+    ap.add_argument('--tag', default=None, help='artifact suffix (default: role)')
     ap.add_argument('--out-dir', default=OUT_DIR)
-    ap.add_argument('--top-c', type=int, default=100)
+    ap.add_argument('--filter-model', default=FILTER_MODEL_GLOB)
+    ap.add_argument('--top-c', type=int, default=125)
+    ap.add_argument('--window', type=int, default=WINDOW)
+    ap.add_argument('--tail-sample', type=int, default=TAIL_SAMPLE)
     ap.add_argument('--max-events', type=int, default=None)
     ap.add_argument('--chunk-size', type=int, default=CHUNK_SIZE)
-    ap.add_argument('--workers', type=int, default=1,
-                    help='parallel worker processes over disjoint chunk-aligned event ranges')
-    ap.add_argument('--tracks-only', action='store_true',
-                    help='only write the consolidated tracks_<tag>.parquet')
-    ap.add_argument('--skip-tracks', action='store_true',
-                    help='do not (re)write tracks_<tag>.parquet')
+    ap.add_argument('--workers', type=int, default=1)
+    ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args(argv)
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    print('loading dump + source parquet...', flush=True)
-    dump, src, n = _load_prefix(args.dump, args.src_glob, args.max_events)
-    if not args.skip_tracks:
-        write_tracks(src, n, os.path.join(args.out_dir, f'tracks_{args.tag}.parquet'))
-    if args.tracks_only:
-        return
+    role_dump, role_src = ROLE_DEFAULTS[args.role]
+    args.dump = args.dump or role_dump
+    args.src_glob = args.src_glob or role_src
+    args.tag = args.tag or args.role
 
+    torch.set_num_threads(1)
     out_path = os.path.join(args.out_dir, f'candidates_{args.tag}.parquet')
-    if args.workers > 1:
-        del dump, src
-        _run_workers(args, n, out_path)
+    expected = args.max_events
+    if expected is not None and _finalize_if_complete(out_path, expected):
         return
-
-    print(f'building event views for {n} events...', flush=True)
-    dump_cols, src_cols = _event_views(dump, src)
-    gbdt_models = load_gbdt_models()
-    write_candidates(dump_cols, src_cols, range(n), args.top_c, gbdt_models, out_path,
-                     chunk_size=args.chunk_size)
+    build(args)
 
 
 if __name__ == '__main__':

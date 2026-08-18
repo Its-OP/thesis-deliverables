@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 import sys
 
@@ -8,355 +9,268 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts', 'python'))
 
 from build_triplet_rank_candidates import (
     CANDIDATE_SCHEMA,
-    event_candidates,
-    load_gbdt_models,
+    FILTER_MODEL_GLOB,
+    _dump_blocks,
+    _window_selection,
+    load_filter_model,
     main,
 )
+from build_triplet_filter_table import IDENTITY_COLS
 
-_DELIVERABLES = os.path.join(os.path.dirname(__file__), '..')
-_GBDT6 = os.path.join(_DELIVERABLES, 'models', 'third_pion_filter_gbdt_full_P2.joblib')
-_GBDT8 = os.path.join(_DELIVERABLES, 'models', 'third_pion_filter_gbdt8_full_P2.joblib')
-_DUMP = os.path.join(_DELIVERABLES, 'data', 'low-pt', 'eval', 'perstage_couples_val.parquet')
-_SRC_GLOB = '/Users/oleh/Projects/masters/part/data/low-pt/val/val_*.parquet'
-
-_LIST_FIELDS = ['cand_i', 'cand_j', 'cand_k', 'couple_rank',
-                'gbdt6_score', 'gbdt8_score', 'is_gt']
-
-_HAVE_MODELS = os.path.exists(_GBDT6) and os.path.exists(_GBDT8)
+_HAVE_FILTER = bool(glob.glob(FILTER_MODEL_GLOB))
 
 
-def _synthetic_event(couples):
-    # 5 tracks, charges (+,+,-,-,+); GT = tracks 0,1,2. Mirrors tests/test_triplet_join.py.
-    # stage1 order is a nontrivial permutation so the track_s1 scatter is exercised;
-    # track 4 sits outside the stage-2 set -> NaN track_s2 there (couple members must
-    # stay inside it, matching the real top-K2 construction).
-    dump_cols = {
-        'stage1_sorted_indices': [[2, 0, 3, 1, 4]],
-        'stage1_scores': [[0.9, 0.8, 0.7, 0.6, 0.5]],
-        'stage2_sorted_indices': [[2, 0, 3, 1]],
-        'stage2_scores': [[0.5, 0.4, 0.35, 0.3]],
-        'stage3_sorted_couples': [couples],
-        'stage3_couple_scores': [[round(0.95 - 0.1 * c, 2) for c in range(len(couples))]],
-    }
-    src_cols = {
-        'event_n_tracks': [5],
-        'track_pt': [[1.0, 1.2, 0.9, 1.1, 0.8]],
-        'track_eta': [[0.10, 0.15, 0.12, 0.18, 3.00]],
-        'track_phi': [[0.05, 0.10, 0.08, 0.12, 2.50]],
-        'track_charge': [[1.0, 1.0, -1.0, -1.0, 1.0]],
-        'track_dz_significance': [[0.20, 0.25, 0.22, 0.28, 9.00]],
-        'track_dxy_significance': [[0.5, 0.6, 0.7, 0.8, 0.9]],
-        'track_dca_significance': [[1.0, 1.1, 1.2, 1.3, 1.4]],
-        'track_n_valid_pixel_hits': [[4.0, 4.0, 3.0, 5.0, 2.0]],
-        'track_norm_chi2': [[1.0, 1.2, 0.9, 1.1, 2.0]],
-        'track_pt_error': [[0.01, 0.02, 0.03, 0.04, 0.05]],
-        'track_covariance_phi_phi': [[0.001, 0.002, 0.003, 0.004, 0.005]],
-        'track_covariance_lambda_lambda': [[0.0011, 0.0021, 0.0031, 0.0041, 0.0051]],
-        'track_label_from_tau': [[1.0, 1.0, 1.0, 0.0, 0.0]],
-    }
-    return dump_cols, src_cols
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
 
-
-def test_candidate_schema_fields():
+def test_schema_v2_has_the_single_filter_score_and_row_kind():
     names = CANDIDATE_SCHEMA.names
-    for field_name in ['n_tracks', 'n_candidates', 'gt_i', 'gt_j', 'gt_k', 'recon'] + _LIST_FIELDS:
-        assert field_name in names
-    assert CANDIDATE_SCHEMA.field('cand_i').type == pa.list_(pa.int16())
-    assert CANDIDATE_SCHEMA.field('gbdt6_score').type == pa.list_(pa.float32())
-    assert CANDIDATE_SCHEMA.field('is_gt').type == pa.list_(pa.bool_())
-    assert CANDIDATE_SCHEMA.field('gt_i').type == pa.int16()
-    assert CANDIDATE_SCHEMA.field('recon').type == pa.bool_()
-    for field_name in ['track_s1', 'track_s2', 'couple_scores']:
-        assert CANDIDATE_SCHEMA.field(field_name).type == pa.list_(pa.float32())
+    assert 'filter_score' in names
+    assert 'row_kind' in names
+    assert 'n_tierh' in names
+    assert 'gbdt6_score' not in names
+    assert 'gbdt8_score' not in names
+    assert CANDIDATE_SCHEMA.field('filter_score').type == pa.list_(pa.float32())
+    assert CANDIDATE_SCHEMA.field('row_kind').type == pa.list_(pa.uint8())
+    assert CANDIDATE_SCHEMA.field('n_tail_total').type == pa.int32()
+    for name in IDENTITY_COLS:
+        assert name in names
 
 
-@pytest.mark.skipif(not _HAVE_MODELS, reason='GBDT joblibs not present')
-def test_event_candidates_synthetic():
-    from utils.triplet_join import build_track_lorentz, candidates_for_tier
+# ---------------------------------------------------------------------------
+# Window selection (pure)
+# ---------------------------------------------------------------------------
 
-    dump_cols, src_cols = _synthetic_event([[0, 1], [0, 2]])
-    models = load_gbdt_models()
-    row = event_candidates(0, dump_cols, src_cols, top_c=100, gbdt_models=models)
-
-    assert row['n_tracks'] == 5
-    assert row['recon'] is True
-    assert (row['gt_i'], row['gt_j'], row['gt_k']) == (0, 1, 2)
-    n = row['n_candidates']
-    for field_name in _LIST_FIELDS:
-        assert len(row[field_name]) == n
-
-    # Candidate indices reproduce the Tier-H enumeration exactly.
-    lorentz = build_track_lorentz(torch.tensor(src_cols['track_pt'][0]),
-                                  torch.tensor(src_cols['track_eta'][0]),
-                                  torch.tensor(src_cols['track_phi'][0]))
-    triplets, couple_row = candidates_for_tier(
-        'H', torch.tensor([[0, 1], [0, 2]]), torch.arange(5),
-        lorentz=lorentz, charge=torch.tensor(src_cols['track_charge'][0]),
-    )
-    assert row['cand_i'] == triplets[:, 0].tolist()
-    assert row['cand_j'] == triplets[:, 1].tolist()
-    assert row['cand_k'] == triplets[:, 2].tolist()
-    assert row['couple_rank'] == couple_row.tolist()
-
-    # is_gt marks decompositions of the GT 3-set {0,1,2} only.
-    for flag, i, j, k in zip(row['is_gt'], row['cand_i'], row['cand_j'], row['cand_k']):
-        assert flag == (sorted((i, j, k)) == [0, 1, 2])
-    assert sum(row['is_gt']) >= 1
-    assert all(0.0 <= s <= 1.0 for s in row['gbdt6_score'])
-    assert all(0.0 <= s <= 1.0 for s in row['gbdt8_score'])
+def test_window_head_is_descending_by_score():
+    scores = np.array([0.1, 0.9, 0.5, 0.7, 0.3], dtype=np.float32)
+    is_gt = np.zeros(5, dtype=bool)
+    rows, kinds, n_tail = _window_selection(
+        scores, is_gt, window=3, tail_sample=0,
+        generator=np.random.default_rng(0))
+    assert rows.tolist() == [1, 3, 2]
+    assert kinds.tolist() == [0, 0, 0]
+    assert n_tail == 2
 
 
-@pytest.mark.skipif(not _HAVE_MODELS, reason='GBDT joblibs not present')
-def test_event_candidates_non_reconstructable():
-    # GT couple (0,1) absent from the couple list -> not reconstructable.
-    dump_cols, src_cols = _synthetic_event([[0, 3]])
-    models = load_gbdt_models()
-    row = event_candidates(0, dump_cols, src_cols, top_c=100, gbdt_models=models)
-    assert row['recon'] is False
-    assert (row['gt_i'], row['gt_j'], row['gt_k']) == (-1, -1, -1)
-    assert sum(row['is_gt']) == 0
+def test_gt_rows_beyond_the_window_are_force_included():
+    scores = np.array([0.9, 0.8, 0.7, 0.6, 0.05], dtype=np.float32)
+    is_gt = np.array([False, False, False, False, True])
+    rows, kinds, n_tail = _window_selection(
+        scores, is_gt, window=2, tail_sample=0,
+        generator=np.random.default_rng(0))
+    assert rows.tolist()[:2] == [0, 1]
+    assert kinds.tolist()[:2] == [0, 0]
+    assert 4 in rows.tolist()
+    assert kinds[rows.tolist().index(4)] == 1
+    # Forced GT never counts toward the reweighting tail.
+    assert n_tail == 2
 
 
-@pytest.mark.skipif(
-    not (_HAVE_MODELS and os.path.exists(_DUMP) and glob.glob(_SRC_GLOB)),
-    reason='VAL dump, source parquet, or GBDT joblibs not present',
-)
-def test_builder_integration_real_val(tmp_path):
-    main([
-        '--out-dir', str(tmp_path),
-        '--tag', 'val',
-        '--max-events', '40',
-    ])
-    table = pq.read_table(str(tmp_path / 'candidates_val.parquet'))
-    assert table.num_rows == 40
+def test_gt_inside_the_window_stays_a_window_row():
+    scores = np.array([0.9, 0.8, 0.1], dtype=np.float32)
+    is_gt = np.array([True, False, False])
+    rows, kinds, _ = _window_selection(
+        scores, is_gt, window=2, tail_sample=0,
+        generator=np.random.default_rng(0))
+    assert rows.tolist() == [0, 1]
+    assert kinds.tolist() == [0, 0]
+
+
+def test_tail_sample_draws_beyond_the_window_without_replacement():
+    scores = np.linspace(1.0, 0.0, 40, dtype=np.float32)
+    is_gt = np.zeros(40, dtype=bool)
+    rows, kinds, n_tail = _window_selection(
+        scores, is_gt, window=10, tail_sample=5,
+        generator=np.random.default_rng(0))
+    head, tail = rows[:10], rows[10:]
+    assert kinds[:10].tolist() == [0] * 10
+    assert kinds[10:].tolist() == [2] * 5
+    assert len(set(tail.tolist())) == 5
+    assert all(index >= 10 for index in np.argsort(-scores)[tail])
+    assert n_tail == 30
+
+
+def test_no_window_returns_the_full_list_sorted_descending():
+    scores = np.array([0.2, 0.9, 0.4], dtype=np.float32)
+    is_gt = np.array([False, True, False])
+    rows, kinds, n_tail = _window_selection(
+        scores, is_gt, window=None, tail_sample=0,
+        generator=np.random.default_rng(0))
+    assert rows.tolist() == [1, 2, 0]
+    assert kinds.tolist() == [0, 0, 0]
+    assert n_tail == 0
+
+
+def test_window_selection_is_deterministic_under_a_seed():
+    scores = np.random.default_rng(3).random(100).astype(np.float32)
+    is_gt = np.zeros(100, dtype=bool)
+    first = _window_selection(scores, is_gt, window=20, tail_sample=10,
+                              generator=np.random.default_rng(7))
+    second = _window_selection(scores, is_gt, window=20, tail_sample=10,
+                               generator=np.random.default_rng(7))
+    assert first[0].tolist() == second[0].tolist()
+
+
+# ---------------------------------------------------------------------------
+# Filter model
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _HAVE_FILTER, reason='sweep filter joblib not present')
+def test_load_filter_model_resolves_the_100_feature_champion():
+    model = load_filter_model(FILTER_MODEL_GLOB)
+    assert int(model.n_features_in_) == 100
+    # CPU inference must work in a forked worker: predict on a zero row.
+    probabilities = model.predict_proba(np.zeros((1, 100), dtype=np.float32))
+    assert probabilities.shape == (1, 2)
+
+
+def test_load_filter_model_rejects_an_ambiguous_glob(tmp_path):
+    for name in ('a.joblib', 'b.joblib'):
+        (tmp_path / name).write_bytes(b'x')
+    with pytest.raises(AssertionError, match='exactly one'):
+        load_filter_model(str(tmp_path / '*.joblib'))
+
+
+# ---------------------------------------------------------------------------
+# Synthetic end-to-end fixture
+# ---------------------------------------------------------------------------
+
+def _synthetic_events(n_events, seed=0):
+    """5-track events; GT = tracks 0,1,2; couples cover the GT couple."""
+    generator = np.random.default_rng(seed)
+    events = []
+    for index in range(n_events):
+        jitter = 0.02 * generator.standard_normal(5)
+        events.append(dict(
+            src={
+                'event_n_tracks': 5,
+                'track_pt': (np.array([1.0, 1.2, 0.9, 1.1, 0.8]) + jitter).tolist(),
+                'track_eta': [0.10, 0.15, 0.12, 0.18, 0.30],
+                'track_phi': [0.05, 0.10, 0.08, 0.12, 0.50],
+                'track_charge': [1.0, 1.0, -1.0, -1.0, 1.0],
+                'track_dz_significance': [0.20, 0.25, 0.22, 0.28, 9.00],
+                'track_dxy_significance': [0.5, 0.6, 0.7, 0.8, 0.9],
+                'track_dca_significance': [1.0, 1.1, 1.2, 1.3, 1.4],
+                'track_n_valid_pixel_hits': [4.0, 4.0, 3.0, 5.0, 2.0],
+                'track_norm_chi2': [1.0, 1.2, 0.9, 1.1, 2.0],
+                'track_pt_error': [0.01, 0.02, 0.03, 0.04, 0.05],
+                'track_covariance_phi_phi': [0.001, 0.002, 0.003, 0.004, 0.005],
+                'track_covariance_lambda_lambda': [0.0011, 0.0021, 0.0031,
+                                                   0.0041, 0.0051],
+                'track_label_from_tau': [1.0, 1.0, 1.0, 0.0, 0.0],
+                'track_vertex_x': [0.10, 0.11, 0.09, 0.02, -0.50],
+                'track_vertex_y': [0.05, 0.06, 0.04, 0.01, 0.60],
+                'track_vertex_z': [1.00, 1.02, 0.98, 0.20, -4.00],
+                'track_dz': [0.30, 0.34, 0.28, 0.10, 7.00],
+                'event_primary_vertex_x': 0.0,
+                'event_primary_vertex_y': 0.0,
+                'sv_x': [0.10], 'sv_y': [0.05], 'sv_z': [1.00],
+                'sv_dlen_sig': [4.5], 'sv_mass': [0.62],
+                'other_track_pt': [0.40], 'other_track_eta': [0.13],
+                'other_track_phi': [0.09], 'other_track_dz': [0.31],
+                'event_run': 1, 'event_id': 1000 + index,
+                'event_luminosity_block': 7,
+                'source_batch_id': index // 2, 'source_microbatch_id': index % 2,
+            },
+            dump={
+                'stage1_sorted_indices': [2, 0, 3, 1, 4],
+                'stage1_scores': [0.9, 0.8, 0.7, 0.6, 0.5],
+                'stage2_sorted_indices': [2, 0, 3, 1],
+                'stage2_scores': [0.5, 0.4, 0.35, 0.3],
+                'stage3_sorted_couples': [[0, 1], [0, 2], [2, 3]],
+                'stage3_couple_scores': [0.95, 0.85, 0.75],
+                'event_run': 1, 'event_id': 1000 + index,
+                'event_luminosity_block': 7,
+                'source_batch_id': index // 2, 'source_microbatch_id': index % 2,
+            },
+        ))
+    return events
+
+
+def _write_fixture(tmp_path, events, dump_order):
+    src_dir = tmp_path / 'shards'
+    src_dir.mkdir()
+    half = len(events) // 2
+    for shard, chunk in enumerate((events[:half], events[half:])):
+        columns = {key: [event['src'][key] for event in chunk]
+                   for key in chunk[0]['src']}
+        pq.write_table(pa.table(columns), src_dir / f'src_{shard:03d}.parquet')
+    dump_columns = {key: [events[r]['dump'][key] for r in dump_order]
+                    for key in events[0]['dump']}
+    dump_path = tmp_path / 'dump.parquet'
+    pq.write_table(pa.table(dump_columns), dump_path)
+    return str(dump_path), str(src_dir / '*.parquet')
+
+
+@pytest.mark.skipif(not _HAVE_FILTER, reason='sweep filter joblib not present')
+def test_builder_end_to_end_on_a_permuted_dump(tmp_path):
+    events = _synthetic_events(4)
+    dump_path, src_glob = _write_fixture(tmp_path, events, dump_order=[2, 0, 3, 1])
+    out_dir = tmp_path / 'out'
+    main(['--role', 'train', '--dump', dump_path, '--src-glob', src_glob,
+          '--out-dir', str(out_dir), '--window', '4', '--tail-sample', '2',
+          '--top-c', '125'])
+
+    table = pq.read_table(out_dir / 'candidates_train.parquet')
+    assert table.num_rows == 4
     assert table.schema.equals(CANDIDATE_SCHEMA)
-    n_recon = 0
-    for row in table.to_pylist():
-        n = row['n_candidates']
-        assert n == len(row['cand_i']) == len(row['gbdt6_score']) == len(row['is_gt'])
-        assert 0 < n <= 32768
-        assert max(row['cand_k']) < row['n_tracks']
-        gt_flags = sum(row['is_gt'])
-        if row['recon']:
-            n_recon += 1
-            assert 1 <= gt_flags <= 3
-            gt_set = sorted((row['gt_i'], row['gt_j'], row['gt_k']))
-            for flag, i, j, k in zip(row['is_gt'], row['cand_i'], row['cand_j'], row['cand_k']):
-                if flag:
-                    assert sorted((i, j, k)) == gt_set
-        else:
-            assert gt_flags == 0
-            assert row['gt_i'] == -1
-    assert n_recon > 0
-
-
-def _replicate(dump_cols, src_cols, n):
-    dump = {key: value * n for key, value in dump_cols.items()}
-    src = {key: value * n for key, value in src_cols.items()}
-    return dump, src
-
-
-@pytest.mark.skipif(not _HAVE_MODELS, reason='GBDT joblibs not present')
-def test_cascade_columns_synthetic():
-    dump_cols, src_cols = _synthetic_event([[0, 1], [0, 2]])
-    models = load_gbdt_models()
-    row = event_candidates(0, dump_cols, src_cols, top_c=100, gbdt_models=models)
-
-    # track_s1 = stage1 scores scattered back to track order by the sorted indices.
-    assert row['track_s1'] == pytest.approx([0.8, 0.6, 0.9, 0.7, 0.5])
-    # track_s2 covers only the stage-2 set {2, 0, 3, 1}; track 4 is NaN.
-    track_s2 = row['track_s2']
-    assert track_s2[:4] == pytest.approx([0.4, 0.3, 0.5, 0.35])
-    assert np.isnan(track_s2[4])
-    # couple members always carry finite stage-2 scores.
-    for i, j in zip(row['cand_i'], row['cand_j']):
-        assert np.isfinite(track_s2[i]) and np.isfinite(track_s2[j])
-    assert row['couple_scores'] == pytest.approx([0.95, 0.85])
-    assert max(row['couple_rank']) < len(row['couple_scores'])
-
-
-@pytest.mark.skipif(not _HAVE_MODELS, reason='GBDT joblibs not present')
-def test_couple_scores_truncated_to_top_c():
-    dump_cols, src_cols = _synthetic_event([[0, 1], [0, 2]])
-    models = load_gbdt_models()
-    row = event_candidates(0, dump_cols, src_cols, top_c=1, gbdt_models=models)
-    assert row['couple_scores'] == pytest.approx([0.95])
-    assert max(row['couple_rank']) == 0
-
-
-def _write_prefix_fixtures(directory, dump_rows, src_rows):
-    import build_triplet_rank_candidates as builder
-
-    dump_cols, src_cols = _synthetic_event([[0, 1]])
-    dump = {key: value * dump_rows for key, value in dump_cols.items()}
-    src = {key: value * src_rows for key, value in src_cols.items()}
-    dump_path = os.path.join(directory, 'dump.parquet')
-    src_path = os.path.join(directory, 'src_0.parquet')
-    pq.write_table(pa.table(dump), dump_path)
-    pq.write_table(pa.table({key: src[key] for key in builder.SRC_COLS}), src_path)
-    return dump_path, os.path.join(directory, 'src_*.parquet')
-
-
-def test_load_prefix_allows_partial_dump(tmp_path):
-    from build_triplet_rank_candidates import _load_prefix
-
-    dump_path, src_glob = _write_prefix_fixtures(str(tmp_path), dump_rows=2, src_rows=3)
-    dump, src, n = _load_prefix(dump_path, src_glob, None)
-    assert n == 2 and dump.num_rows == 2 and src.num_rows == 2
-    _, _, n_capped = _load_prefix(dump_path, src_glob, 1)
-    assert n_capped == 1
-
-
-def test_load_prefix_rejects_dump_longer_than_src(tmp_path):
-    from build_triplet_rank_candidates import _load_prefix
-
-    dump_path, src_glob = _write_prefix_fixtures(str(tmp_path), dump_rows=4, src_rows=3)
-    with pytest.raises(AssertionError):
-        _load_prefix(dump_path, src_glob, None)
-
-
-@pytest.mark.skipif(not _HAVE_MODELS, reason='GBDT joblibs not present')
-def test_event_failure_writes_empty_row(tmp_path, monkeypatch):
-    import build_triplet_rank_candidates as builder
-
-    dump_cols, src_cols = _replicate(*_synthetic_event([[0, 1], [0, 2]]), 3)
-    models = load_gbdt_models()
-    real_event_features = builder.event_features
-
-    def flaky(r, *args, **kwargs):
-        if r == 1:
-            raise ValueError('boom')
-        return real_event_features(r, *args, **kwargs)
-
-    monkeypatch.setattr(builder, 'event_features', flaky)
-    out_path = str(tmp_path / 'cand.parquet')
-    builder.write_candidates(dump_cols, src_cols, range(3), 100, models, out_path, chunk_size=2)
-
-    table = pq.read_table(out_path)
-    assert table.num_rows == 3
     rows = table.to_pylist()
-    assert rows[1]['n_candidates'] == 0
-    assert rows[1]['recon'] is False
-    assert rows[1]['gt_i'] == -1
-    assert rows[1]['cand_i'] == []
-    assert rows[0]['n_candidates'] > 0
-    assert rows[2]['n_candidates'] > 0
-    assert not glob.glob(out_path + '.chunk*')
+    # Output rows follow SOURCE-SHARD order despite the permuted dump.
+    assert [row['event_id'] for row in rows] == [1000, 1001, 1002, 1003]
+    for row in rows:
+        n = len(row['cand_i'])
+        assert n == len(row['filter_score']) == len(row['row_kind'])
+        assert row['n_tierh'] >= n - sum(kind != 0 for kind in row['row_kind'])
+        window_scores = [score for score, kind
+                         in zip(row['filter_score'], row['row_kind']) if kind == 0]
+        assert window_scores == sorted(window_scores, reverse=True)
+        assert len(window_scores) <= 4
+        assert row['recon'] is True
+        assert any(row['is_gt'])
+        # The stage-1 scatter survived the identity join: couple members carry
+        # finite stage-2 scores.
+        track_s2 = row['track_s2']
+        for i, kind in zip(row['cand_i'], row['row_kind']):
+            assert np.isfinite(track_s2[i])
+    manifest = json.loads((out_dir / 'build_manifest_train.json').read_text())
+    assert manifest['window'] == 4
+    assert manifest['top_c'] == 125
+    ops = json.loads((out_dir / 'operating_points.json').read_text())
+    assert ops['score_column'] == 'filter_score'
+    assert set(ops['taus']) == {'p99', 'p95'}
 
 
-@pytest.mark.skipif(not _HAVE_MODELS, reason='GBDT joblibs not present')
-def test_chunk_resume_skips_complete_chunks(tmp_path):
-    import build_triplet_rank_candidates as builder
-
-    dump_cols, src_cols = _replicate(*_synthetic_event([[0, 1], [0, 2]]), 3)
-    models = load_gbdt_models()
-    out_path = str(tmp_path / 'cand.parquet')
-
-    # Pre-existing complete chunk 0 with sentinel content simulates a resumed run;
-    # the builder must skip it rather than recompute.
-    sentinel = builder._empty_row(src_cols, 0)
-    sentinel['n_tracks'] = 999
-    columns = {field.name: [sentinel[field.name]] for field in CANDIDATE_SCHEMA}
-    pq.write_table(pa.table(columns, schema=CANDIDATE_SCHEMA), out_path + '.chunk000000')
-
-    builder.write_candidates(dump_cols, src_cols, range(3), 100, models, out_path, chunk_size=1)
-
-    rows = pq.read_table(out_path).to_pylist()
-    assert len(rows) == 3
-    assert rows[0]['n_tracks'] == 999
-    assert rows[1]['n_candidates'] > 0
-    assert rows[2]['n_candidates'] > 0
-    assert not glob.glob(out_path + '.chunk*')
+@pytest.mark.skipif(not _HAVE_FILTER, reason='sweep filter joblib not present')
+def test_eval_role_stores_the_full_sorted_list(tmp_path):
+    events = _synthetic_events(4)
+    dump_path, src_glob = _write_fixture(tmp_path, events, dump_order=[1, 3, 0, 2])
+    out_dir = tmp_path / 'out'
+    main(['--role', 'eval', '--dump', dump_path, '--src-glob', src_glob,
+          '--out-dir', str(out_dir), '--top-c', '125'])
+    rows = pq.read_table(out_dir / 'candidates_eval.parquet').to_pylist()
+    for row in rows:
+        assert all(kind == 0 for kind in row['row_kind'])
+        assert len(row['cand_i']) == row['n_tierh']
+        assert row['n_tail_total'] == 0
+        scores = row['filter_score']
+        assert scores == sorted(scores, reverse=True)
 
 
-@pytest.mark.skipif(not _HAVE_MODELS, reason='GBDT joblibs not present')
-def test_batched_chunk_scores_match_per_event():
-    import build_triplet_rank_candidates as builder
-
-    dump_cols, src_cols = _replicate(*_synthetic_event([[0, 1], [0, 2]]), 3)
-    models = load_gbdt_models()
-    rows, n_failed = builder._process_chunk(list(range(3)), 0, dump_cols, src_cols, 100, models)
-    assert n_failed == 0
-    for r, row in enumerate(rows):
-        reference = event_candidates(r, dump_cols, src_cols, top_c=100, gbdt_models=models)
-        assert row['gbdt6_score'] == reference['gbdt6_score']
-        assert row['gbdt8_score'] == reference['gbdt8_score']
-        assert row['cand_i'] == reference['cand_i']
-        assert row['is_gt'] == reference['is_gt']
-
-
-@pytest.mark.skipif(
-    not (_HAVE_MODELS and os.path.exists(_DUMP) and glob.glob(_SRC_GLOB)),
-    reason='VAL dump, source parquet, or GBDT joblibs not present',
-)
-def test_parallel_workers_match_single_process(tmp_path):
-    single_dir, parallel_dir = tmp_path / 'single', tmp_path / 'parallel'
-    common = ['--tag', 'val', '--max-events', '40', '--chunk-size', '10', '--skip-tracks']
-    main(['--out-dir', str(single_dir), '--workers', '1'] + common)
-    main(['--out-dir', str(parallel_dir), '--workers', '2'] + common)
-    single = pq.read_table(str(single_dir / 'candidates_val.parquet'))
-    parallel = pq.read_table(str(parallel_dir / 'candidates_val.parquet'))
-    assert single.num_rows == parallel.num_rows == 40
-    # track_s2 legitimately holds NaN (outside the stage-1 top-K1) and arrow's
-    # equals treats NaN != NaN -> compare that column NaN-aware, the rest exactly.
-    nan_free = [name for name in single.schema.names if name != 'track_s2']
-    assert single.select(nan_free).equals(parallel.select(nan_free))
-    for left, right in zip(single['track_s2'].to_pylist(),
-                           parallel['track_s2'].to_pylist()):
-        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
-    assert not glob.glob(str(parallel_dir / 'candidates_val.parquet.chunk*'))
-    # Per-worker pre-sliced dump/src files (the OOM-avoidance mechanism) must not
-    # leak once the run completes.
-    assert not glob.glob(str(parallel_dir / 'candidates_val.parquet.worker_slices*'))
-
-
-@pytest.mark.skipif(
-    not (_HAVE_MODELS and os.path.exists(_DUMP) and glob.glob(_SRC_GLOB)),
-    reason='VAL dump, source parquet, or GBDT joblibs not present',
-)
-def test_worker_slices_are_small_self_contained_files(tmp_path):
-    # Each worker must read a file scoped to its OWN event range, not a zero-copy
-    # slice of the FULL dump/src (that pins the whole file's buffers in memory for
-    # the worker's lifetime -- the actual root cause of the TRAIN-scale OOM).
-    from build_triplet_rank_candidates import _load_prefix, _worker_ranges, _write_worker_slices
-
-    dump, src, n = _load_prefix(_DUMP, _SRC_GLOB, 40)
-    dump_path = str(tmp_path / 'dump.parquet')
-    src_path = str(tmp_path / 'src.parquet')
-    pq.write_table(dump, dump_path)
-    pq.write_table(src, src_path)
-
-    ranges = _worker_ranges(n, chunk_size=10, workers=4)
-    tmp_dir = str(tmp_path / 'slices')
-    os.makedirs(tmp_dir)
-    slice_paths = _write_worker_slices(dump_path, src_path.replace('src.parquet', 'src*.parquet'),
-                                       ranges, tmp_dir)
-    assert len(slice_paths) == len(ranges)
-    for (start, end), (dump_slice_path, src_slice_path) in zip(ranges, slice_paths):
-        assert pq.read_metadata(dump_slice_path).num_rows == end - start
-        assert pq.read_metadata(src_slice_path).num_rows == end - start
-
-
-@pytest.mark.skipif(
-    not glob.glob(_SRC_GLOB),
-    reason='source parquet not present',
-)
-def test_tracks_consolidation(tmp_path):
-    main([
-        '--out-dir', str(tmp_path),
-        '--tag', 'val',
-        '--max-events', '10',
-        '--tracks-only',
-    ])
-    tracks = pq.read_table(str(tmp_path / 'tracks_val.parquet'))
-    assert tracks.num_rows == 10
-    assert 'track_pt' in tracks.schema.names
-    assert 'track_label_from_tau' in tracks.schema.names
-    first = tracks.to_pylist()[0]
-    assert len(first['track_pt']) == first['event_n_tracks']
+def test_misaligned_dump_is_rejected(tmp_path):
+    events = _synthetic_events(4)
+    dump_path, src_glob = _write_fixture(tmp_path, events, dump_order=[2, 0, 3, 1])
+    # Corrupt one identity so a source event is absent from the dump.
+    table = pq.read_table(dump_path)
+    ids = table['event_id'].to_pylist()
+    ids[0] = 999999
+    table = table.set_column(table.schema.get_field_index('event_id'),
+                             'event_id', pa.array(ids))
+    pq.write_table(table, dump_path)
+    with pytest.raises(ValueError, match='absent from the dump'):
+        list(_dump_blocks(dump_path, src_glob, None))

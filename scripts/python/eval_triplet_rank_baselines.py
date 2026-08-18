@@ -11,18 +11,29 @@ from tqdm import tqdm
 from utils.triplet_split import load_split
 
 TRIPLET_RANK_DIR = os.path.join(os.path.dirname(__file__), '..', '..',
-                                'data', 'low-pt', 'eval', 'triplet_rank')
+                                'data', 'triplet_rank_v2')
 REPORTS_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'reports')
 K_VALUES = [1, 5, 10, 20, 50, 100]
 
-# tau values from the TRAIN-trained GBDT soft-filters (recall floors on a held-out 60k
-# TRAIN slice; VAL never seen by the filter -> no leakage); tierH applies no learned filter.
+# tierH applies no learned gate. The learned operating points (p95/p99 taus of
+# the 100-feature filter) are re-derived per artifact generation and read from
+# operating_points.json — never hardcoded here again.
 OPERATING_POINTS = {
-    'tierH': ('gbdt6_score', 0.0),
-    'd6@0.99': ('gbdt6_score', 0.025128),
-    'd8@0.95': ('gbdt8_score', 0.158525),
+    'tierH': ('filter_score', -np.inf),
 }
-ORDERINGS = ['gbdt', 'couple_rank_lex', 'random']
+ORDERINGS = ['filter', 'couple_rank_lex', 'random']
+
+
+def load_operating_points(path: str) -> dict[str, tuple[str, float]]:
+    """path: operating_points.json written by the candidates builder. Returns
+    {name: (score_column, tau)} including the ungated tierH point."""
+    with open(path) as handle:
+        payload = json.load(handle)
+    score_column = payload['score_column']
+    points = dict(OPERATING_POINTS)
+    points.update({name: (score_column, float(tau))
+                   for name, tau in payload['taus'].items()})
+    return points
 
 
 def deduped_gt_rank(keys: np.ndarray, is_gt: np.ndarray) -> int | None:
@@ -33,22 +44,24 @@ def deduped_gt_rank(keys: np.ndarray, is_gt: np.ndarray) -> int | None:
     """
     if not is_gt.any():
         return None
-    encoded = (keys[:, 0].astype(np.int64) * 4_194_304
-               + keys[:, 1].astype(np.int64) * 2048 + keys[:, 2].astype(np.int64))
+    # Radix 4096: the shards pad to 2,100 tracks, which overflows base 2048.
+    encoded = (keys[:, 0].astype(np.int64) * 16_777_216
+               + keys[:, 1].astype(np.int64) * 4096 + keys[:, 2].astype(np.int64))
     _, first_positions = np.unique(encoded, return_index=True)
     gt_first = int(np.flatnonzero(is_gt)[0])
     return int(np.searchsorted(np.sort(first_positions), gt_first)) + 1
 
 
 def _event_orderings(scores, couple_rank, generator):
-    yield 'gbdt', np.argsort(-scores, kind='stable')
+    yield 'filter', np.argsort(-scores, kind='stable')
     yield 'couple_rank_lex', np.lexsort((-scores, couple_rank))
     yield 'random', generator.permutation(len(scores))
 
 
 def evaluate_baselines(candidates_path: str, *, operating_point: str,
-                       event_indices=None, seed: int = 0) -> dict:
-    score_column, tau = OPERATING_POINTS[operating_point]
+                       operating_points=None, event_indices=None,
+                       seed: int = 0) -> dict:
+    score_column, tau = (operating_points or OPERATING_POINTS)[operating_point]
     table = pq.read_table(candidates_path,
                           columns=['cand_i', 'cand_j', 'cand_k', 'couple_rank',
                                    score_column, 'is_gt'])
@@ -113,7 +126,9 @@ def _print_table(results: dict) -> list[str]:
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument('--candidates', default=os.path.join(TRIPLET_RANK_DIR, 'candidates_val.parquet'))
+    ap.add_argument('--candidates', default=os.path.join(TRIPLET_RANK_DIR, 'candidates_eval.parquet'))
+    ap.add_argument('--operating-points', default=os.path.join(
+        TRIPLET_RANK_DIR, 'operating_points.json'))
     ap.add_argument('--split-json', default=None,
                     help='also report the held-out slice of this split file')
     ap.add_argument('--out-json', default=os.path.join(REPORTS_DIR, 'triplet_rank_baselines.json'))
@@ -121,6 +136,7 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args(argv)
 
+    points = load_operating_points(args.operating_points)
     slices = {'full': None}
     if args.split_json:
         slices['held_out_20'] = load_split(args.split_json, 'test')
@@ -129,8 +145,9 @@ def main(argv=None):
     for slice_name, indices in slices.items():
         results[slice_name] = {
             op: evaluate_baselines(args.candidates, operating_point=op,
+                                   operating_points=points,
                                    event_indices=indices, seed=args.seed)
-            for op in OPERATING_POINTS
+            for op in points
         }
     _print_table(results)
 
