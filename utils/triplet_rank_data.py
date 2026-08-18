@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import json
 import os
 
@@ -9,11 +10,17 @@ import torch
 import yaml
 from torch.utils.data import Dataset
 
-from utils.triplet_join import FEATURE_NAMES, build_track_lorentz, triplet_feature_columns
+from utils.triplet_join import (
+    FEATURE_NAMES,
+    FEATURE_NAMES_EXTENDED,
+    build_track_lorentz,
+    triplet_feature_columns,
+)
+from utils.vertex_fit_features import FIT_NAMES, static_fit_columns
 
 DEFAULT_AUTO_YAML = os.path.join(
     os.path.dirname(__file__), '..', 'data', 'low-pt',
-    'lowpt_tau_trackfinder.c8a40f560c44edfe47c8f0fc25230de1.auto.yaml',
+    'lowpt_tau_trackfinder.4bb52a63a2023c146396395a612cbe3f.auto.yaml',
 )
 
 # pf_features channel order from the data-config yaml; formulas from its new_variables.
@@ -26,33 +33,44 @@ TRACK16_VAR_NAMES = [
 ]
 
 # FEATURE_NAMES substrings flagged for sign(x)*log1p(|x|) before the affine transform:
-# raw significances, covariances, pt errors, chi2, and the Minkowski dot span decades.
-LOG1P_MARKERS = ('dz', 'dxy', 'dca', 'chi2', 'pt_error', 'rel_pt_err', 'cov_', 'lorentz_dot')
+# raw significances, covariances, pt errors, chi2, fit geometry and the Minkowski
+# dot span decades.
+LOG1P_MARKERS = ('dz', 'dxy', 'dca', 'chi2', 'pt_error', 'rel_pt_err', 'cov_',
+                 'lorentz_dot', 'fit_res', 'fit_lxy', 'fit_sigma', 'fit_arc',
+                 'fit_dlen', 'fitpv_lxy')
 
-# Optional per-candidate inputs beyond the 89 geometry features: the GBDT soft-filter
-# scores (always present in the candidates artifact) and the frozen-cascade scores
-# gathered from the per-event track_s1/track_s2/couple_scores columns (present only in
-# artifacts built with the cascade-column schema).
-GBDT_EXTRA_NAMES = ['gbdt6_score', 'gbdt8_score']
+# The reranker's per-candidate base is the h6s4 champion's 100-feature layout:
+# the legacy 89 plus the vertex (6) and physics (5) blocks. Isolation and
+# secondary-vertex blocks measured inert and are never computed.
+H6_FEATURE_WIDTH = 11
+BASE_FEATURE_NAMES = list(FEATURE_NAMES_EXTENDED[:len(FEATURE_NAMES) + H6_FEATURE_WIDTH])
+
+# The single soft-filter score column (the gbdt6/gbdt8 pair died with the old
+# cascade) and the frozen-cascade extras gathered per candidate.
+FILTER_EXTRA_NAMES = ['filter_score']
 CASCADE_EXTRA_NAMES = ['s1_i', 's1_j', 's1_k', 's2_i', 's2_j', 's2_k',
                        's2_k_isvalid', 's3_couple']
-# Per-candidate standings within the event's full tau-surviving list; computed at
-# dataset time from the full list on both the train and eval side, so the sampled
-# training subset sees the same values as full-list eval.
-CONTEXT_FEATURE_NAMES = ['ctx_gbdt6_rank_frac', 'ctx_gbdt6_top_gap', 'ctx_gbdt6_z',
-                         'ctx_gbdt8_rank_frac', 'ctx_gbdt8_top_gap',
-                         'ctx_log_n_surviving', 'ctx_couple_rank_frac']
+# Per-candidate standings within the event's serving list, computed over the
+# full surviving list on both train and eval sides.
+CONTEXT_FEATURE_NAMES = ['ctx_filter_rank_frac', 'ctx_filter_top_gap',
+                         'ctx_filter_z', 'ctx_log_n_surviving',
+                         'ctx_couple_rank_frac']
+
+IDENTITY_COLS = ['event_run', 'event_id', 'event_luminosity_block',
+                 'source_batch_id', 'source_microbatch_id']
+
+_LOGIT_EPS = 1e-7
 
 
 def resolve_feature_names(table: '_EventTable', extra_features: str) -> list[str]:
-    if extra_features not in ('none', 'gbdt', 'all', 'auto'):
+    if extra_features not in ('none', 'filter', 'all', 'auto'):
         raise ValueError(f'unknown extra_features {extra_features!r}')
     if extra_features == 'none':
-        return list(FEATURE_NAMES)
+        return list(BASE_FEATURE_NAMES)
     if extra_features == 'all' and not table.has_cascade_columns:
-        raise ValueError('extra_features=all requires track_s1/track_s2/couple_scores '
-                         'columns in the candidates artifact')
-    names = list(FEATURE_NAMES) + GBDT_EXTRA_NAMES
+        raise ValueError('extra_features=all requires track_s1/track_s2/'
+                         'couple_scores columns in the candidates artifact')
+    names = list(BASE_FEATURE_NAMES) + FILTER_EXTRA_NAMES
     if extra_features == 'all' or (extra_features == 'auto' and table.has_cascade_columns):
         names += CASCADE_EXTRA_NAMES
     return names
@@ -136,42 +154,78 @@ def _plain_array(chunked):
 
 
 class _EventTable:
-    """Row-position-aligned access to the candidates and tracks parquet artifacts."""
+    """Schema-v2 candidates plus per-track columns read straight from the
+    source shards — the candidates artifact is written in source-shard order
+    and echoes the 5-column identity key, which is asserted here at load."""
 
-    _CAND_COLS = ['n_tracks', 'n_candidates', 'cand_i', 'cand_j', 'cand_k',
-                  'couple_rank', 'gbdt6_score', 'gbdt8_score', 'is_gt', 'recon']
+    _CAND_COLS = ['n_tracks', 'n_tierh', 'n_tail_total', 'cand_i', 'cand_j',
+                  'cand_k', 'couple_rank', 'filter_score', 'is_gt', 'row_kind',
+                  'recon']
     _CASCADE_COLS = ['track_s1', 'track_s2', 'couple_scores']
     _TRACK_COLS = ['track_pt', 'track_eta', 'track_phi', 'track_charge',
                    'track_dz_significance', 'track_dxy_significance',
                    'track_dca_significance', 'track_n_valid_pixel_hits',
                    'track_norm_chi2', 'track_pt_error',
-                   'track_covariance_phi_phi', 'track_covariance_lambda_lambda']
+                   'track_covariance_phi_phi', 'track_covariance_lambda_lambda',
+                   'track_vertex_x', 'track_vertex_y', 'track_vertex_z',
+                   'track_dz', 'track_label_from_b',
+                   'track_covariance_dxy_dxy', 'track_covariance_dsz_dsz',
+                   'track_covariance_dxy_dsz', 'track_covariance_phi_dxy',
+                   'track_n_valid_hits',
+                   'other_track_pt', 'other_track_eta', 'other_track_phi',
+                   'other_track_dz']
+    _EVENT_COLS = ['event_primary_vertex_x', 'event_primary_vertex_y',
+                   'event_primary_vertex_z']
 
-    def __init__(self, candidates_path: str, tracks_path: str):
+    def __init__(self, candidates_path: str, src_glob: str):
         schema_names = set(pq.read_schema(candidates_path).names)
         self.has_cascade_columns = all(name in schema_names for name in self._CASCADE_COLS)
-        cand_cols = self._CAND_COLS + (self._CASCADE_COLS if self.has_cascade_columns else [])
+        cand_cols = self._CAND_COLS + IDENTITY_COLS \
+            + (self._CASCADE_COLS if self.has_cascade_columns else [])
         candidates = pq.read_table(candidates_path, columns=cand_cols)
-        tracks = pq.read_table(tracks_path, columns=self._TRACK_COLS)
-        assert candidates.num_rows == tracks.num_rows, 'candidates/tracks row mismatch'
+
+        shards = sorted(glob.glob(src_glob))
+        assert shards, f'no source shards matched {src_glob}'
+        import pyarrow as pa
+        src = pa.concat_tables([
+            pq.read_table(shard, columns=self._TRACK_COLS + self._EVENT_COLS
+                          + IDENTITY_COLS)
+            for shard in shards])
+        # A candidates artifact may cover a prefix of the shards (smoke builds).
+        assert candidates.num_rows <= src.num_rows, \
+            f'candidates rows {candidates.num_rows} exceed src rows {src.num_rows}'
+        src = src.slice(0, candidates.num_rows)
+        for name in IDENTITY_COLS:
+            expected = np.asarray(candidates[name])
+            actual = np.asarray(src[name])
+            assert (expected == actual).all(), (
+                f'identity echo mismatch on {name}: the candidates artifact was '
+                f'built against different shards or a different shard order')
         self.num_rows = candidates.num_rows
-        self.candidates = {name: _plain_array(candidates[name]) for name in cand_cols}
-        self.tracks = {name: _plain_array(tracks[name]) for name in self._TRACK_COLS}
+        self.candidates = {name: _plain_array(candidates[name])
+                           for name in cand_cols}
+        self.tracks = {name: _plain_array(src[name]) for name in self._TRACK_COLS}
+        self.events = {name: src[name].to_numpy(zero_copy_only=False)
+                       for name in self._EVENT_COLS}
 
     def candidate_arrays(self, r: int) -> dict[str, np.ndarray]:
         out = {}
-        for name in ['cand_i', 'cand_j', 'cand_k', 'couple_rank', 'gbdt6_score',
-                     'gbdt8_score', 'is_gt']:
+        for name in ['cand_i', 'cand_j', 'cand_k', 'couple_rank',
+                     'filter_score', 'is_gt', 'row_kind']:
             out[name] = np.asarray(self.candidates[name][r].values)
+        out['n_tail_total'] = int(self.candidates['n_tail_total'][r].as_py())
         return out
 
     def cascade_arrays(self, r: int) -> dict[str, np.ndarray]:
         return {name: np.asarray(self.candidates[name][r].values)
                 for name in self._CASCADE_COLS}
 
+    def _track_tensor(self, name: str, r: int) -> torch.Tensor:
+        return torch.tensor(np.asarray(self.tracks[name][r].values),
+                            dtype=torch.float32)
+
     def track_kw(self, r: int) -> dict[str, torch.Tensor]:
-        column = lambda name: torch.tensor(np.asarray(self.tracks[name][r].values),
-                                           dtype=torch.float32)
+        column = lambda name: self._track_tensor(name, r)
         pt, eta, phi = column('track_pt'), column('track_eta'), column('track_phi')
         return dict(
             lorentz=build_track_lorentz(pt, eta, phi),
@@ -183,6 +237,65 @@ class _EventTable:
             cov_phi_phi=column('track_covariance_phi_phi'),
             cov_lambda_lambda=column('track_covariance_lambda_lambda'),
         )
+
+    def h6_inputs(self, r: int) -> dict[str, torch.Tensor]:
+        """Inputs for the leading H6_FEATURE_WIDTH feature columns. The
+        secondary-vertex keys are supplied empty: the SV block sits beyond
+        width 11 and is never computed."""
+        empty = torch.zeros(0, dtype=torch.float32)
+        return dict(
+            vertex_x=self._track_tensor('track_vertex_x', r),
+            vertex_y=self._track_tensor('track_vertex_y', r),
+            vertex_z=self._track_tensor('track_vertex_z', r),
+            dz_raw=self._track_tensor('track_dz', r),
+            primary_vertex_x=torch.tensor(self.events['event_primary_vertex_x'][r],
+                                          dtype=torch.float32),
+            primary_vertex_y=torch.tensor(self.events['event_primary_vertex_y'][r],
+                                          dtype=torch.float32),
+            sv_x=empty, sv_y=empty, sv_z=empty, sv_dlen_sig=empty, sv_mass=empty,
+            other_pt=self._track_tensor('other_track_pt', r),
+            other_eta=self._track_tensor('other_track_eta', r),
+            other_phi=self._track_tensor('other_track_phi', r),
+            other_dz=self._track_tensor('other_track_dz', r),
+        )
+
+    def primary_vertex(self, r: int) -> torch.Tensor:
+        return torch.tensor([self.events[name][r] for name in self._EVENT_COLS],
+                            dtype=torch.float32)
+
+    def vertex_fit_kw(self, r: int) -> dict[str, torch.Tensor]:
+        return dict(
+            vertex_x=self._track_tensor('track_vertex_x', r),
+            vertex_y=self._track_tensor('track_vertex_y', r),
+            vertex_z=self._track_tensor('track_vertex_z', r),
+            var_dxy=self._track_tensor('track_covariance_dxy_dxy', r),
+            var_dsz=self._track_tensor('track_covariance_dsz_dsz', r),
+        )
+
+    def quality_channels(self, r: int) -> torch.Tensor:
+        """Returns (T, 12) log-compressed per-track quality channels feeding
+        the learned fit-weight head."""
+        log = lambda name: torch.log(
+            torch.clamp_min(self._track_tensor(name, r), 1e-12))
+        log_abs = lambda name: torch.log1p(self._track_tensor(name, r).abs())
+        return torch.stack([
+            log('track_covariance_dxy_dxy'),
+            log('track_covariance_dsz_dsz'),
+            log_abs('track_covariance_dxy_dsz'),
+            log_abs('track_covariance_phi_dxy'),
+            log('track_covariance_phi_phi'),
+            log('track_covariance_lambda_lambda'),
+            log('track_pt_error'),
+            torch.log1p(self._track_tensor('track_norm_chi2', r)),
+            self._track_tensor('track_n_valid_pixel_hits', r),
+            self._track_tensor('track_n_valid_hits', r),
+            log_abs('track_dxy_significance'),
+            log_abs('track_dz_significance'),
+        ], dim=1)
+
+    def from_b_counts(self, r: int, i, j, k) -> torch.Tensor:
+        labels = self._track_tensor('track_label_from_b', r) > 0.5
+        return (labels[i].long() + labels[j].long() + labels[k].long())
 
 
 def _segment_any(flat: np.ndarray, offsets: np.ndarray) -> np.ndarray:
@@ -199,11 +312,15 @@ def build_candidate_features(table: _EventTable, r: int, arrays: dict, selected,
     j = torch.tensor(arrays['cand_j'][selected], dtype=torch.long)
     k = torch.tensor(arrays['cand_k'][selected], dtype=torch.long)
     rank = torch.tensor(arrays['couple_rank'][selected], dtype=torch.long)
-    features = triplet_feature_columns(i, j, k, rank, **kw)
-    extra_names = feature_names[len(FEATURE_NAMES):]
+    features = triplet_feature_columns(
+        i, j, k, rank, h6_inputs=table.h6_inputs(r),
+        h6_width=H6_FEATURE_WIDTH, **kw)
+    extra_names = feature_names[len(BASE_FEATURE_NAMES):]
     if extra_names:
-        values = {name: torch.tensor(arrays[name][selected], dtype=torch.float32)
-                  for name in extra_names if name in GBDT_EXTRA_NAMES}
+        values = {}
+        if 'filter_score' in extra_names:
+            values['filter_score'] = torch.tensor(
+                arrays['filter_score'][selected], dtype=torch.float32)
         if any(name in CASCADE_EXTRA_NAMES for name in extra_names):
             cascade = table.cascade_arrays(r)
             track_s1 = torch.tensor(cascade['track_s1'], dtype=torch.float32)
@@ -236,16 +353,13 @@ def event_context_features(arrays: dict, cascade: dict, surviving: np.ndarray,
     n_surviving = len(surviving)
     if n_surviving == 0:
         return torch.zeros((0, len(CONTEXT_FEATURE_NAMES)), dtype=torch.float32)
-    gbdt6 = arrays['gbdt6_score'][surviving].astype(np.float64)
-    gbdt8 = arrays['gbdt8_score'][surviving].astype(np.float64)
+    scores = arrays['filter_score'][surviving].astype(np.float64)
     n_couples = len(cascade['couple_scores'])
     couple_rank = arrays['couple_rank'][surviving].astype(np.float64)
     context = np.stack([
-        _rank_fractions(gbdt6),
-        gbdt6.max() - gbdt6,
-        (gbdt6 - gbdt6.mean()) / (gbdt6.std() + 1e-6),
-        _rank_fractions(gbdt8),
-        gbdt8.max() - gbdt8,
+        _rank_fractions(scores),
+        scores.max() - scores,
+        (scores - scores.mean()) / (scores.std() + 1e-6),
         np.full(n_surviving, np.log1p(n_surviving)),
         couple_rank / n_couples if n_couples else np.zeros(n_surviving),
     ], axis=1)
@@ -255,52 +369,60 @@ def event_context_features(arrays: dict, cascade: dict, surviving: np.ndarray,
     return torch.tensor(context[lookup], dtype=torch.float32)
 
 
-def fit_norm_stats(candidates_path: str, tracks_path: str, *,
+def _static_fit_block(table: _EventTable, r: int, i, j, k) -> torch.Tensor:
+    kw = table.track_kw(r)
+    return static_fit_columns(
+        i, j, k, lorentz=kw['lorentz'], eta=kw['eta'], phi=kw['phi'],
+        primary_vertex=table.primary_vertex(r), **table.vertex_fit_kw(r))
+
+
+def fit_norm_stats(candidates_path: str, src_glob: str, *,
                    feature_names: list[str] | None = None, n_events: int = 2000,
                    per_event: int = 50, seed: int = 0, events=None,
-                   tau: float | None = None, score_column: str = 'gbdt6_score',
-                   context_features: bool = False) -> dict:
-    """Median/IQR stats over sampled surviving candidates; keys = feature_names
-    (default FEATURE_NAMES). NaN entries (missing Stage-2 scores) are ignored by
-    the percentiles; binary *_isvalid flags get passthrough stats.
-
-    events: optional event-row pool to sample from (e.g. the train split side);
-    defaults to all rows.
-    """
+                   tau: float | None = None,
+                   context_features: bool = False,
+                   vertex_fit: str = 'off') -> dict:
+    """Median/IQR stats over sampled surviving window candidates; keys =
+    feature_names (default BASE_FEATURE_NAMES) plus the static fit block when
+    vertex_fit != 'off' and the context block when context_features."""
     if context_features and tau is None:
         raise ValueError('context_features=True requires tau (context is defined '
                          'over the tau-surviving list)')
-    table = _EventTable(candidates_path, tracks_path)
+    table = _EventTable(candidates_path, src_glob)
     if feature_names is None:
-        feature_names = list(FEATURE_NAMES)
-    base_names = [name for name in feature_names if name not in CONTEXT_FEATURE_NAMES]
+        feature_names = list(BASE_FEATURE_NAMES)
+    base_names = [name for name in feature_names
+                  if name not in CONTEXT_FEATURE_NAMES and name not in FIT_NAMES]
+    with_fit = vertex_fit != 'off' or any(name in FIT_NAMES for name in feature_names)
     generator = np.random.default_rng(seed)
     pool = np.arange(table.num_rows) if events is None else np.asarray(events)
     events = generator.choice(pool, min(n_events, len(pool)), replace=False)
     samples = []
     for r in events:
         arrays = table.candidate_arrays(int(r))
-        n = len(arrays['cand_i'])
-        if n == 0:
+        window = arrays['row_kind'] == 0
+        if tau is not None:
+            window &= arrays['filter_score'] >= tau
+        surviving = np.where(window)[0]
+        if len(surviving) == 0:
             continue
-        if context_features:
-            surviving = np.where(arrays[score_column] >= tau)[0]
-            if len(surviving) == 0:
-                continue
-            take = surviving[generator.choice(len(surviving),
-                                              min(per_event, len(surviving)),
-                                              replace=False)]
-        else:
-            take = generator.choice(n, min(per_event, n), replace=False)
-        X, _, _, _ = build_candidate_features(table, int(r), arrays, take, base_names)
+        take = surviving[generator.choice(len(surviving),
+                                          min(per_event, len(surviving)),
+                                          replace=False)]
+        X, i, j, k = build_candidate_features(table, int(r), arrays, take,
+                                              base_names)
+        if with_fit:
+            X = torch.cat([X, _static_fit_block(table, int(r), i, j, k)], dim=1)
         if context_features:
             context = event_context_features(arrays, table.cascade_arrays(int(r)),
                                              surviving, take)
             X = torch.cat([X, context], dim=1)
         samples.append(X.numpy())
     sample = np.concatenate(samples)
+    names = list(base_names) + (list(FIT_NAMES) if with_fit else []) \
+        + (list(CONTEXT_FEATURE_NAMES) if context_features else [])
     stats = {}
-    for column_index, name in enumerate(feature_names):
+    for column_index, name in enumerate(names):
         if name.endswith('_isvalid'):
             stats[name] = {'log1p': False, 'center': 0.0, 'scale': 1.0}
             continue
@@ -317,60 +439,50 @@ def fit_norm_stats(candidates_path: str, tracks_path: str, *,
 
 
 class TripletRankDataset(Dataset):
-    """Event-major candidate lists for listwise (InfoNCE) training and full-list eval.
+    """Event-major candidate lists for listwise training and full-list eval
+    over the schema-v2 window artifact.
 
-    Train items: 89-feature rows for all surviving positives + `num_negatives` random
-    negatives (with replacement, mirroring the couple loss sampler). Eval items: the
-    full surviving list + sorted 3-set keys for dedup.
-    """
+    Serving list = window rows (row_kind 0) at or above the gate tau. Train
+    items: all serving positives + `num_negatives` negatives sampled with
+    replacement; optionally the tail-sample rows (row_kind 2) with log
+    reweighting for an unbiased full-list loss. Eval items: the full serving
+    list + sorted 3-set keys for dedup."""
 
-    def __init__(self, candidates_path: str, tracks_path: str, *, tau: float,
-                 score_column: str = 'gbdt6_score', num_negatives: int = 50,
-                 mode: str = 'train', norm_stats: dict | None = None, seed: int = 0,
-                 extra_features: str = 'none', weaver_track_blocks: bool = False,
-                 context_features: bool = False, window_artifact: str | None = None,
-                 attention_window: int = 512):
+    def __init__(self, candidates_path: str, src_glob: str, *, tau: float,
+                 num_negatives: int = 512, mode: str = 'train',
+                 norm_stats: dict | None = None, seed: int = 0,
+                 extra_features: str = 'auto', context_features: bool = False,
+                 vertex_fit: str = 'off', tail_weighting: bool = False,
+                 from_b_targets: bool = False):
         assert mode in ('train', 'eval')
-        self.table = _EventTable(candidates_path, tracks_path)
+        assert vertex_fit in ('off', 'static', 'layer')
+        self.table = _EventTable(candidates_path, src_glob)
         self.tau = tau
-        self.score_column = score_column
         self.num_negatives = num_negatives
         self.mode = mode
         self.norm_stats = norm_stats
         self.generator = np.random.default_rng(seed)
-        self.attention_window = attention_window
-        self.window_positions = None
-        if window_artifact is not None:
-            window_table = pq.read_table(window_artifact, columns=['window_positions'])
-            assert window_table.num_rows == self.table.num_rows, (
-                f'window artifact rows {window_table.num_rows} != candidates rows '
-                f'{self.table.num_rows}')
-            self.window_positions = _plain_array(window_table['window_positions'])
+        self.vertex_fit = vertex_fit
+        self.tail_weighting = tail_weighting and mode == 'train'
+        self.from_b_targets = from_b_targets
         self._base_feature_names = resolve_feature_names(self.table, extra_features)
-        self.feature_names = self._base_feature_names
+        self.feature_names = list(self._base_feature_names)
+        if vertex_fit == 'static':
+            self.feature_names += list(FIT_NAMES)
         self.context_features = context_features
         if context_features:
             if not self.table.has_cascade_columns:
                 raise ValueError('context_features requires track_s1/track_s2/'
                                  'couple_scores columns in the candidates artifact')
-            self.feature_names = self._base_feature_names + CONTEXT_FEATURE_NAMES
-        self.weaver_track_blocks = weaver_track_blocks
-        if weaver_track_blocks:
-            self.track16_params = load_track16_params()
-            self.track_block_columns = torch.tensor(
-                [index for index, name in enumerate(self.feature_names)
-                 if name.startswith(('ti_', 'tj_', 'tk_'))], dtype=torch.long)
-            assert self.track_block_columns.numel() == 48, (
-                f'expected 48 ti_/tj_/tk_ feature columns, found '
-                f'{self.track_block_columns.numel()}')
-            self.track_block_mask = torch.zeros(len(self.feature_names), dtype=torch.bool)
-            self.track_block_mask[self.track_block_columns] = True
+            self.feature_names = self.feature_names + CONTEXT_FEATURE_NAMES
 
-        scores = self.table.candidates[score_column]
-        flat_survive = np.asarray(scores.values) >= tau
-        offsets = np.asarray(scores.offsets)
+        flat_scores = np.asarray(self.table.candidates['filter_score'].values)
+        flat_kind = np.asarray(self.table.candidates['row_kind'].values)
+        offsets = np.asarray(self.table.candidates['filter_score'].offsets)
         flat_gt = np.asarray(self.table.candidates['is_gt'].values)
-        self.trainable_indices = np.where(_segment_any(flat_survive & flat_gt, offsets))[0]
+        serving = (flat_scores >= tau) & (flat_kind == 0)
+        self.trainable_indices = np.where(
+            _segment_any(serving & flat_gt, offsets))[0]
 
     @property
     def feature_dim(self) -> int:
@@ -381,71 +493,102 @@ class TripletRankDataset(Dataset):
 
     def _select(self, r: int):
         arrays = self.table.candidate_arrays(r)
-        survive = arrays[self.score_column] >= self.tau
-        return arrays, np.where(survive)[0]
-
-    def _window_selection(self, r: int, arrays: dict,
-                          surviving: np.ndarray) -> np.ndarray:
-        window = np.asarray(self.window_positions[r].values,
-                            dtype=np.int64)[:self.attention_window]
-        window = window[arrays[self.score_column][window] >= self.tau]
-        if self.mode == 'train':
-            positives = surviving[arrays['is_gt'][surviving].astype(bool)]
-            missing = positives[~np.isin(positives, window)]
-            if missing.size >= window.size:
-                window = missing[:max(window.size, 1)]
-            elif missing.size:
-                window = window.copy()
-                window[-missing.size:] = missing
-        return window
+        serving = (arrays['filter_score'] >= self.tau) & (arrays['row_kind'] == 0)
+        return arrays, np.where(serving)[0]
 
     def __getitem__(self, r: int) -> dict[str, torch.Tensor]:
         arrays, surviving = self._select(int(r))
         is_gt = arrays['is_gt'][surviving]
-        if self.window_positions is not None:
-            selected = self._window_selection(int(r), arrays, surviving)
-            pos_mask = arrays['is_gt'][selected].astype(bool)
-        elif self.mode == 'train':
-            positive_positions = surviving[is_gt]
-            negative_positions = surviving[~is_gt]
+        log_weights = None
+        if self.mode == 'train':
+            positive_positions = surviving[is_gt.astype(bool)]
+            negative_positions = surviving[~is_gt.astype(bool)]
             if len(negative_positions) == 0:
                 selected = positive_positions
             else:
                 sampled = self.generator.integers(0, len(negative_positions),
                                                   self.num_negatives)
-                selected = np.concatenate([positive_positions, negative_positions[sampled]])
+                selected = np.concatenate([positive_positions,
+                                           negative_positions[sampled]])
             pos_mask = np.zeros(len(selected), dtype=bool)
             pos_mask[:len(positive_positions)] = True
+            if self.tail_weighting:
+                tail = np.where(arrays['row_kind'] == 2)[0]
+                if len(tail):
+                    log_weight = float(np.log(arrays['n_tail_total'] / len(tail)))
+                    log_weights = np.concatenate([
+                        np.zeros(len(selected)), np.full(len(tail), log_weight)])
+                    selected = np.concatenate([selected, tail])
+                    pos_mask = np.concatenate(
+                        [pos_mask, np.zeros(len(tail), dtype=bool)])
+                else:
+                    log_weights = np.zeros(len(selected))
         else:
             selected = surviving
             pos_mask = is_gt.astype(bool)
 
         features, i, j, k = build_candidate_features(
             self.table, int(r), arrays, selected, self._base_feature_names)
-        if self.weaver_track_blocks:
-            kw = self.table.track_kw(int(r))
-            pt = torch.sqrt(kw['lorentz'][0] ** 2 + kw['lorentz'][1] ** 2)
-            track16 = track16_std(
-                pt=pt, eta=kw['eta'], phi=kw['phi'], charge=kw['charge'],
-                dxy_sig=kw['dxy_sig'], dz_sig=kw['dz'], norm_chi2=kw['norm_chi2'],
-                pt_error=kw['pt_error'], n_pixel=kw['n_pixel'], dca_sig=kw['dca_sig'],
-                cov_phi_phi=kw['cov_phi_phi'], cov_lambda_lambda=kw['cov_lambda_lambda'],
-                params=self.track16_params)
-            features[:, self.track_block_columns] = torch.cat(
-                [track16[i], track16[j], track16[k]], dim=1)
+        if self.vertex_fit == 'static':
+            features = torch.cat(
+                [features, _static_fit_block(self.table, int(r), i, j, k)], dim=1)
         if self.context_features:
             context = event_context_features(
                 arrays, self.table.cascade_arrays(int(r)), surviving, selected)
             features = torch.cat([features, context], dim=1)
         if self.norm_stats is not None:
-            standardized = standardize_features(features, self.feature_names, self.norm_stats)
-            if self.weaver_track_blocks:
-                standardized = torch.where(self.track_block_mask, features, standardized)
-            features = standardized
-        item = {'features': features, 'pos_mask': torch.from_numpy(pos_mask)}
+            features = standardize_features(features, self.feature_names,
+                                            self.norm_stats)
+
+        scores = np.clip(arrays['filter_score'][selected].astype(np.float64),
+                         _LOGIT_EPS, 1.0 - _LOGIT_EPS)
+        item = {
+            'features': features,
+            'pos_mask': torch.from_numpy(pos_mask),
+            'filter_logit': torch.tensor(np.log(scores / (1.0 - scores)),
+                                         dtype=torch.float32),
+        }
+        if log_weights is not None:
+            item['log_weights'] = torch.tensor(log_weights, dtype=torch.float32)
+        if self.from_b_targets:
+            item['from_b'] = self.table.from_b_counts(int(r), i, j, k)
+        if self.vertex_fit == 'layer':
+            item.update(self._fit_layer_inputs(int(r), i, j, k))
         if self.mode == 'eval':
             item['keys'] = torch.stack([i, j, k], dim=1).sort(dim=1).values
         return item
+
+    def _fit_layer_inputs(self, r: int, i, j, k) -> dict[str, torch.Tensor]:
+        kw = self.table.track_kw(r)
+        fit = self.table.vertex_fit_kw(r)
+        members = torch.stack([i, j, k], dim=0)
+        reference = torch.stack([
+            torch.stack([fit['vertex_x'][members[m]], fit['vertex_y'][members[m]],
+                         fit['vertex_z'][members[m]]], dim=0)
+            for m in range(3)], dim=0)
+        momentum = sum(kw['lorentz'][:3, members[m]] for m in range(3))
+        energy = sum(kw['lorentz'][3, members[m]] for m in range(3))
+        mass = (energy.square() - momentum.square().sum(dim=0)) \
+            .clamp_min(0.0).sqrt()
+        quality = self.table.quality_channels(r)
+        return {
+            'fit_reference': reference,
+            'fit_eta': torch.stack([kw['eta'][members[m]] for m in range(3)]),
+            'fit_phi': torch.stack([kw['phi'][members[m]] for m in range(3)]),
+            'fit_var_dxy': torch.stack(
+                [fit['var_dxy'][members[m]] for m in range(3)]),
+            'fit_var_dsz': torch.stack(
+                [fit['var_dsz'][members[m]] for m in range(3)]),
+            'fit_momentum': momentum,
+            'fit_mass': mass,
+            'fit_quality': torch.stack(
+                [quality[members[m]] for m in range(3)], dim=1).permute(2, 1, 0),
+            'primary_vertex': self.table.primary_vertex(r),
+        }
+
+
+_FIT_PAD_KEYS = ['fit_reference', 'fit_eta', 'fit_phi', 'fit_var_dxy',
+                 'fit_var_dsz', 'fit_momentum', 'fit_quality']
 
 
 def collate_triplet_rank(items: list[dict]) -> dict[str, torch.Tensor]:
@@ -456,12 +599,39 @@ def collate_triplet_rank(items: list[dict]) -> dict[str, torch.Tensor]:
     features = torch.zeros(batch_size, num_features, max_candidates)
     pos_mask = torch.zeros(batch_size, max_candidates, dtype=torch.bool)
     valid_mask = torch.zeros(batch_size, max_candidates, dtype=torch.bool)
+    filter_logit = torch.zeros(batch_size, max_candidates)
     for b, item in enumerate(items):
         n = item['features'].shape[0]
         features[b, :, :n] = item['features'].T
         pos_mask[b, :n] = item['pos_mask']
         valid_mask[b, :n] = True
-    return {'features': features, 'pos_mask': pos_mask, 'valid_mask': valid_mask}
+        filter_logit[b, :n] = item['filter_logit']
+    batch = {'features': features, 'pos_mask': pos_mask,
+             'valid_mask': valid_mask, 'filter_logit': filter_logit}
+    if 'log_weights' in items[0]:
+        log_weights = torch.zeros(batch_size, max_candidates)
+        for b, item in enumerate(items):
+            log_weights[b, :item['log_weights'].shape[0]] = item['log_weights']
+        batch['log_weights'] = log_weights
+    if 'from_b' in items[0]:
+        from_b = torch.zeros(batch_size, max_candidates, dtype=torch.long)
+        for b, item in enumerate(items):
+            from_b[b, :item['from_b'].shape[0]] = item['from_b']
+        batch['from_b'] = from_b
+    if 'fit_reference' in items[0]:
+        for key in _FIT_PAD_KEYS:
+            shape = items[0][key].shape[:-1]
+            padded = torch.zeros(batch_size, *shape, max_candidates)
+            for b, item in enumerate(items):
+                padded[b, ..., :item[key].shape[-1]] = item[key]
+            batch[key] = padded
+        mass = torch.zeros(batch_size, max_candidates)
+        for b, item in enumerate(items):
+            mass[b, :item['fit_mass'].shape[0]] = item['fit_mass']
+        batch['fit_mass'] = mass
+        batch['primary_vertex'] = torch.stack(
+            [item['primary_vertex'] for item in items])
+    return batch
 
 
 def collate_triplet_rank_eval(items: list[dict]) -> dict:
