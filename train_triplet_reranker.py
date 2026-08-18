@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -14,7 +15,12 @@ from torch.utils.data import DataLoader, Subset, SubsetRandomSampler
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts', 'python'))
 
-from eval_triplet_rank_baselines import K_VALUES, OPERATING_POINTS, deduped_gt_rank
+from eval_triplet_rank_baselines import (
+    K_VALUES,
+    OPERATING_POINTS,
+    deduped_gt_rank,
+    load_operating_points,
+)
 from utils.checkpointing import CheckpointManager
 from utils.experiment import build_experiment_directory
 from utils.training import build_warmup_scheduler
@@ -28,76 +34,73 @@ from utils.triplet_rank_data import (
 )
 from utils.triplet_split import load_split
 from weaver.nn.model.TripletReranker import TripletReranker
+from weaver.nn.model.VertexFit import FIT_NAMES
 
 logger = logging.getLogger('train_triplet_reranker')
 
-TRIPLET_RANK_DIR = os.path.join(os.path.dirname(__file__), 'data', 'low-pt', 'eval', 'triplet_rank')
+TRIPLET_RANK_DIR = os.path.join(os.path.dirname(__file__), 'data', 'triplet_rank_v2')
+DATA_DIR = os.path.join(os.path.dirname(__file__), 'data', 'low-pt')
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Stage-4 triplet reranker trainer '
-                                                 '(offline candidate artifacts, InfoNCE top-1).')
-    parser.add_argument('--candidates', default=os.path.join(TRIPLET_RANK_DIR, 'candidates_val.parquet'))
-    parser.add_argument('--tracks', default=os.path.join(TRIPLET_RANK_DIR, 'tracks_val.parquet'))
-    parser.add_argument('--eval-candidates', default=None,
-                        help='separate eval-side candidates (train-on-train / eval-on-val); '
-                             'mutually exclusive with --split-json')
-    parser.add_argument('--eval-tracks', default=None)
+                                                 '(schema-v2 window artifacts).')
+    parser.add_argument('--candidates', default=os.path.join(TRIPLET_RANK_DIR, 'candidates_train.parquet'))
+    parser.add_argument('--src-glob', default=os.path.join(DATA_DIR, 'train', '*.parquet'))
+    parser.add_argument('--eval-candidates', default=os.path.join(TRIPLET_RANK_DIR, 'candidates_eval.parquet'))
+    parser.add_argument('--eval-src-glob', default=os.path.join(DATA_DIR, 'eval', '*.parquet'))
     parser.add_argument('--eval-events', type=int, default=20000,
                         help='fixed-seed eval subsample per epoch; the final eval always '
                              'runs on the full eval side')
     parser.add_argument('--eval-batch-size', type=int, default=1,
-                        help='events per eval forward; >1 changes BatchNorm batch '
-                             'statistics and lets padding leak into them — keep 1 '
-                             'for exact per-event scoring')
-    parser.add_argument('--eval-every', type=int, default=1,
-                        help='run the per-epoch eval every Nth epoch (the last epoch '
-                             'and the final full eval always run)')
+                        help='events per eval forward; >1 requires --trunk-norm layer '
+                             '(batch statistics leak across events otherwise)')
+    parser.add_argument('--eval-every', type=int, default=1)
     parser.add_argument('--norm-stats', default=os.path.join(TRIPLET_RANK_DIR, 'norm_stats_train.json'))
     parser.add_argument('--norm-stats-events', type=int, default=2000)
     parser.add_argument('--split-json', default=None,
-                        help='train on the train side, evaluate on the test side; '
-                             'omit to train on all trainable events and evaluate on all')
-    parser.add_argument('--operating-point', default='d6@0.99', choices=sorted(OPERATING_POINTS),
-                        help='survivor mask tau/score column (both sides)')
-    parser.add_argument('--score-column', default=None,
-                        help='override the operating-point score column')
+                        help='train on the train side, evaluate on the test side of '
+                             'the SAME artifact; omit for train-on-train / eval-on-eval')
+    parser.add_argument('--operating-points', default=os.path.join(
+        TRIPLET_RANK_DIR, 'operating_points.json'))
+    parser.add_argument('--gate', default='p95',
+                        help='training gate name from operating_points.json '
+                             '(p95/p99/tierH)')
+    parser.add_argument('--eval-gates', default='p95,p99',
+                        help='gates reported every eval, all from one forward pass')
     parser.add_argument('--tau', type=float, default=None,
-                        help='override the operating-point threshold')
+                        help='override the training-gate threshold')
     parser.add_argument('--input-mode', choices=('flat', 'hierarchical'), default='flat')
-    parser.add_argument('--weaver-track-blocks', action='store_true',
-                        help='weaver-standardized ti_/tj_/tk_ blocks for hierarchical '
-                             'warm-start fidelity')
-    parser.add_argument('--context-features', action='store_true',
-                        help='append per-candidate standings within the event\'s '
-                             'tau-surviving list (ctx_* features)')
-    parser.add_argument('--window-artifact', default=None,
-                        help='stage-A window dump for the train candidates; switches '
-                             'both modes to top-M window items')
-    parser.add_argument('--eval-window-artifact', default=None,
-                        help='stage-A window dump for the --eval-candidates side')
-    parser.add_argument('--attention-window', type=int, default=512,
-                        help='M: window rows taken from the window artifact')
+    parser.add_argument('--track-embed-dim', type=int, default=32)
+    parser.add_argument('--context-features', action='store_true')
+    parser.add_argument('--fit-mode', choices=('off', 'static', 'layer'), default='off',
+                        help='static: 21 WLS fit columns as inputs; layer: the '
+                             'differentiable fit computes them in-model')
+    parser.add_argument('--fusion', action='store_true',
+                        help='score = alpha * filter_logit + f(x); epoch 0 IS the '
+                             'filter ordering (asserted)')
+    parser.add_argument('--aux-fromb-weight', type=float, default=0.0)
+    parser.add_argument('--trunk-norm', choices=('batch', 'layer'), default='layer')
+    parser.add_argument('--tail-weighting', action='store_true',
+                        help='append the stored tail sample with log reweighting '
+                             '(unbiased full-list loss beyond the window)')
     parser.add_argument('--attention-layers', type=int, default=0)
     parser.add_argument('--attention-heads', type=int, default=8)
-    parser.add_argument('--warm-start-checkpoint', default=None,
-                        help='stage-A checkpoint; loads all matching weights '
-                             '(strict=False) and supersedes --warm-start-projector')
-    parser.add_argument('--extra-features', choices=('none', 'gbdt', 'all', 'auto'), default='auto',
-                        help='inputs beyond the 89 geometry features (gbdt scores, cascade scores)')
-    parser.add_argument('--loss-mode', choices=('sampled', 'full'), default='sampled')
+    parser.add_argument('--warm-start-checkpoint', default=None)
+    parser.add_argument('--extra-features', choices=('none', 'filter', 'all', 'auto'),
+                        default='auto')
+    parser.add_argument('--loss-mode', choices=('sampled', 'full'), default='full')
     parser.add_argument('--temperature', type=float, default=1.0)
-    parser.add_argument('--num-negatives', type=int, default=50)
+    parser.add_argument('--num-negatives', type=int, default=512)
     parser.add_argument('--hidden-dim', type=int, default=256)
     parser.add_argument('--num-residual-blocks', type=int, default=4)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--label-smoothing', type=float, default=0.10)
     parser.add_argument('--projector-dim', type=int, default=32)
-    parser.add_argument('--warm-start-projector', default=None,
-                        help='couple reranker checkpoint to initialize track_projector from')
+    parser.add_argument('--warm-start-projector', default=None)
     parser.add_argument('--batch-size', type=int, default=96)
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight-decay', type=float, default=0.01)
     parser.add_argument('--warmup-fraction', type=float, default=0.05)
     parser.add_argument('--cosine-power', type=float, default=2.0)
@@ -106,18 +109,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--num-workers', type=int, default=0)
-    parser.add_argument('--log-every', type=int, default=50,
-                        help='in-epoch progress log cadence in batches (0 disables)')
-    parser.add_argument('--resume', default=None,
-                        help='checkpoint to continue from (model + optimizer + epoch)')
+    parser.add_argument('--log-every', type=int, default=50)
+    parser.add_argument('--resume', default=None)
     parser.add_argument('--experiments-dir', default=os.path.join(os.path.dirname(__file__), 'experiments'))
-    parser.add_argument('--experiment-dir', default=None,
-                        help='exact run directory (overrides the timestamped default)')
+    parser.add_argument('--experiment-dir', default=None)
     parser.add_argument('--run-name', default='triplet_reranker')
     return parser
 
 
-def _norm_stats(args, feature_names, train_events, tau, score_column) -> dict:
+def _resolve_gates(args) -> tuple[dict, float]:
+    points = dict(OPERATING_POINTS)
+    if os.path.exists(args.operating_points):
+        points = load_operating_points(args.operating_points)
+    elif args.tau is None and args.gate != 'tierH':
+        raise SystemExit(f'{args.operating_points} not found and no --tau override')
+    if args.gate not in points and args.tau is None:
+        raise SystemExit(f'gate {args.gate!r} not in {sorted(points)}')
+    train_tau = args.tau if args.tau is not None else points[args.gate][1]
+    eval_gates = {}
+    for name in args.eval_gates.split(','):
+        name = name.strip()
+        if name == args.gate and args.tau is not None:
+            eval_gates[name] = train_tau
+        elif name in points:
+            eval_gates[name] = points[name][1]
+    if not eval_gates:
+        eval_gates = {args.gate: train_tau}
+    return eval_gates, float(train_tau)
+
+
+def _norm_stats(args, feature_names, train_events, tau) -> dict:
     if os.path.exists(args.norm_stats):
         logger.info(f'loading norm stats from {args.norm_stats}')
         stats = load_norm_stats(args.norm_stats)
@@ -127,10 +148,13 @@ def _norm_stats(args, feature_names, train_events, tau, score_column) -> dict:
                              f'(e.g. {missing[:3]}); delete it to refit')
         return stats
     logger.info('fitting norm stats on the train side')
-    stats = fit_norm_stats(args.candidates, args.tracks, feature_names=feature_names,
+    stats = fit_norm_stats(args.candidates, args.src_glob,
+                           feature_names=feature_names,
                            n_events=args.norm_stats_events, seed=args.seed,
-                           events=train_events, tau=tau, score_column=score_column,
-                           context_features=args.context_features)
+                           events=train_events, tau=tau,
+                           context_features=args.context_features,
+                           vertex_fit='static' if args.fit_mode != 'off' else 'off')
+    os.makedirs(os.path.dirname(os.path.abspath(args.norm_stats)), exist_ok=True)
     save_norm_stats(stats, args.norm_stats)
     logger.info(f'wrote {args.norm_stats}')
     return stats
@@ -159,50 +183,108 @@ def _warm_start_checkpoint(model: TripletReranker, checkpoint_path: str) -> None
                 f'({len(missing)} attention tensors stay fresh)')
 
 
+def _batch_kwargs(batch, device, *, for_loss: bool) -> dict:
+    kwargs = {}
+    loss_only = ('log_weights', 'from_b') if for_loss else ()
+    for key in ('filter_logit',) + loss_only:
+        if key in batch:
+            kwargs[key] = batch[key].to(device)
+    fit_keys = [key for key in batch if key.startswith('fit_')] \
+        + (['primary_vertex'] if 'primary_vertex' in batch else [])
+    if any(key.startswith('fit_') for key in fit_keys):
+        kwargs['fit_inputs'] = {key: batch[key].to(device) for key in fit_keys}
+    return kwargs
+
+
 @torch.no_grad()
-def evaluate(model, dataset, event_indices, device, *, batch_size: int = 1,
-             num_workers: int = 0) -> dict:
-    """Feature building parallelizes across `num_workers`; scoring stays exact at
-    batch_size=1 (NanSafeBatchNorm1d uses batch statistics even in eval mode, so
-    batching events together or padding would change per-candidate scores)."""
+def evaluate(model, dataset, event_indices, device, *, gates: dict[str, float],
+             batch_size: int = 1, num_workers: int = 0,
+             score_override=None) -> dict:
+    """One forward pass per event; every gate in `gates` (name -> tau) is a
+    mask applied afterwards, so all reported operating points are paired.
+    score_override(batch) replaces the model scores (e.g. the raw filter
+    ordering for the epoch-0 fusion assert)."""
     model.eval()
     subset = Subset(dataset, [int(r) for r in event_indices])
     loader = DataLoader(subset, batch_size=batch_size, num_workers=num_workers,
                         collate_fn=collate_triplet_rank_eval)
-    hits = {k: 0 for k in K_VALUES}
-    gt_ranks = []
+    hits = {gate: {k: 0 for k in K_VALUES} for gate in gates}
+    gt_ranks = {gate: [] for gate in gates}
+    # The dataset serves the loosest gate; tighter gates mask by filter logit.
+    logit_taus = {gate: (math.log(tau / (1.0 - tau))
+                         if 0.0 < tau < 1.0 else -float('inf'))
+                  for gate, tau in gates.items()}
     for batch in loader:
         counts = batch['counts']
         if int(counts.max()) == 0:
             continue
         valid_mask = batch['valid_mask'].to(device)
-        scores = model(batch['features'].to(device), valid_mask=valid_mask)
+        if score_override is not None:
+            scores = score_override(batch).to(device)
+        else:
+            scores = model(batch['features'].to(device), valid_mask=valid_mask,
+                           **_batch_kwargs(batch, device, for_loss=False))
         scores = scores.masked_fill(~valid_mask, float('-inf')).cpu()
+        filter_logit = batch['filter_logit']
         for b in range(scores.shape[0]):
             n = int(counts[b])
             if n == 0:
                 continue
-            order = torch.argsort(scores[b, :n], descending=True).numpy()
-            rank = deduped_gt_rank(batch['keys'][b].numpy()[order],
-                                   batch['pos_mask'][b, :n].numpy()[order])
-            if rank is None:
-                continue
-            gt_ranks.append(rank)
-            for k in K_VALUES:
-                if rank <= k:
-                    hits[k] += 1
+            event_scores = scores[b, :n]
+            event_logits = filter_logit[b, :n]
+            keys = batch['keys'][b].numpy()
+            pos = batch['pos_mask'][b, :n].numpy()
+            for gate, logit_tau in logit_taus.items():
+                surviving = (event_logits >= logit_tau).numpy()
+                if not pos[surviving].any():
+                    continue
+                order = torch.argsort(event_scores[surviving],
+                                      descending=True).numpy()
+                rank = deduped_gt_rank(keys[surviving][order],
+                                       pos[surviving][order])
+                if rank is None:
+                    continue
+                gt_ranks[gate].append(rank)
+                for k in K_VALUES:
+                    if rank <= k:
+                        hits[gate][k] += 1
     n_events = len(event_indices)
-    ranks = np.asarray(gt_ranks) if gt_ranks else np.asarray([0])
-    metrics = {f'T@{k}': hits[k] / n_events for k in K_VALUES}
-    metrics['gt_rank_median'] = float(np.median(ranks))
-    metrics['gt_rank_p90'] = float(np.percentile(ranks, 90))
-    metrics['n_gt_surviving'] = len(gt_ranks)
+    metrics = {}
+    primary = next(iter(gates))
+    for gate in gates:
+        ranks = np.asarray(gt_ranks[gate]) if gt_ranks[gate] else np.asarray([0])
+        prefix = '' if gate == primary else f'{gate}/'
+        for k in K_VALUES:
+            metrics[f'{prefix}T@{k}'] = hits[gate][k] / n_events
+        metrics[f'{prefix}gt_rank_median'] = float(np.median(ranks))
+        metrics[f'{prefix}gt_rank_p90'] = float(np.percentile(ranks, 90))
+        metrics[f'{prefix}n_gt_surviving'] = len(gt_ranks[gate])
     metrics['n_eval_events'] = n_events
     return metrics
 
 
+def _assert_epoch0_fusion(model, dataset, eval_side, device, gates, args) -> None:
+    """With the zero-initialized fusion head the model ordering must equal the
+    filter ordering exactly — the wiring gate for every later delta."""
+    sample = eval_side[:min(len(eval_side), 512)]
+    model_metrics = evaluate(model, dataset, sample, device, gates=gates,
+                             batch_size=args.eval_batch_size)
+    filter_metrics = evaluate(model, dataset, sample, device, gates=gates,
+                              batch_size=args.eval_batch_size,
+                              score_override=lambda batch: batch['filter_logit'])
+    for key in model_metrics:
+        if key.split('/')[-1].startswith('T@'):
+            if abs(model_metrics[key] - filter_metrics[key]) > 1e-9:
+                raise SystemExit(
+                    f'epoch-0 fusion mismatch on {key}: model '
+                    f'{model_metrics[key]:.6f} vs filter {filter_metrics[key]:.6f} '
+                    f'— the fusion wiring is broken')
+    logger.info(f'epoch-0 fusion assert passed on {len(sample)} events '
+                f"(T@10 {model_metrics['T@10']:.4f})")
+
+
 def _checkpoint_payload(model, optimizer, args, metrics, epoch, best_criterion,
-                        feature_names, norm_stats, score_column, tau) -> dict:
+                        feature_names, norm_stats, gates, train_tau) -> dict:
     return {
         'triplet_reranker_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -212,7 +294,8 @@ def _checkpoint_payload(model, optimizer, args, metrics, epoch, best_criterion,
         'best_criterion': best_criterion,
         'feature_names': feature_names,
         'norm_stats': norm_stats,
-        'operating_point': {'score_column': score_column, 'tau': tau},
+        'operating_point': {'score_column': 'filter_score', 'gate': args.gate,
+                            'tau': train_tau, 'eval_gates': gates},
     }
 
 
@@ -224,64 +307,48 @@ def _flush_history(experiment_dir: str, history: list) -> None:
 def main(argv=None) -> None:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     args = build_parser().parse_args(argv)
-    if args.eval_candidates and args.split_json:
-        raise SystemExit('--eval-candidates and --split-json are mutually exclusive')
-    if bool(args.eval_candidates) != bool(args.eval_tracks):
-        raise SystemExit('--eval-candidates and --eval-tracks must be given together')
     if args.eval_every < 1:
         raise SystemExit('--eval-every must be >= 1')
+    if args.eval_batch_size > 1 and args.trunk_norm != 'layer':
+        raise SystemExit('--eval-batch-size > 1 requires --trunk-norm layer')
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device(args.device)
 
-    score_column, tau = OPERATING_POINTS[args.operating_point]
-    if args.score_column is not None:
-        score_column = args.score_column
-    if args.tau is not None:
-        tau = args.tau
-    logger.info(f'operating point {args.operating_point}: {score_column} >= {tau}')
+    eval_gates, train_tau = _resolve_gates(args)
+    # The eval dataset serves the LOOSEST gate; tighter gates mask at eval time.
+    eval_tau = min(eval_gates.values())
+    logger.info(f'training gate {args.gate}: filter_score >= {train_tau}; '
+                f'eval gates {eval_gates}')
 
     train_events = None
     if args.split_json:
         train_events = load_split(args.split_json, 'train')
 
-    if args.eval_candidates and args.window_artifact and not args.eval_window_artifact:
-        raise SystemExit('--window-artifact with --eval-candidates also requires '
-                         '--eval-window-artifact')
-
-    train_dataset = TripletRankDataset(
-        args.candidates, args.tracks, tau=tau, score_column=score_column,
-        num_negatives=args.num_negatives, mode='train', seed=args.seed,
+    dataset_kwargs = dict(
         extra_features=args.extra_features,
-        weaver_track_blocks=args.weaver_track_blocks,
         context_features=args.context_features,
-        window_artifact=args.window_artifact,
-        attention_window=args.attention_window)
+        vertex_fit=args.fit_mode,
+        from_b_targets=args.aux_fromb_weight > 0.0)
+    train_dataset = TripletRankDataset(
+        args.candidates, args.src_glob, tau=train_tau,
+        num_negatives=args.num_negatives, mode='train', seed=args.seed,
+        tail_weighting=args.tail_weighting, **dataset_kwargs)
     feature_names = train_dataset.feature_names
-    norm_stats = _norm_stats(args, feature_names, train_events, tau, score_column)
+    norm_stats = _norm_stats(args, feature_names, train_events, train_tau)
     train_dataset.norm_stats = norm_stats
 
-    if args.eval_candidates:
+    if args.split_json:
         eval_dataset = TripletRankDataset(
-            args.eval_candidates, args.eval_tracks, tau=tau, score_column=score_column,
-            mode='eval', norm_stats=norm_stats, seed=args.seed,
-            extra_features=args.extra_features,
-            weaver_track_blocks=args.weaver_track_blocks,
-            context_features=args.context_features,
-            window_artifact=args.eval_window_artifact,
-            attention_window=args.attention_window)
-        if eval_dataset.feature_names != feature_names:
-            raise SystemExit('eval artifact resolves different feature names than the '
-                             'train artifact (extra columns mismatch)')
+            args.candidates, args.src_glob, tau=eval_tau, mode='eval',
+            norm_stats=norm_stats, seed=args.seed, **dataset_kwargs)
     else:
         eval_dataset = TripletRankDataset(
-            args.candidates, args.tracks, tau=tau, score_column=score_column,
-            mode='eval', norm_stats=norm_stats, seed=args.seed,
-            extra_features=args.extra_features,
-            weaver_track_blocks=args.weaver_track_blocks,
-            context_features=args.context_features,
-            window_artifact=args.window_artifact,
-            attention_window=args.attention_window)
+            args.eval_candidates, args.eval_src_glob, tau=eval_tau, mode='eval',
+            norm_stats=norm_stats, seed=args.seed, **dataset_kwargs)
+        if eval_dataset.feature_names != feature_names:
+            raise SystemExit('eval artifact resolves different feature names than '
+                             'the train artifact')
 
     n_rows = train_dataset.table.num_rows
     if args.split_json:
@@ -293,8 +360,6 @@ def main(argv=None) -> None:
         trainable = train_dataset.trainable_indices
         full_eval = np.arange(eval_dataset.table.num_rows)
     if args.eval_events and args.eval_events < len(full_eval):
-        # Fixed-seed subsample: the SAME events every epoch, so across-epoch T@K
-        # comparisons (checkpoint selection) are paired.
         eval_side = np.random.default_rng(args.seed).choice(
             full_eval, args.eval_events, replace=False)
     else:
@@ -311,6 +376,9 @@ def main(argv=None) -> None:
                         drop_last=True, **loader_kwargs)
     steps_per_epoch = max(1, len(trainable) // args.batch_size)
 
+    fit_stats = None
+    if args.fit_mode == 'layer':
+        fit_stats = {name: norm_stats[name] for name in FIT_NAMES}
     model = TripletReranker(
         input_mode=args.input_mode, hidden_dim=args.hidden_dim,
         num_residual_blocks=args.num_residual_blocks, dropout=args.dropout,
@@ -319,11 +387,17 @@ def main(argv=None) -> None:
         feature_names=feature_names, loss_mode=args.loss_mode,
         num_attention_layers=args.attention_layers,
         attention_heads=args.attention_heads,
+        track_embed_dim=args.track_embed_dim, trunk_norm=args.trunk_norm,
+        fusion=args.fusion, aux_from_b_weight=args.aux_fromb_weight,
+        vertex_fit_layer=args.fit_mode == 'layer', fit_norm_stats=fit_stats,
     ).to(device)
     if args.warm_start_checkpoint:
         _warm_start_checkpoint(model, args.warm_start_checkpoint)
     elif args.warm_start_projector:
         _warm_start_projector(model, args.warm_start_projector)
+    if args.fusion:
+        _assert_epoch0_fusion(model, eval_dataset, eval_side, device,
+                              eval_gates, args)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_warmup_scheduler(optimizer, args, steps_per_epoch, logger)
@@ -369,7 +443,9 @@ def main(argv=None) -> None:
                 features = batch['features'].to(device)
                 pos_mask = batch['pos_mask'].to(device)
                 valid_mask = batch['valid_mask'].to(device)
-                out = model.compute_loss(features, pos_mask, valid_mask)
+                out = model.compute_loss(features, pos_mask, valid_mask,
+                                         **_batch_kwargs(batch, device,
+                                                         for_loss=True))
                 optimizer.zero_grad(set_to_none=True)
                 out['total_loss'].backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -391,6 +467,7 @@ def main(argv=None) -> None:
                         or epoch == args.epochs - 1)
             if run_eval:
                 metrics = evaluate(model, eval_dataset, eval_side, device,
+                                   gates=eval_gates,
                                    batch_size=args.eval_batch_size,
                                    num_workers=args.num_workers)
                 metrics['train_loss'] = train_loss
@@ -403,7 +480,7 @@ def main(argv=None) -> None:
                 best_criterion = max(best_criterion, metrics['T@10'])
                 manager.save_checkpoint(
                     _checkpoint_payload(model, optimizer, args, metrics, epoch, best_criterion,
-                                        feature_names, norm_stats, score_column, tau),
+                                        feature_names, norm_stats, eval_gates, train_tau),
                     epoch, metrics['T@10'], is_best)
             else:
                 history.append({'train_loss': train_loss, 'epoch': epoch, 'lr': current_lr})
@@ -414,32 +491,25 @@ def main(argv=None) -> None:
         logger.error(f'training crashed at epoch {epoch}:\n{traceback.format_exc()}')
         crash_path = os.path.join(checkpoints_dir, f'crash_epoch{epoch}.pt')
         torch.save(_checkpoint_payload(model, optimizer, args, {}, epoch, best_criterion,
-                                       feature_names, norm_stats, score_column, tau),
+                                       feature_names, norm_stats, eval_gates, train_tau),
                    crash_path)
         _flush_history(experiment_dir, history)
         logger.error(f'saved emergency checkpoint {crash_path}')
         raise
 
-    evaluated = [entry for entry in history if 'T@10' in entry]
-    if evaluated:
-        best = max(evaluated, key=lambda m: m['T@10'])
-        logger.info(f"best epoch {best['epoch']}: " +
-                    ' '.join(f"T@{k} {best[f'T@{k}']:.4f}" for k in K_VALUES))
-
     best_path = os.path.join(checkpoints_dir, 'best_model.pt')
     if os.path.exists(best_path):
         checkpoint = torch.load(best_path, map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint['triplet_reranker_state_dict'])
-        model.to(device)
-        logger.info(f'final full eval on {len(full_eval)} events '
-                    f'(best epoch {checkpoint["epoch"]})')
-        final = evaluate(model, eval_dataset, full_eval, device,
-                         batch_size=args.eval_batch_size,
-                         num_workers=args.num_workers)
-        final['best_epoch'] = checkpoint['epoch']
-        with open(os.path.join(experiment_dir, 'final_eval.json'), 'w') as fh:
-            json.dump(final, fh, indent=2)
-        logger.info('final eval: ' + ' '.join(f"T@{k} {final[f'T@{k}']:.4f}" for k in K_VALUES))
+        logger.info(f"final eval with the best checkpoint "
+                    f"(epoch {checkpoint['epoch']}, "
+                    f"T@10 {checkpoint['val_metrics'].get('T@10', float('nan')):.4f})")
+    final = evaluate(model, eval_dataset, full_eval, device, gates=eval_gates,
+                     batch_size=args.eval_batch_size, num_workers=args.num_workers)
+    with open(os.path.join(experiment_dir, 'final_eval.json'), 'w') as fh:
+        json.dump(final, fh, indent=2)
+    logger.info(f"final full eval: T@10 {final['T@10']:.4f} over "
+                f"{final['n_eval_events']} events")
 
 
 if __name__ == '__main__':
