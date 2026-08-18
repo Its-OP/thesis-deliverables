@@ -40,7 +40,9 @@ FILTER_MODEL_GLOB = os.path.join(
 # vertex (6) + physics (5): the h6s4 champion's feature set; isolation and
 # secondary-vertex blocks measured inert and are never computed here.
 H6_WIDTH = 11
-MAX_CANDIDATES_PER_EVENT = 32768
+# Sanity bound only: the busiest K2=125 events reach ~34k Tier-H survivors
+# (the old top-100 era cap of 32768 dropped exactly the busy tail).
+MAX_CANDIDATES_PER_EVENT = 131072
 CHUNK_SIZE = 500
 WINDOW = 2048
 TAIL_SAMPLE = 512
