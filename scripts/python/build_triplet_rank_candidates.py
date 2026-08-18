@@ -310,9 +310,11 @@ def _assemble(out_path, chunk_specs):
     writer = pq.ParquetWriter(out_path, CANDIDATE_SCHEMA, compression='zstd')
     for _, _, path in chunk_specs:
         writer.write_table(pq.read_table(path))
-    writer.close()
-    for _, _, path in chunk_specs:
+        # Delete as we go: peak disk stays at artifact + one chunk instead of
+        # 2x artifact. A crash mid-assembly recomputes the deleted chunks on
+        # rerun (their shards fail the completeness check and rebuild).
         os.remove(path)
+    writer.close()
 
 
 def _git_sha():
