@@ -19,7 +19,11 @@ FIT_NAMES = [
     'fit_logw_i', 'fit_logw_j', 'fit_logw_k',
 ]
 
-_TIKHONOV_RELATIVE = 1e-6
+# Sized for BACKWARD stability: gradients through the solve scale like the
+# inverse of the smallest regularized eigenvalue, and collimated taus produce
+# near-parallel triplets. The extra forward bias is ~1e-4 of the vertex
+# scale — far below any physical resolution in the problem.
+_TIKHONOV_RELATIVE = 1e-4
 _TIKHONOV_FLOOR = 1e-9
 _VARIANCE_FLOOR = 1e-12
 _EPSILON = 1e-12
@@ -134,7 +138,9 @@ class VertexFitLayer(nn.Module):
             var_dsz.permute(0, 2, 1).reshape(flat, 3))
         correction = self.weight_head(
             quality.permute(0, 3, 2, 1).reshape(flat, 3, -1)).squeeze(-1)
-        log_weights = base_log_weights + correction
+        # Bounded correction (NDIVE-style damping): an unbounded head can push
+        # one weight orders of magnitude up, re-singularizing the solve.
+        log_weights = base_log_weights + 3.0 * torch.tanh(correction / 3.0)
 
         fit = wls_vertex_fit(points, directions, log_weights)
 
