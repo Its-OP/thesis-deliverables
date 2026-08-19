@@ -26,6 +26,7 @@ FIT_NAMES = [
 _TIKHONOV_RELATIVE = 1e-4
 _TIKHONOV_FLOOR = 1e-9
 _VARIANCE_FLOOR = 1e-12
+_VARIANCE_CEILING = 1e12
 _EPSILON = 1e-12
 
 
@@ -42,7 +43,16 @@ class WLSFit(NamedTuple):
 def physics_log_weights(variance_dxy: torch.Tensor,
                         variance_dsz: torch.Tensor) -> torch.Tensor:
     """variance_dxy, variance_dsz: (..., T). Returns (..., T)."""
-    return -torch.log(variance_dxy + variance_dsz + _VARIANCE_FLOOR)
+    # A non-positive or non-finite stored covariance is garbage; such tracks
+    # get the ceiling variance (minimum trust). log of a value outside
+    # [floor, ceiling] would send NaN/inf through the whole fit graph, and
+    # any non-finite forward value NaNs the backward pass even where the
+    # upstream gradient is zero.
+    variance_sum = variance_dxy + variance_dsz
+    variance_sum = torch.where(
+        torch.isfinite(variance_sum) & (variance_sum > 0.0), variance_sum,
+        torch.full_like(variance_sum, _VARIANCE_CEILING))
+    return -torch.log(variance_sum.clamp(_VARIANCE_FLOOR, _VARIANCE_CEILING))
 
 
 def wls_vertex_fit(points: torch.Tensor, directions: torch.Tensor,
@@ -136,11 +146,16 @@ class VertexFitLayer(nn.Module):
         base_log_weights = physics_log_weights(
             var_dxy.permute(0, 2, 1).reshape(flat, 3),
             var_dsz.permute(0, 2, 1).reshape(flat, 3))
+        # Quality channels are raw detector quantities; a stored inf (e.g. a
+        # significance with zero error) would make the head's weight gradient
+        # non-finite even though tanh bounds the head's output.
+        quality = torch.nan_to_num(quality, nan=0.0, posinf=1e4, neginf=-1e4)
         correction = self.weight_head(
             quality.permute(0, 3, 2, 1).reshape(flat, 3, -1)).squeeze(-1)
         # Bounded correction (NDIVE-style damping): an unbounded head can push
         # one weight orders of magnitude up, re-singularizing the solve.
-        log_weights = base_log_weights + 3.0 * torch.tanh(correction / 3.0)
+        log_weights = (base_log_weights
+                       + 3.0 * torch.tanh(correction / 3.0)).clamp(-30.0, 30.0)
 
         fit = wls_vertex_fit(points, directions, log_weights)
 

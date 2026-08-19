@@ -269,17 +269,8 @@ class TripletReranker(nn.Module):
         scale = self.fit_scale.view(1, -1, 1)
         transformed = torch.where(
             log1p, torch.sign(channels) * torch.log1p(channels.abs()), channels)
-        standardized = torch.nan_to_num(
+        return torch.nan_to_num(
             torch.clamp((transformed - center) / scale, -10.0, 10.0), nan=0.0)
-        # Padded and degenerate candidates sit on non-differentiable corners of
-        # the fit (zero norms, parallel lines); their upstream gradient is zero
-        # but 0 x inf local derivatives poison shared weight grads as NaN.
-        # Those gradients are exactly zero in the limit — sanitize them.
-        if standardized.requires_grad:
-            standardized.register_hook(
-                lambda gradient: torch.nan_to_num(gradient, nan=0.0,
-                                                  posinf=0.0, neginf=0.0))
-        return standardized
 
     def _encode(self, features: torch.Tensor,
                 fit_inputs: dict | None = None) -> torch.Tensor:
