@@ -95,7 +95,7 @@ def wls_vertex_fit(points: torch.Tensor, directions: torch.Tensor,
 def _corrected_mass(mass: torch.Tensor,
                     transverse_momentum: torch.Tensor) -> torch.Tensor:
     """mass, transverse_momentum: (M,). Returns (M,)."""
-    return (mass.square() + transverse_momentum.square()).sqrt() \
+    return (mass.square() + transverse_momentum.square()).clamp_min(1e-12).sqrt() \
         + transverse_momentum
 
 
