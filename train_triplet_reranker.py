@@ -306,6 +306,10 @@ def _flush_history(experiment_dir: str, history: list) -> None:
 
 def main(argv=None) -> None:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    # Two full worker pools (train + eval) share tensors over file descriptors
+    # by default and exhaust the fd limit mid-run; the file_system strategy
+    # shares over named files instead.
+    torch.multiprocessing.set_sharing_strategy('file_system')
     args = build_parser().parse_args(argv)
     if args.eval_every < 1:
         raise SystemExit('--eval-every must be >= 1')
