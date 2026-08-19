@@ -76,14 +76,14 @@ def wls_vertex_fit(points: torch.Tensor, directions: torch.Tensor,
     separation = vertex.unsqueeze(-2) - points64
     arcs = (separation * directions64).sum(dim=-1)
     perpendicular = separation - arcs.unsqueeze(-1) * directions64
-    residuals = perpendicular.square().sum(dim=-1).clamp_min(0.0).sqrt()
+    residuals = perpendicular.square().sum(dim=-1).clamp_min(1e-12).sqrt()
     chi2 = (log_weights64.exp() * residuals.square()).sum(dim=-1)
 
     covariance = torch.linalg.inv(regularized) \
         * (-mean_log_weight.squeeze(-1)).exp().unsqueeze(-1).unsqueeze(-1)
     diagonal = covariance.diagonal(dim1=-2, dim2=-1)
-    sigma_xy = (diagonal[..., 0] + diagonal[..., 1]).clamp_min(0.0).sqrt()
-    sigma_z = diagonal[..., 2].clamp_min(0.0).sqrt()
+    sigma_xy = (diagonal[..., 0] + diagonal[..., 1]).clamp_min(1e-12).sqrt()
+    sigma_z = diagonal[..., 2].clamp_min(1e-12).sqrt()
     log_det_a = torch.logdet(regularized) \
         + 3.0 * mean_log_weight.squeeze(-1)
 
@@ -150,9 +150,9 @@ class VertexFitLayer(nn.Module):
 
         # Beam-frame block: flight direction taken from the beamline origin in
         # the transverse plane — independent of the stored primary vertex.
-        lxy_beam = vertex[:, :2].square().sum(dim=-1).clamp_min(0.0).sqrt()
+        lxy_beam = vertex[:, :2].square().sum(dim=-1).clamp_min(1e-12).sqrt()
         pt_total = momentum_flat[:, :2].square().sum(dim=-1) \
-            .clamp_min(0.0).sqrt()
+            .clamp_min(1e-12).sqrt()
         cos_xy_beam = (vertex[:, 0] * momentum_flat[:, 0]
                        + vertex[:, 1] * momentum_flat[:, 1]) \
             / (lxy_beam * pt_total + _EPSILON)
@@ -165,16 +165,16 @@ class VertexFitLayer(nn.Module):
         # PV block: everything downstream of the stored primary vertex.
         flight = vertex - primary_vertex.unsqueeze(1) \
             .expand(batch, candidates, 3).reshape(flat, 3)
-        flight_norm = flight.square().sum(dim=-1).clamp_min(0.0).sqrt()
-        momentum_norm = momentum_flat.square().sum(dim=-1).clamp_min(0.0).sqrt()
+        flight_norm = flight.square().sum(dim=-1).clamp_min(1e-12).sqrt()
+        momentum_norm = momentum_flat.square().sum(dim=-1).clamp_min(1e-12).sqrt()
         pv_cos = (flight * momentum_flat).sum(dim=-1) \
             / (flight_norm * momentum_norm + _EPSILON)
         flight_unit = flight / (flight_norm + _EPSILON).unsqueeze(-1)
         along = (momentum_flat * flight_unit).sum(dim=-1, keepdim=True)
         perpendicular = momentum_flat - along * flight_unit
-        transverse_3d = perpendicular.square().sum(dim=-1).clamp_min(0.0).sqrt()
+        transverse_3d = perpendicular.square().sum(dim=-1).clamp_min(1e-12).sqrt()
         pv_mcorr = _corrected_mass(mass_flat, transverse_3d)
-        pv_lxy = flight[:, :2].square().sum(dim=-1).clamp_min(0.0).sqrt()
+        pv_lxy = flight[:, :2].square().sum(dim=-1).clamp_min(1e-12).sqrt()
 
         channels = torch.stack([
             fit.chi2,
