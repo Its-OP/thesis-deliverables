@@ -273,3 +273,98 @@ def test_norm_stats_round_trip(artifact, tmp_path):
     assert item['features'].shape[1] == len(expected_names)
     assert torch.isfinite(item['features']).all()
     assert item['features'].abs().max() <= 10.0
+
+
+# ---------------------------------------------------------------------------
+# TRACK32 blocks (hierarchical + couple warm-start substrate)
+# ---------------------------------------------------------------------------
+
+def test_track32_dataset_swaps_track_blocks_for_weaver_standardized(artifact):
+    from utils.track32_features import (TRACK32_VAR_NAMES, TRACK32_YAML_PATH,
+                                        compute_track32_raw,
+                                        load_track32_params,
+                                        standardize_track32)
+    dataset = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
+                                 extra_features='auto', track32=True)
+    for prefix in ('ti_', 'tj_', 'tk_'):
+        block = [name for name in dataset.feature_names
+                 if name.startswith(prefix)]
+        assert block == [f'{prefix}{var}' for var in TRACK32_VAR_NAMES]
+
+    item = dataset[0]
+    arrays = dataset.table.candidate_arrays(0)
+    params = load_track32_params(TRACK32_YAML_PATH)
+    source = {}
+    for name in ['track_pt', 'track_eta', 'track_phi', 'track_charge',
+                 'track_dxy_significance', 'track_dz_significance',
+                 'track_norm_chi2', 'track_pt_error',
+                 'track_n_valid_pixel_hits', 'track_dca_significance',
+                 'track_covariance_phi_phi', 'track_covariance_lambda_lambda',
+                 'track_dxy', 'track_dz', 'track_covariance_dxy_dxy',
+                 'track_covariance_dsz_dsz', 'track_covariance_dxy_dsz',
+                 'track_covariance_phi_dxy', 'track_n_valid_hits',
+                 'track_vertex_x', 'track_vertex_y', 'track_vertex_z']:
+        source[name] = np.asarray(dataset.table.tracks[name][0].values)
+    for name in ['event_primary_vertex_x', 'event_primary_vertex_y',
+                 'event_primary_vertex_z']:
+        source[name] = dataset.table.events[name][0]
+    source['event_n_pvs'] = dataset.table.track32_extras['event_n_pvs'][0]
+    for name in ['event_other_pv_z', 'muon_eta', 'muon_phi', 'muon_dz',
+                 'muon_soft_id', 'sv_x', 'sv_y', 'sv_z']:
+        source[name] = np.asarray(
+            dataset.table.track32_extras[name][0].values)
+    expected = standardize_track32(compute_track32_raw(source), params)
+
+    names = dataset.feature_names
+    ti_start = names.index('ti_track_px')
+    ti_block = item['features'][:, ti_start:ti_start + 32].numpy()
+    cand_i = arrays['cand_i']
+    for row in range(ti_block.shape[0]):
+        np.testing.assert_allclose(ti_block[row], expected[cand_i[row]],
+                                   rtol=1e-5, atol=1e-6)
+
+
+def test_track32_blocks_bypass_dataset_standardization(artifact):
+    plain = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
+                               extra_features='auto', track32=True)
+    stats = fit_norm_stats(artifact[0], artifact[1],
+                           feature_names=None, n_events=4, seed=0)
+    stats.update({name: {'log1p': True, 'center': 5.0, 'scale': 9.0}
+                  for name in plain.feature_names
+                  if not name.startswith(('ti_', 'tj_', 'tk_'))
+                  and name not in stats})
+    standardized = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
+                                      extra_features='auto', track32=True,
+                                      norm_stats=stats)
+    names = plain.feature_names
+    ti_start = names.index('ti_track_px')
+    raw_item = plain[0]['features'][:, ti_start:ti_start + 32]
+    std_item = standardized[0]['features'][:, ti_start:ti_start + 32]
+    torch.testing.assert_close(raw_item, std_item)
+
+
+def test_warm_start_projector_loads_couple_weights(artifact, tmp_path):
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from train_triplet_reranker import _warm_start_projector
+    from weaver.nn.model.TripletReranker import TripletReranker
+
+    dataset = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
+                                 extra_features='auto', track32=True)
+    model = TripletReranker(input_mode='hierarchical', track_embed_dim=32,
+                            projector_dim=32,
+                            feature_names=dataset.feature_names, fusion=True)
+    generator = torch.Generator().manual_seed(5)
+    state = {
+        'couple_projector.0.weight': torch.randn(32, 32, generator=generator),
+        'couple_projector.0.bias': torch.randn(32, generator=generator),
+        'couple_projector.2.weight': torch.randn(32, generator=generator),
+        'couple_projector.2.bias': torch.randn(32, generator=generator),
+        'other_component.weight': torch.zeros(2, 2),
+    }
+    checkpoint_path = tmp_path / 'couple_best.pt'
+    torch.save({'couple_reranker_state_dict': state}, checkpoint_path)
+    _warm_start_projector(model, str(checkpoint_path))
+    torch.testing.assert_close(model.track_projector[0].weight,
+                               state['couple_projector.0.weight'])
+    torch.testing.assert_close(model.track_projector[2].bias,
+                               state['couple_projector.2.bias'])

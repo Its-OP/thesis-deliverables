@@ -13,8 +13,18 @@ from torch.utils.data import Dataset
 from utils.triplet_join import (
     FEATURE_NAMES,
     FEATURE_NAMES_EXTENDED,
+    RICH_NAMES,
+    TRACK16_NAMES,
     build_track_lorentz,
     triplet_feature_columns,
+)
+from utils.track32_features import (
+    TRACK32_SOURCE_TRACK_COLUMNS,
+    TRACK32_VAR_NAMES,
+    TRACK32_YAML_PATH,
+    compute_track32_raw,
+    load_track32_params,
+    standardize_track32,
 )
 from utils.vertex_fit_features import FIT_NAMES, static_fit_columns
 
@@ -62,17 +72,35 @@ IDENTITY_COLS = ['event_run', 'event_id', 'event_luminosity_block',
 _LOGIT_EPS = 1e-7
 
 
-def resolve_feature_names(table: '_EventTable', extra_features: str) -> list[str]:
+# The raw 16-wide per-track blocks sit at BASE_FEATURE_NAMES[24:72]; track32
+# mode swaps them for the couple stage's 32 weaver-standardized channels.
+TRACK_BLOCK_START = len(RICH_NAMES)
+TRACK_BLOCK_END = TRACK_BLOCK_START + 3 * len(TRACK16_NAMES)
+TRACK32_FEATURE_NAMES = [f'{prefix}{var}' for prefix in ('ti_', 'tj_', 'tk_')
+                         for var in TRACK32_VAR_NAMES]
+
+
+def is_track32_name(name: str) -> bool:
+    return name.startswith(('ti_track_', 'tj_track_', 'tk_track_'))
+
+
+def resolve_feature_names(table: '_EventTable', extra_features: str,
+                          track32: bool = False) -> list[str]:
     if extra_features not in ('none', 'filter', 'all', 'auto'):
         raise ValueError(f'unknown extra_features {extra_features!r}')
     if extra_features == 'none':
-        return list(BASE_FEATURE_NAMES)
-    if extra_features == 'all' and not table.has_cascade_columns:
-        raise ValueError('extra_features=all requires track_s1/track_s2/'
-                         'couple_scores columns in the candidates artifact')
-    names = list(BASE_FEATURE_NAMES) + FILTER_EXTRA_NAMES
-    if extra_features == 'all' or (extra_features == 'auto' and table.has_cascade_columns):
-        names += CASCADE_EXTRA_NAMES
+        names = list(BASE_FEATURE_NAMES)
+    else:
+        if extra_features == 'all' and not table.has_cascade_columns:
+            raise ValueError('extra_features=all requires track_s1/track_s2/'
+                             'couple_scores columns in the candidates artifact')
+        names = list(BASE_FEATURE_NAMES) + FILTER_EXTRA_NAMES
+        if extra_features == 'all' or (extra_features == 'auto'
+                                       and table.has_cascade_columns):
+            names += CASCADE_EXTRA_NAMES
+    if track32:
+        names = names[:TRACK_BLOCK_START] + TRACK32_FEATURE_NAMES \
+            + names[TRACK_BLOCK_END:]
     return names
 
 
@@ -114,13 +142,19 @@ def track16_std(*, pt, eta, phi, charge, dxy_sig, dz_sig, norm_chi2, pt_error,
     return torch.stack(standardized, dim=1)
 
 
+_NEUTRAL_STATS = {'log1p': False, 'center': 0.0, 'scale': 1.0}
+
+
 def standardize_features(X: torch.Tensor, names: list[str], stats: dict) -> torch.Tensor:
     """X: (M, F) in `names` order. Returns (M, F) sign-log1p + affine, clipped to +-10.
     NaN inputs (e.g. Stage-2 scores outside the top-K1) standardize to 0; their
-    companion *_isvalid flag channel carries the missingness."""
-    log1p_mask = torch.tensor([stats[name]['log1p'] for name in names])
-    center = torch.tensor([stats[name]['center'] for name in names], dtype=X.dtype)
-    scale = torch.tensor([stats[name]['scale'] for name in names], dtype=X.dtype)
+    companion *_isvalid flag channel carries the missingness. track32 channels
+    arrive weaver-standardized and pass through untouched."""
+    entries = [_NEUTRAL_STATS if is_track32_name(name) else stats[name]
+               for name in names]
+    log1p_mask = torch.tensor([entry['log1p'] for entry in entries])
+    center = torch.tensor([entry['center'] for entry in entries], dtype=X.dtype)
+    scale = torch.tensor([entry['scale'] for entry in entries], dtype=X.dtype)
     transformed = torch.where(log1p_mask, torch.sign(X) * torch.log1p(X.abs()), X)
     return torch.nan_to_num(torch.clamp((transformed - center) / scale, -10.0, 10.0),
                             nan=0.0)
@@ -177,19 +211,33 @@ class _EventTable:
     _EVENT_COLS = ['event_primary_vertex_x', 'event_primary_vertex_y',
                    'event_primary_vertex_z']
 
-    def __init__(self, candidates_path: str, src_glob: str):
+    _TRACK32_TRACK_COLS = ['track_dxy']
+    _TRACK32_EVENT_SCALAR_COLS = ['event_n_pvs']
+    _TRACK32_EVENT_LIST_COLS = ['event_other_pv_z', 'muon_eta', 'muon_phi',
+                                'muon_dz', 'muon_soft_id', 'sv_x', 'sv_y',
+                                'sv_z']
+
+    def __init__(self, candidates_path: str, src_glob: str,
+                 track32: bool = False):
         schema_names = set(pq.read_schema(candidates_path).names)
         self.has_cascade_columns = all(name in schema_names for name in self._CASCADE_COLS)
         cand_cols = self._CAND_COLS + IDENTITY_COLS \
             + (self._CASCADE_COLS if self.has_cascade_columns else [])
         candidates = pq.read_table(candidates_path, columns=cand_cols)
 
+        self.track32 = track32
+        track_cols = list(self._TRACK_COLS)
+        extra_cols = []
+        if track32:
+            track_cols += self._TRACK32_TRACK_COLS
+            extra_cols = self._TRACK32_EVENT_SCALAR_COLS \
+                + self._TRACK32_EVENT_LIST_COLS
         shards = sorted(glob.glob(src_glob))
         assert shards, f'no source shards matched {src_glob}'
         import pyarrow as pa
         src = pa.concat_tables([
-            pq.read_table(shard, columns=self._TRACK_COLS + self._EVENT_COLS
-                          + IDENTITY_COLS)
+            pq.read_table(shard, columns=track_cols + self._EVENT_COLS
+                          + extra_cols + IDENTITY_COLS)
             for shard in shards])
         # A candidates artifact may cover a prefix of the shards (smoke builds).
         assert candidates.num_rows <= src.num_rows, \
@@ -204,9 +252,31 @@ class _EventTable:
         self.num_rows = candidates.num_rows
         self.candidates = {name: _plain_array(candidates[name])
                            for name in cand_cols}
-        self.tracks = {name: _plain_array(src[name]) for name in self._TRACK_COLS}
+        self.tracks = {name: _plain_array(src[name]) for name in track_cols}
         self.events = {name: src[name].to_numpy(zero_copy_only=False)
                        for name in self._EVENT_COLS}
+        if track32:
+            self.track32_extras = {
+                name: src[name].to_numpy(zero_copy_only=False)
+                for name in self._TRACK32_EVENT_SCALAR_COLS}
+            self.track32_extras.update(
+                {name: _plain_array(src[name])
+                 for name in self._TRACK32_EVENT_LIST_COLS})
+            self.track32_params = load_track32_params(TRACK32_YAML_PATH)
+
+    def track32_table(self, r: int) -> torch.Tensor:
+        """Returns (T, 32) weaver-standardized pf_features channels for
+        event r, in TRACK32_VAR_NAMES order."""
+        source = {name: np.asarray(self.tracks[name][r].values)
+                  for name in TRACK32_SOURCE_TRACK_COLUMNS}
+        for name in self._EVENT_COLS:
+            source[name] = self.events[name][r]
+        for name in self._TRACK32_EVENT_SCALAR_COLS:
+            source[name] = self.track32_extras[name][r]
+        for name in self._TRACK32_EVENT_LIST_COLS:
+            source[name] = np.asarray(self.track32_extras[name][r].values)
+        raw = compute_track32_raw(source)
+        return torch.from_numpy(standardize_track32(raw, self.track32_params))
 
     def candidate_arrays(self, r: int) -> dict[str, np.ndarray]:
         out = {}
@@ -388,6 +458,9 @@ def fit_norm_stats(candidates_path: str, src_glob: str, *,
     if context_features and tau is None:
         raise ValueError('context_features=True requires tau (context is defined '
                          'over the tau-surviving list)')
+    if feature_names is not None:
+        assert not any(is_track32_name(name) for name in feature_names), \
+            'track32 channels arrive weaver-standardized; stats are never fitted'
     table = _EventTable(candidates_path, src_glob)
     if feature_names is None:
         feature_names = list(BASE_FEATURE_NAMES)
@@ -453,10 +526,10 @@ class TripletRankDataset(Dataset):
                  norm_stats: dict | None = None, seed: int = 0,
                  extra_features: str = 'auto', context_features: bool = False,
                  vertex_fit: str = 'off', tail_weighting: bool = False,
-                 from_b_targets: bool = False):
+                 from_b_targets: bool = False, track32: bool = False):
         assert mode in ('train', 'eval')
         assert vertex_fit in ('off', 'static', 'layer')
-        self.table = _EventTable(candidates_path, src_glob)
+        self.table = _EventTable(candidates_path, src_glob, track32=track32)
         self.tau = tau
         self.num_negatives = num_negatives
         self.mode = mode
@@ -465,7 +538,13 @@ class TripletRankDataset(Dataset):
         self.vertex_fit = vertex_fit
         self.tail_weighting = tail_weighting and mode == 'train'
         self.from_b_targets = from_b_targets
-        self._base_feature_names = resolve_feature_names(self.table, extra_features)
+        self.track32 = track32
+        # build_candidate_features can only assemble the raw-block layout;
+        # track32 splices the standardized blocks in afterwards.
+        self._buildable_feature_names = resolve_feature_names(
+            self.table, extra_features)
+        self._base_feature_names = resolve_feature_names(
+            self.table, extra_features, track32=track32)
         self.feature_names = list(self._base_feature_names)
         if vertex_fit == 'static':
             self.feature_names += list(FIT_NAMES)
@@ -528,7 +607,12 @@ class TripletRankDataset(Dataset):
             pos_mask = is_gt.astype(bool)
 
         features, i, j, k = build_candidate_features(
-            self.table, int(r), arrays, selected, self._base_feature_names)
+            self.table, int(r), arrays, selected, self._buildable_feature_names)
+        if self.track32:
+            block = self.table.track32_table(int(r))
+            features = torch.cat([
+                features[:, :TRACK_BLOCK_START], block[i], block[j], block[k],
+                features[:, TRACK_BLOCK_END:]], dim=1)
         if self.vertex_fit == 'static':
             features = torch.cat(
                 [features, _static_fit_block(self.table, int(r), i, j, k)], dim=1)

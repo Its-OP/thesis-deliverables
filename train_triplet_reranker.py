@@ -29,6 +29,7 @@ from utils.triplet_rank_data import (
     collate_triplet_rank,
     collate_triplet_rank_eval,
     fit_norm_stats,
+    is_track32_name,
     load_norm_stats,
     save_norm_stats,
 )
@@ -142,7 +143,8 @@ def _norm_stats(args, feature_names, train_events, tau) -> dict:
     if os.path.exists(args.norm_stats):
         logger.info(f'loading norm stats from {args.norm_stats}')
         stats = load_norm_stats(args.norm_stats)
-        missing = [name for name in feature_names if name not in stats]
+        missing = [name for name in feature_names
+                   if name not in stats and not is_track32_name(name)]
         if missing:
             raise SystemExit(f'{args.norm_stats} lacks {len(missing)} feature keys '
                              f'(e.g. {missing[:3]}); delete it to refit')
@@ -333,7 +335,8 @@ def main(argv=None) -> None:
         extra_features=args.extra_features,
         context_features=args.context_features,
         vertex_fit=args.fit_mode,
-        from_b_targets=args.aux_fromb_weight > 0.0)
+        from_b_targets=args.aux_fromb_weight > 0.0,
+        track32=args.input_mode == 'hierarchical' and args.track_embed_dim == 32)
     train_dataset = TripletRankDataset(
         args.candidates, args.src_glob, tau=train_tau,
         num_negatives=args.num_negatives, mode='train', seed=args.seed,
