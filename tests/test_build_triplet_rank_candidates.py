@@ -209,3 +209,76 @@ def test_misaligned_dump_is_rejected(tmp_path):
     pq.write_table(table, dump_path)
     with pytest.raises(ValueError, match='absent from the dump'):
         list(_dump_blocks(dump_path, src_glob, None))
+
+
+# ---------------------------------------------------------------------------
+# Torch gate adapter
+# ---------------------------------------------------------------------------
+
+def _tiny_gate_checkpoint(tmp_path):
+    import torch
+
+    from utils.triplet_rank_data import BASE_FEATURE_NAMES
+    from weaver.nn.model.TripletReranker import TripletReranker
+
+    torch.manual_seed(5)
+    names = list(BASE_FEATURE_NAMES)
+    arguments = dict(input_mode='flat', hidden_dim=16, num_residual_blocks=1,
+                     dropout=0.0, num_negatives=8, temperature=1.0,
+                     label_smoothing=0.0, projector_dim=8, loss_mode='full',
+                     attention_layers=0, attention_heads=2, track_embed_dim=16,
+                     trunk_norm='layer', fusion=False, aux_fromb_weight=0.0,
+                     fit_mode='off')
+    model = TripletReranker(
+        input_mode='flat', hidden_dim=16, num_residual_blocks=1, dropout=0.0,
+        ranking_num_samples=8, ranking_temperature=1.0, label_smoothing=0.0,
+        projector_dim=8, feature_names=names, loss_mode='full',
+        num_attention_layers=0, attention_heads=2, track_embed_dim=16,
+        trunk_norm='layer', fusion=False, aux_from_b_weight=0.0,
+        vertex_fit_layer=False, fit_norm_stats=None)
+    stats = {name: {'log1p': index % 3 == 0, 'center': 0.1 * (index % 5),
+                    'scale': 1.0 + 0.05 * (index % 7)}
+             for index, name in enumerate(names)}
+    path = tmp_path / 'gate.pt'
+    torch.save({'triplet_reranker_state_dict': model.state_dict(),
+                'args': arguments, 'feature_names': names,
+                'norm_stats': stats}, path)
+    return str(path), model, names, stats
+
+
+def test_torch_gate_matches_dataset_standardization_and_sums_to_one(tmp_path):
+    import torch
+
+    from build_triplet_rank_candidates import load_torch_gate
+    from utils.triplet_rank_data import standardize_features
+
+    path, model, names, stats = _tiny_gate_checkpoint(tmp_path)
+    gate = load_torch_gate(path)
+    assert gate.n_features_in_ == len(names)
+
+    raw = np.random.default_rng(3).normal(
+        size=(7, len(names))).astype(np.float32)
+    probabilities = gate.predict_proba(raw)
+    assert probabilities.shape == (7, 2)
+    assert np.allclose(probabilities.sum(axis=1), 1.0, atol=1e-6)
+
+    standardized = standardize_features(torch.from_numpy(raw), names, stats)
+    with torch.no_grad():
+        reference = model(standardized.T.unsqueeze(0),
+                          valid_mask=torch.ones(1, 7, dtype=torch.bool),
+                          filter_logit=torch.zeros(1, 7))
+    assert np.allclose(probabilities[:, 1],
+                       torch.sigmoid(reference[0]).numpy(), atol=1e-6)
+
+
+def test_torch_gate_rejects_wrong_feature_set(tmp_path):
+    import torch
+
+    from build_triplet_rank_candidates import load_torch_gate
+
+    path, model, names, stats = _tiny_gate_checkpoint(tmp_path)
+    payload = torch.load(path, weights_only=False)
+    payload['feature_names'] = names + ['filter_score']
+    torch.save(payload, path)
+    with pytest.raises(AssertionError, match='raw 100-feature base'):
+        load_torch_gate(path)

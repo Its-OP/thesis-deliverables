@@ -93,6 +93,52 @@ def load_filter_model(path_glob):
     return use_cpu_inference(model)
 
 
+class _TorchGate:
+    """MLP gate behind the GBDT's predict_proba contract: raw builder
+    features in, calibrated class-1 probability out."""
+
+    _CHUNK_ROWS = 8192
+
+    def __init__(self, checkpoint_path):
+        import torch
+        from scripts.python.triplet_failure_taxonomy import _build_model
+        from utils.triplet_rank_data import BASE_FEATURE_NAMES
+        checkpoint = torch.load(checkpoint_path, map_location='cpu',
+                                weights_only=False)
+        assert checkpoint['feature_names'] == list(BASE_FEATURE_NAMES), \
+            'gate checkpoint must be trained on the raw 100-feature base ' \
+            '(--extra-features none)'
+        self.model = _build_model(checkpoint, torch.device('cpu'))
+        self.norm_stats = checkpoint['norm_stats']
+        self.n_features_in_ = len(checkpoint['feature_names'])
+
+    def predict_proba(self, features):
+        import torch
+        from utils.triplet_rank_data import (BASE_FEATURE_NAMES,
+                                             standardize_features)
+        torch.set_num_threads(1)
+        raw = torch.from_numpy(np.ascontiguousarray(features,
+                                                    dtype=np.float32))
+        standardized = standardize_features(raw, list(BASE_FEATURE_NAMES),
+                                            self.norm_stats)
+        chunks = []
+        with torch.no_grad():
+            for start in range(0, standardized.shape[0], self._CHUNK_ROWS):
+                chunk = standardized[start:start + self._CHUNK_ROWS]
+                scores = self.model(
+                    chunk.T.unsqueeze(0),
+                    valid_mask=torch.ones(1, chunk.shape[0], dtype=torch.bool),
+                    filter_logit=torch.zeros(1, chunk.shape[0]))
+                chunks.append(torch.sigmoid(scores[0]))
+        positive = (torch.cat(chunks).numpy().astype(np.float32) if chunks
+                    else np.zeros(0, np.float32))
+        return np.stack([1.0 - positive, positive], axis=1)
+
+
+def load_torch_gate(checkpoint_path):
+    return _TorchGate(checkpoint_path)
+
+
 def _window_selection(scores, is_gt, *, window, tail_sample, generator):
     """scores: (M,) filter scores; is_gt: (M,) bool. Returns (row indices,
     row kinds, tail-population size). Window rows come first in descending
@@ -339,7 +385,8 @@ def _file_sha256(path):
 def build(args):
     out_path = os.path.join(args.out_dir, f'candidates_{args.tag}.parquet')
     os.makedirs(args.out_dir, exist_ok=True)
-    model = load_filter_model(args.filter_model)
+    model = (load_torch_gate(args.filter_checkpoint) if args.filter_checkpoint
+             else load_filter_model(args.filter_model))
     window = None if args.role == 'eval' else args.window
     tail_sample = 0 if args.role == 'eval' else args.tail_sample
 
@@ -393,7 +440,8 @@ def build(args):
         print(f'WARNING: {n_failed}/{total} events failed and were written empty')
     print(f'wrote {out_path} ({total} rows)')
 
-    filter_path = sorted(glob.glob(args.filter_model))[0]
+    filter_path = (args.filter_checkpoint if args.filter_checkpoint
+                   else sorted(glob.glob(args.filter_model))[0])
     manifest = dict(
         git_sha=_git_sha(), role=args.role, dump=os.path.abspath(args.dump),
         src_glob=args.src_glob, n_events=total, n_failed=n_failed,
@@ -431,6 +479,9 @@ def main(argv=None):
     ap.add_argument('--tag', default=None, help='artifact suffix (default: role)')
     ap.add_argument('--out-dir', default=OUT_DIR)
     ap.add_argument('--filter-model', default=FILTER_MODEL_GLOB)
+    ap.add_argument('--filter-checkpoint', default=None,
+                    help='TripletReranker gate checkpoint; overrides '
+                         '--filter-model when set')
     ap.add_argument('--top-c', type=int, default=125)
     ap.add_argument('--window', type=int, default=WINDOW)
     ap.add_argument('--tail-sample', type=int, default=TAIL_SAMPLE)
