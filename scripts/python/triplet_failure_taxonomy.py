@@ -154,6 +154,7 @@ def run(args: argparse.Namespace) -> dict:
     from utils.triplet_rank_data import (TripletRankDataset,
                                          collate_triplet_rank_eval)
 
+    torch.multiprocessing.set_sharing_strategy('file_system')
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location='cpu',
                             weights_only=False)
