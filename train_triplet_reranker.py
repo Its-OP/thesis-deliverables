@@ -99,6 +99,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--label-smoothing', type=float, default=0.10)
     parser.add_argument('--projector-dim', type=int, default=32)
     parser.add_argument('--warm-start-projector', default=None)
+    parser.add_argument('--pv-reassociation', action='store_true',
+                        help='re-reference each candidate fitpv_* block to '
+                             'the PV nearest its fitted vertex (static fit '
+                             'path only)')
     parser.add_argument('--batch-size', type=int, default=96)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -336,7 +340,8 @@ def main(argv=None) -> None:
         context_features=args.context_features,
         vertex_fit=args.fit_mode,
         from_b_targets=args.aux_fromb_weight > 0.0,
-        track32=args.input_mode == 'hierarchical' and args.track_embed_dim == 32)
+        track32=args.input_mode == 'hierarchical' and args.track_embed_dim == 32,
+        pv_reassociation=args.pv_reassociation)
     train_dataset = TripletRankDataset(
         args.candidates, args.src_glob, tau=train_tau,
         num_negatives=args.num_negatives, mode='train', seed=args.seed,

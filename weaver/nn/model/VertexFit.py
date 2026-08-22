@@ -126,10 +126,14 @@ class VertexFitLayer(nn.Module):
                 phi: torch.Tensor, var_dxy: torch.Tensor,
                 var_dsz: torch.Tensor, primary_vertex: torch.Tensor,
                 momentum: torch.Tensor, mass: torch.Tensor,
-                quality: torch.Tensor) -> torch.Tensor:
+                quality: torch.Tensor,
+                pv_z_candidates: torch.Tensor | None = None) -> torch.Tensor:
         """reference: (B, 3, 3, N) member-major; eta, phi, var_dxy, var_dsz:
         (B, 3, N); primary_vertex: (B, 3); momentum: (B, 3, N) candidate sum;
-        mass: (B, N); quality: (B, Q, 3, N). Returns (B, len(FIT_NAMES), N)."""
+        mass: (B, N); quality: (B, Q, 3, N); pv_z_candidates: (B, P) optional,
+        NaN-padded — each candidate's PV block re-references the PV whose z is
+        nearest its fitted vertex, keeping the stored transverse coordinates.
+        Returns (B, len(FIT_NAMES), N)."""
         batch, _, _, candidates = reference.shape
         flat = batch * candidates
 
@@ -177,9 +181,22 @@ class VertexFitLayer(nn.Module):
         mcorr_beam = _corrected_mass(mass_flat, transverse_xy)
         dlen_sig_beam = lxy_beam / (fit.sigma_xy + _EPSILON)
 
-        # PV block: everything downstream of the stored primary vertex.
-        flight = vertex - primary_vertex.unsqueeze(1) \
+        # PV block: everything downstream of the reference primary vertex.
+        pv_flat = primary_vertex.unsqueeze(1) \
             .expand(batch, candidates, 3).reshape(flat, 3)
+        if pv_z_candidates is not None:
+            z_options = pv_z_candidates.unsqueeze(1) \
+                .expand(batch, candidates, -1).reshape(flat, -1)
+            gaps = (z_options - vertex[:, 2:3]).abs()
+            gaps = torch.where(torch.isnan(gaps),
+                               torch.full_like(gaps, float('inf')), gaps)
+            chosen_z = z_options.gather(
+                1, gaps.argmin(dim=1, keepdim=True)).squeeze(1)
+            chosen_z = torch.where(torch.isfinite(chosen_z), chosen_z,
+                                   pv_flat[:, 2])
+            pv_flat = torch.stack(
+                [pv_flat[:, 0], pv_flat[:, 1], chosen_z], dim=1)
+        flight = vertex - pv_flat
         flight_norm = flight.square().sum(dim=-1).clamp_min(1e-12).sqrt()
         momentum_norm = momentum_flat.square().sum(dim=-1).clamp_min(1e-12).sqrt()
         pv_cos = (flight * momentum_flat).sum(dim=-1) \

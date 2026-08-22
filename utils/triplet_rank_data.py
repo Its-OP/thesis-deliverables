@@ -218,7 +218,7 @@ class _EventTable:
                                 'sv_z']
 
     def __init__(self, candidates_path: str, src_glob: str,
-                 track32: bool = False):
+                 track32: bool = False, pv_reassociation: bool = False):
         schema_names = set(pq.read_schema(candidates_path).names)
         self.has_cascade_columns = all(name in schema_names for name in self._CASCADE_COLS)
         cand_cols = self._CAND_COLS + IDENTITY_COLS \
@@ -226,12 +226,15 @@ class _EventTable:
         candidates = pq.read_table(candidates_path, columns=cand_cols)
 
         self.track32 = track32
+        self.pv_reassociation = pv_reassociation
         track_cols = list(self._TRACK_COLS)
         extra_cols = []
         if track32:
             track_cols += self._TRACK32_TRACK_COLS
             extra_cols = self._TRACK32_EVENT_SCALAR_COLS \
                 + self._TRACK32_EVENT_LIST_COLS
+        if pv_reassociation and 'event_other_pv_z' not in extra_cols:
+            extra_cols = extra_cols + ['event_other_pv_z']
         shards = sorted(glob.glob(src_glob))
         assert shards, f'no source shards matched {src_glob}'
         import pyarrow as pa
@@ -263,6 +266,15 @@ class _EventTable:
                 {name: _plain_array(src[name])
                  for name in self._TRACK32_EVENT_LIST_COLS})
             self.track32_params = load_track32_params(TRACK32_YAML_PATH)
+        if pv_reassociation:
+            self._other_pv_z = (self.track32_extras['event_other_pv_z']
+                                if track32 else _plain_array(src['event_other_pv_z']))
+
+    def pv_z_candidates(self, r: int) -> torch.Tensor:
+        """Returns (P,): the stored PV z followed by the OtherPV z list."""
+        others = np.asarray(self._other_pv_z[r].values, dtype=np.float64)
+        stored = float(self.events['event_primary_vertex_z'][r])
+        return torch.tensor([stored, *others.tolist()], dtype=torch.float32)
 
     def track32_table(self, r: int) -> torch.Tensor:
         """Returns (T, 32) weaver-standardized pf_features channels for
@@ -443,7 +455,10 @@ def _static_fit_block(table: _EventTable, r: int, i, j, k) -> torch.Tensor:
     kw = table.track_kw(r)
     return static_fit_columns(
         i, j, k, lorentz=kw['lorentz'], eta=kw['eta'], phi=kw['phi'],
-        primary_vertex=table.primary_vertex(r), **table.vertex_fit_kw(r))
+        primary_vertex=table.primary_vertex(r),
+        pv_z_candidates=(table.pv_z_candidates(r)
+                         if table.pv_reassociation else None),
+        **table.vertex_fit_kw(r))
 
 
 def fit_norm_stats(candidates_path: str, src_glob: str, *,
@@ -526,10 +541,14 @@ class TripletRankDataset(Dataset):
                  norm_stats: dict | None = None, seed: int = 0,
                  extra_features: str = 'auto', context_features: bool = False,
                  vertex_fit: str = 'off', tail_weighting: bool = False,
-                 from_b_targets: bool = False, track32: bool = False):
+                 from_b_targets: bool = False, track32: bool = False,
+                 pv_reassociation: bool = False):
         assert mode in ('train', 'eval')
         assert vertex_fit in ('off', 'static', 'layer')
-        self.table = _EventTable(candidates_path, src_glob, track32=track32)
+        assert not (pv_reassociation and vertex_fit != 'static'), \
+            'pv_reassociation is implemented for the static fit path only'
+        self.table = _EventTable(candidates_path, src_glob, track32=track32,
+                                 pv_reassociation=pv_reassociation)
         self.tau = tau
         self.num_negatives = num_negatives
         self.mode = mode

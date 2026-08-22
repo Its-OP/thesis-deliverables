@@ -20,11 +20,13 @@ def static_fit_columns(
     vertex_x: torch.Tensor, vertex_y: torch.Tensor, vertex_z: torch.Tensor,
     var_dxy: torch.Tensor, var_dsz: torch.Tensor,
     primary_vertex: torch.Tensor,
+    pv_z_candidates: torch.Tensor | None = None,
     **_ignored: torch.Tensor,
 ) -> torch.Tensor:
     """i, j, k: (M,) member indices; lorentz: (4, T); eta, phi, vertex_*,
-    var_*: (T,); primary_vertex: (3,). Returns (M, len(FIT_NAMES)) — the
-    zero-init VertexFitLayer's channels with fixed physics weights."""
+    var_*: (T,); primary_vertex: (3,); pv_z_candidates: (P,) optional.
+    Returns (M, len(FIT_NAMES)) — the zero-init VertexFitLayer's channels
+    with fixed physics weights."""
     members = torch.stack([i, j, k], dim=0)
     reference = torch.stack([
         torch.stack([vertex_x[members[m]], vertex_y[members[m]],
@@ -47,5 +49,7 @@ def static_fit_columns(
             momentum=momentum,
             mass=mass,
             quality=torch.zeros(1, 12, 3, int(i.shape[0])),
+            pv_z_candidates=(None if pv_z_candidates is None
+                             else pv_z_candidates.unsqueeze(0)),
         )
     return outputs[0].T.contiguous()

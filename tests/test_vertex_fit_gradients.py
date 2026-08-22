@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from weaver.nn.model.VertexFit import (VertexFitLayer, physics_log_weights,
-                                       wls_vertex_fit)
+from weaver.nn.model.VertexFit import (FIT_NAMES, VertexFitLayer,
+                                       physics_log_weights, wls_vertex_fit)
 
 
 def test_backward_is_finite_at_an_exact_intersection():
@@ -84,6 +84,50 @@ def test_poisoned_candidate_does_not_corrupt_clean_gradients(poison):
                                     reference_gradients):
         assert torch.isfinite(parameter.grad).all()
         assert torch.allclose(parameter.grad, reference, atol=1e-6)
+
+
+def test_pv_reassociation_matches_baseline_when_only_stored_pv_offered():
+    layer = VertexFitLayer()
+    inputs = _clean_layer_inputs(3)
+    baseline = layer(**inputs)
+    stored_z = inputs['primary_vertex'][:, 2]
+    candidates_z = stored_z.unsqueeze(1)
+    repaired = layer(**inputs, pv_z_candidates=candidates_z)
+    assert torch.allclose(repaired, baseline, atol=1e-6)
+
+
+def test_pv_reassociation_switches_to_the_nearer_pv():
+    # Tracks meet near z=5; the stored PV sits at z=0, an OtherPV at z=4.9.
+    # Re-association must pick the near PV, shrinking the PV flight length.
+    layer = VertexFitLayer()
+    vertex = torch.tensor([0.3, -0.2, 5.0])
+    directions = torch.nn.functional.normalize(torch.tensor([
+        [1.0, 0.2, 0.1], [-0.3, 1.0, -0.2], [0.5, -0.6, 0.3]]), dim=-1)
+    arcs = torch.tensor([[-2.0], [1.5], [3.0]])
+    points = vertex.unsqueeze(0) + arcs * directions
+    eta = torch.asinh(directions[:, 2]
+                      / directions[:, :2].norm(dim=-1)).reshape(1, 3, 1)
+    phi = torch.atan2(directions[:, 1], directions[:, 0]).reshape(1, 3, 1)
+    inputs = dict(
+        reference=points.unsqueeze(0).unsqueeze(-1), eta=eta, phi=phi,
+        var_dxy=torch.full((1, 3, 1), 1e-4),
+        var_dsz=torch.full((1, 3, 1), 1e-4),
+        primary_vertex=torch.tensor([[0.0, 0.0, 0.0]]),
+        momentum=torch.tensor([0.4, -0.1, 2.0]).reshape(1, 3, 1),
+        mass=torch.full((1, 1), 0.7),
+        quality=torch.zeros(1, 12, 3, 1))
+    baseline = layer(**inputs)
+    repaired = layer(**inputs, pv_z_candidates=torch.tensor([[0.0, 4.9]]))
+    names = FIT_NAMES
+    pv_cos = names.index('fitpv_cos')
+    pv_lxy = names.index('fitpv_lxy')
+    beam_lxy = names.index('fit_lxy_beam')
+    # Beam-frame channels never touch the PV. The repair swaps only the PV z,
+    # so the transverse fitpv_lxy is invariant while the 3D pointing changes.
+    assert torch.allclose(repaired[0, beam_lxy], baseline[0, beam_lxy])
+    assert torch.allclose(repaired[0, pv_lxy], baseline[0, pv_lxy])
+    assert not torch.allclose(repaired[0, pv_cos], baseline[0, pv_cos])
+    assert torch.isfinite(repaired).all()
 
 
 def test_layer_backward_is_finite_on_degenerate_geometry():
