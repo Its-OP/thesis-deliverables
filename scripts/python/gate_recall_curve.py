@@ -43,7 +43,8 @@ def threshold_curve(scores: list[np.ndarray], is_gt: list[np.ndarray],
 
 
 def load_event_arrays(candidates_path: str, score_column: str,
-                      max_events: int = 0) -> tuple[list, list]:
+                      max_events: int = 0,
+                      scores_parquet: str | None = None) -> tuple[list, list]:
     table = pq.read_table(candidates_path,
                           columns=[score_column, 'is_gt', 'row_kind'])
     scores, is_gt = [], []
@@ -51,6 +52,11 @@ def load_event_arrays(candidates_path: str, score_column: str,
         else min(max_events, table.num_rows)
     score_col, gt_col, kind_col = (table[score_column], table['is_gt'],
                                    table['row_kind'])
+    if scores_parquet is not None:
+        external = pq.read_table(scores_parquet, columns=['scores'])
+        assert external.num_rows == table.num_rows, \
+            f'{external.num_rows} score rows vs {table.num_rows} events'
+        score_col = external['scores']
     for r in range(n_rows):
         kinds = np.asarray(kind_col[r].values)
         serving = kinds == 0
@@ -66,11 +72,13 @@ def main() -> None:
     parser.add_argument('--top-n', default=','.join(map(str, DEFAULT_TOP_N)))
     parser.add_argument('--quantile-thresholds', type=int, default=25)
     parser.add_argument('--max-events', type=int, default=0)
+    parser.add_argument('--scores-parquet', default=None)
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
 
     scores, is_gt = load_event_arrays(args.candidates, args.score_column,
-                                      args.max_events)
+                                      args.max_events,
+                                      scores_parquet=args.scores_parquet)
     pooled = np.concatenate(scores)
     thresholds = np.quantile(
         pooled, np.linspace(0.05, 0.999, args.quantile_thresholds)).tolist()
