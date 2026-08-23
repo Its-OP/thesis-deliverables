@@ -7,14 +7,20 @@ import torch.nn.functional as F
 _MAX_SHARED = 3
 
 
-def shared_track_counts(keys: torch.Tensor) -> torch.Tensor:
+def shared_track_counts(keys: torch.Tensor,
+                        block: int = 1024) -> torch.Tensor:
     """keys: (B, N, 3) track-index triples, -1 on padded slots.
-    Returns (B, N, N) pairwise shared-track counts in [0, 3]."""
-    left = keys.unsqueeze(2).unsqueeze(-1)
+    Returns (B, N, N) pairwise shared-track counts in [0, 3]. Computed in
+    row blocks: the (B, N, N, 3, 3) comparison tensor never materializes."""
+    batch, length, _ = keys.shape
+    counts = keys.new_zeros(batch, length, length, dtype=torch.uint8)
     right = keys.unsqueeze(1).unsqueeze(-2)
-    matches = (left == right).any(dim=-1)
-    matches = matches & (keys.unsqueeze(2) >= 0)
-    return matches.sum(dim=-1)
+    for start in range(0, length, block):
+        chunk = keys[:, start:start + block]
+        matches = (chunk.unsqueeze(2).unsqueeze(-1) == right).any(dim=-1)
+        matches = matches & (chunk.unsqueeze(2) >= 0)
+        counts[:, start:start + block] = matches.sum(dim=-1).to(torch.uint8)
+    return counts
 
 
 def within_couple_contrast(scores: torch.Tensor, couple_ids: torch.Tensor,
@@ -62,14 +68,16 @@ class _BiasedAttentionBlock(nn.Module):
         qkv = self.qkv(normed).reshape(batch, length, 3, self.num_heads,
                                        self.head_dim).permute(2, 0, 3, 1, 4)
         query, key, value = qkv[0], qkv[1], qkv[2]
-        logits = query @ key.transpose(-2, -1) / self.head_dim ** 0.5 + bias
-        logits = logits.masked_fill(
-            ~padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
-        attention = torch.softmax(logits, dim=-1)
-        # Fully-padded query rows softmax over -inf only; zero them instead
-        # of letting NaN propagate into the residual stream.
-        attention = torch.nan_to_num(attention, nan=0.0)
-        merged = (attention @ value).transpose(1, 2).reshape(batch, length, -1)
+        # SDPA with the overlap bias folded into an additive float mask keeps
+        # peak memory linear in N (no materialized N x N softmax input).
+        mask = bias.masked_fill(~padding_mask.unsqueeze(1).unsqueeze(2),
+                                float('-inf'))
+        merged = F.scaled_dot_product_attention(query, key, value,
+                                                attn_mask=mask)
+        # Fully-padded query rows attend over -inf only; zero them instead of
+        # letting NaN propagate into the residual stream.
+        merged = torch.nan_to_num(merged, nan=0.0)
+        merged = merged.transpose(1, 2).reshape(batch, length, -1)
         hidden = hidden + self.dropout(self.projection(merged))
         return hidden + self.dropout(self.feedforward(
             self.norm_feedforward(hidden)))
@@ -103,7 +111,7 @@ class ListwiseTripletReranker(nn.Module):
         """features: (B, F, N); keys: (B, N, 3); valid_mask, filter_logit:
         (B, N). Returns (B, N) scores."""
         hidden = self.input_projection(features.transpose(1, 2))
-        counts = shared_track_counts(keys).clamp(0, _MAX_SHARED)
+        counts = shared_track_counts(keys).long().clamp(0, _MAX_SHARED)
         bias = self.overlap_bias[:, counts].permute(1, 0, 2, 3)
         for block in self.blocks:
             hidden = block(hidden, bias, valid_mask)

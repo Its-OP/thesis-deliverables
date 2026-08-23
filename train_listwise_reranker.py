@@ -77,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--min-lr', type=float, default=1e-6)
     parser.add_argument('--grad-clip', type=float, default=1.0)
     parser.add_argument('--eval-events', type=int, default=20000)
-    parser.add_argument('--eval-batch-size', type=int, default=16)
+    parser.add_argument('--eval-batch-size', type=int, default=4)
     parser.add_argument('--max-train-events', type=int, default=0)
     parser.add_argument('--num-workers', type=int, default=32)
     parser.add_argument('--seed', type=int, default=0)
@@ -293,7 +293,7 @@ def main() -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
-            scheduler.step()
+            scheduler.step_batch()
             step += 1
             running += float(loss)
             if (batch_index + 1) % args.log_every == 0:
