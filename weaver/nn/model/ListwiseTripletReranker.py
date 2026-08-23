@@ -112,7 +112,11 @@ class ListwiseTripletReranker(nn.Module):
         (B, N). Returns (B, N) scores."""
         hidden = self.input_projection(features.transpose(1, 2))
         counts = shared_track_counts(keys).long().clamp(0, _MAX_SHARED)
-        bias = self.overlap_bias[:, counts].permute(1, 0, 2, 3)
+        # One-hot einsum instead of a table gather: the gather's backward is a
+        # billion-element atomic scatter onto 32 floats (measured 98% of step
+        # time); the einsum reduces via GEMM.
+        one_hot = F.one_hot(counts, _MAX_SHARED + 1).to(features.dtype)
+        bias = torch.einsum('bnmc,hc->bhnm', one_hot, self.overlap_bias)
         for block in self.blocks:
             hidden = block(hidden, bias, valid_mask)
         residual = self.scorer_head(hidden).squeeze(-1)
