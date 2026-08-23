@@ -79,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--eval-events', type=int, default=20000)
     parser.add_argument('--eval-batch-size', type=int, default=4)
     parser.add_argument('--max-list', type=int, default=3072)
+    parser.add_argument('--events-per-epoch', type=int, default=100000)
     parser.add_argument('--max-train-events', type=int, default=0)
     parser.add_argument('--num-workers', type=int, default=32)
     parser.add_argument('--seed', type=int, default=0)
@@ -242,13 +243,20 @@ def main() -> None:
 
     loader_kwargs = {}
     if args.num_workers > 0:
-        loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
-    loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                        sampler=SubsetRandomSampler([int(x) for x in trainable]),
-                        collate_fn=collate_listwise_rank,
-                        num_workers=args.num_workers, drop_last=True,
-                        **loader_kwargs)
-    steps_per_epoch = max(1, len(trainable) // args.batch_size)
+        loader_kwargs.update(prefetch_factor=4)
+    epoch_events = min(args.events_per_epoch or len(trainable), len(trainable))
+    epoch_rng = np.random.default_rng(args.seed)
+
+    def epoch_loader():
+        subset = epoch_rng.choice(trainable, epoch_events, replace=False)
+        return DataLoader(train_dataset, batch_size=args.batch_size,
+                          sampler=SubsetRandomSampler(
+                              [int(x) for x in subset]),
+                          collate_fn=collate_listwise_rank,
+                          num_workers=args.num_workers, drop_last=True,
+                          **loader_kwargs)
+
+    steps_per_epoch = max(1, epoch_events // args.batch_size)
 
     model = ListwiseTripletReranker(
         feature_dim=len(feature_names), hidden_dim=args.hidden_dim,
@@ -284,7 +292,7 @@ def main() -> None:
     for epoch in range(args.epochs):
         model.train()
         running = 0.0
-        for batch_index, batch in enumerate(loader):
+        for batch_index, batch in enumerate(epoch_loader()):
             scores = _forward(model, batch, device)
             loss = listwise_loss(scores, batch['pos_mask'].to(device),
                                  batch['valid_mask'].to(device),
