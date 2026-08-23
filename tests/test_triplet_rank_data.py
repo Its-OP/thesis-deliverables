@@ -158,6 +158,17 @@ def test_serving_list_is_window_rows_at_or_above_tau(artifact):
     assert tighter[0]['features'].shape[0] == n_window - 1
 
 
+def test_eval_item_couple_ids_encode_the_stage3_couple(artifact):
+    dataset = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
+                                 extra_features='auto')
+    arrays = dataset.table.candidate_arrays(0)
+    serving = arrays['row_kind'] == 0
+    expected = (arrays['cand_i'][serving].astype(np.int64) * 4096
+                + arrays['cand_j'][serving].astype(np.int64))
+    item = dataset[0]
+    assert item['couple_ids'].numpy().tolist() == expected.tolist()
+
+
 def test_filter_logit_matches_the_stored_scores(artifact):
     dataset = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
                                  extra_features='auto')

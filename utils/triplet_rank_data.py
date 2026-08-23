@@ -659,6 +659,7 @@ class TripletRankDataset(Dataset):
             item.update(self._fit_layer_inputs(int(r), i, j, k))
         if self.mode == 'eval':
             item['keys'] = torch.stack([i, j, k], dim=1).sort(dim=1).values
+            item['couple_ids'] = i.long() * 4096 + j.long()
         return item
 
     def _fit_layer_inputs(self, r: int, i, j, k) -> dict[str, torch.Tensor]:
@@ -692,6 +693,24 @@ class TripletRankDataset(Dataset):
 
 _FIT_PAD_KEYS = ['fit_reference', 'fit_eta', 'fit_phi', 'fit_var_dxy',
                  'fit_var_dsz', 'fit_momentum', 'fit_quality']
+
+
+def collate_listwise_rank(items: list[dict]) -> dict[str, torch.Tensor]:
+    """Pads like collate_triplet_rank plus keys (B, N, 3) and couple_ids
+    (B, N), both -1 on padded slots, and counts (B,)."""
+    batch = collate_triplet_rank(items)
+    batch_size = len(items)
+    max_candidates = batch['features'].shape[2]
+    keys = torch.full((batch_size, max_candidates, 3), -1, dtype=torch.long)
+    couple_ids = torch.full((batch_size, max_candidates), -1, dtype=torch.long)
+    counts = torch.zeros(batch_size, dtype=torch.long)
+    for b, item in enumerate(items):
+        n = item['keys'].shape[0]
+        keys[b, :n] = item['keys']
+        couple_ids[b, :n] = item['couple_ids']
+        counts[b] = n
+    batch.update(keys=keys, couple_ids=couple_ids, counts=counts)
+    return batch
 
 
 def collate_triplet_rank(items: list[dict]) -> dict[str, torch.Tensor]:
