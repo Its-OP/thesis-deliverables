@@ -50,6 +50,17 @@ def distinct_couples_in_top(couple_ids: np.ndarray, k: int) -> int:
     return int(np.unique(couple_ids[:k]).size)
 
 
+def top_couple_coverage(couple_ids: np.ndarray, k: int, m: int) -> float:
+    """couple_ids: (n,) deduped ranking order. Fraction of the first k
+    candidates whose couple is among the first m distinct couples to appear."""
+    head = couple_ids[:k]
+    if head.size == 0:
+        return 0.0
+    _, first_positions = np.unique(couple_ids, return_index=True)
+    leading = couple_ids[np.sort(first_positions)[:m]]
+    return float(np.isin(head, leading).mean())
+
+
 def diversity_capped_gt_rank(couple_ids: np.ndarray, is_gt: np.ndarray,
                              cap: int | None) -> int | None:
     """couple_ids, is_gt: (m,) deduped, ranking order. GT rank after keeping
@@ -242,7 +253,7 @@ def run(args: argparse.Namespace) -> dict:
                         'capped_ranks': {str(cap): None
                                          for cap in DIVERSITY_CAPS},
                     }
-                    if not pos[mask].any():
+                    if not mask.any():
                         record['class'] = 'absent'
                         records.append(record)
                         continue
@@ -251,6 +262,20 @@ def run(args: argparse.Namespace) -> dict:
                     dedup = deduped_order(keys_ordered)
                     couples_deduped = couple_ids[mask][order][dedup]
                     is_gt_deduped = pos[mask][order][dedup]
+                    record['n_couples_top10'] = distinct_couples_in_top(
+                        couples_deduped, 10)
+                    for top_k in (50, 100, 500):
+                        record[f'n_couples_top{top_k}'] = \
+                            distinct_couples_in_top(couples_deduped, top_k)
+                    for top_k in (100, 500):
+                        for leading in (1, 5, 12):
+                            record[f'cov_top{leading}_at{top_k}'] = \
+                                top_couple_coverage(couples_deduped, top_k,
+                                                    leading)
+                    if not pos[mask].any():
+                        record['class'] = 'absent'
+                        records.append(record)
+                        continue
                     record['gt_rank'] = deduped_gt_rank(keys_ordered,
                                                         pos[mask][order])
                     record['gt_couple_rank'] = gt_couple_stage3_rank(
@@ -258,8 +283,6 @@ def run(args: argparse.Namespace) -> dict:
                     if (gt_triple >= 0).all():
                         record['two_overlap_rank'] = best_two_overlap_rank(
                             keys_ordered[dedup], gt_triple)
-                    record['n_couples_top10'] = distinct_couples_in_top(
-                        couples_deduped, 10)
                     record['capped_ranks'] = {
                         str(cap): diversity_capped_gt_rank(
                             couples_deduped, is_gt_deduped, cap)
