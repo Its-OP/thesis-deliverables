@@ -542,7 +542,7 @@ class TripletRankDataset(Dataset):
                  extra_features: str = 'auto', context_features: bool = False,
                  vertex_fit: str = 'off', tail_weighting: bool = False,
                  from_b_targets: bool = False, track32: bool = False,
-                 pv_reassociation: bool = False):
+                 pv_reassociation: bool = False, max_serving_rows: int = 0):
         assert mode in ('train', 'eval')
         assert vertex_fit in ('off', 'static', 'layer')
         assert not (pv_reassociation and vertex_fit != 'static'), \
@@ -551,6 +551,7 @@ class TripletRankDataset(Dataset):
                                  pv_reassociation=pv_reassociation)
         self.tau = tau
         self.num_negatives = num_negatives
+        self.max_serving_rows = max_serving_rows
         self.mode = mode
         self.norm_stats = norm_stats
         self.generator = np.random.default_rng(seed)
@@ -592,7 +593,10 @@ class TripletRankDataset(Dataset):
     def _select(self, r: int):
         arrays = self.table.candidate_arrays(r)
         serving = (arrays['filter_score'] >= self.tau) & (arrays['row_kind'] == 0)
-        return arrays, np.where(serving)[0]
+        surviving = np.where(serving)[0]
+        if self.max_serving_rows:
+            surviving = surviving[:self.max_serving_rows]
+        return arrays, surviving
 
     def __getitem__(self, r: int) -> dict[str, torch.Tensor]:
         arrays, surviving = self._select(int(r))

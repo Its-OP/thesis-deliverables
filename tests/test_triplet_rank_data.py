@@ -158,6 +158,19 @@ def test_serving_list_is_window_rows_at_or_above_tau(artifact):
     assert tighter[0]['features'].shape[0] == n_window - 1
 
 
+def test_max_serving_rows_truncates_at_filter_rank(artifact):
+    full = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
+                              extra_features='auto')
+    capped = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
+                                extra_features='auto', max_serving_rows=3)
+    n_full = full[0]['features'].shape[0]
+    item = capped[0]
+    assert item['features'].shape[0] == min(3, n_full)
+    # Stored order = filter rank, so the cap keeps the top-scored rows.
+    assert torch.equal(item['filter_logit'],
+                       full[0]['filter_logit'][:min(3, n_full)])
+
+
 def test_eval_item_couple_ids_encode_the_stage3_couple(artifact):
     dataset = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
                                  extra_features='auto')

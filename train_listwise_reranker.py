@@ -78,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--grad-clip', type=float, default=1.0)
     parser.add_argument('--eval-events', type=int, default=20000)
     parser.add_argument('--eval-batch-size', type=int, default=4)
+    parser.add_argument('--max-list', type=int, default=3072)
     parser.add_argument('--max-train-events', type=int, default=0)
     parser.add_argument('--num-workers', type=int, default=32)
     parser.add_argument('--seed', type=int, default=0)
@@ -201,7 +202,7 @@ def main() -> None:
     logger.info(f'gate {args.gate}: tau {train_tau}; eval gates {eval_gates}')
 
     dataset_kwargs = dict(extra_features='auto', context_features=True,
-                          vertex_fit='static')
+                          vertex_fit='static', max_serving_rows=args.max_list)
     train_dataset = TripletRankDataset(
         args.candidates, args.src_glob, tau=train_tau, mode='eval',
         seed=args.seed, **dataset_kwargs)
