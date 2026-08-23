@@ -80,6 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--eval-batch-size', type=int, default=4)
     parser.add_argument('--max-list', type=int, default=3072)
     parser.add_argument('--events-per-epoch', type=int, default=100000)
+    parser.add_argument('--eval-every', type=int, default=1)
     parser.add_argument('--max-train-events', type=int, default=0)
     parser.add_argument('--num-workers', type=int, default=32)
     parser.add_argument('--seed', type=int, default=0)
@@ -314,6 +315,10 @@ def main() -> None:
                             f'{steps_per_epoch} | loss '
                             f'{running / (batch_index + 1):.4f} | lr '
                             f'{scheduler.get_last_lr()[0]:.2e}')
+        if (epoch + 1) % args.eval_every and epoch != args.epochs - 1:
+            logger.info(f'epoch {epoch}: loss {running / steps_per_epoch:.4f} '
+                        f'(eval skipped)')
+            continue
         metrics = evaluate(model, eval_dataset, eval_side, device,
                            gates=eval_gates, batch_size=args.eval_batch_size,
                            num_workers=args.num_workers)
