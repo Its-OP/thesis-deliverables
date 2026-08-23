@@ -122,10 +122,13 @@ def listwise_loss(scores: torch.Tensor, pos_mask: torch.Tensor,
 
 
 def _forward(model, batch, device) -> torch.Tensor:
-    return model(batch['features'].to(device),
-                 keys=batch['keys'].to(device),
-                 valid_mask=batch['valid_mask'].to(device),
-                 filter_logit=batch['filter_logit'].to(device))
+    with torch.autocast('cuda', dtype=torch.bfloat16,
+                        enabled=device.type == 'cuda'):
+        scores = model(batch['features'].to(device),
+                       keys=batch['keys'].to(device),
+                       valid_mask=batch['valid_mask'].to(device),
+                       filter_logit=batch['filter_logit'].to(device))
+    return scores.float()
 
 
 @torch.no_grad()
@@ -188,6 +191,7 @@ def main() -> None:
                         format='%(asctime)s %(levelname)s %(message)s')
     args = build_parser().parse_args()
     torch.multiprocessing.set_sharing_strategy('file_system')
+    torch.set_float32_matmul_precision('high')
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device(args.device)
