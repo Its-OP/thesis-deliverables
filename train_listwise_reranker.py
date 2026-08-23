@@ -81,6 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--max-list', type=int, default=3072)
     parser.add_argument('--events-per-epoch', type=int, default=100000)
     parser.add_argument('--eval-every', type=int, default=1)
+    parser.add_argument('--warm-start', default=None,
+                        help='listwise checkpoint to initialize from; skips '
+                             'the epoch-0 gate-ordering assert')
     parser.add_argument('--max-train-events', type=int, default=0)
     parser.add_argument('--num-workers', type=int, default=32)
     parser.add_argument('--seed', type=int, default=0)
@@ -270,20 +273,36 @@ def main() -> None:
     logger.info(f'{sum(p.numel() for p in model.parameters())} parameters, '
                 f'{len(feature_names)} features')
 
-    sample = eval_side[:min(len(eval_side), 512)]
-    model_metrics = evaluate(model, eval_dataset, sample, device,
-                             gates=eval_gates, batch_size=args.eval_batch_size)
-    filter_metrics = evaluate(model, eval_dataset, sample, device,
-                              gates=eval_gates, batch_size=args.eval_batch_size,
-                              score_override=lambda b: b['filter_logit'])
-    for key in model_metrics:
-        if key.split('/')[-1].startswith('T@') \
-                and abs(model_metrics[key] - filter_metrics[key]) > 1e-9:
-            raise SystemExit(f'epoch-0 fusion mismatch on {key}: '
-                             f'{model_metrics[key]:.6f} vs '
-                             f'{filter_metrics[key]:.6f}')
-    logger.info(f'epoch-0 fusion assert passed on {len(sample)} events '
-                f"(T@10 {model_metrics['T@10']:.4f})")
+    if args.warm_start:
+        checkpoint = torch.load(args.warm_start, map_location='cpu',
+                                weights_only=False)
+        model.load_state_dict(checkpoint['listwise_reranker_state_dict'])
+        logger.info(f'warm-started from {args.warm_start} '
+                    f"(epoch {checkpoint.get('epoch')}, "
+                    f"T@10 {checkpoint.get('val_metrics', {}).get('T@10')})")
+        sample = eval_side[:min(len(eval_side), 2048)]
+        warm_metrics = evaluate(model, eval_dataset, sample, device,
+                                gates=eval_gates,
+                                batch_size=args.eval_batch_size)
+        logger.info(f'warm-start wiring eval on {len(sample)} events: '
+                    f"T@10 {warm_metrics['T@10']:.4f}")
+    else:
+        sample = eval_side[:min(len(eval_side), 512)]
+        model_metrics = evaluate(model, eval_dataset, sample, device,
+                                 gates=eval_gates,
+                                 batch_size=args.eval_batch_size)
+        filter_metrics = evaluate(model, eval_dataset, sample, device,
+                                  gates=eval_gates,
+                                  batch_size=args.eval_batch_size,
+                                  score_override=lambda b: b['filter_logit'])
+        for key in model_metrics:
+            if key.split('/')[-1].startswith('T@') \
+                    and abs(model_metrics[key] - filter_metrics[key]) > 1e-9:
+                raise SystemExit(f'epoch-0 fusion mismatch on {key}: '
+                                 f'{model_metrics[key]:.6f} vs '
+                                 f'{filter_metrics[key]:.6f}')
+        logger.info(f'epoch-0 fusion assert passed on {len(sample)} events '
+                    f"(T@10 {model_metrics['T@10']:.4f})")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay)
