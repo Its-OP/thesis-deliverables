@@ -84,6 +84,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--warm-start', default=None,
                         help='listwise checkpoint to initialize from; skips '
                              'the epoch-0 gate-ordering assert')
+    parser.add_argument('--third-popularity', action='store_true',
+                        help='append the gate-list third-attachment features')
     parser.add_argument('--max-train-events', type=int, default=0)
     parser.add_argument('--num-workers', type=int, default=32)
     parser.add_argument('--seed', type=int, default=0)
@@ -211,7 +213,8 @@ def main() -> None:
     logger.info(f'gate {args.gate}: tau {train_tau}; eval gates {eval_gates}')
 
     dataset_kwargs = dict(extra_features='auto', context_features=True,
-                          vertex_fit='static', max_serving_rows=args.max_list)
+                          vertex_fit='static', max_serving_rows=args.max_list,
+                          third_popularity=args.third_popularity)
     train_dataset = TripletRankDataset(
         args.candidates, args.src_glob, tau=train_tau, mode='eval',
         seed=args.seed, **dataset_kwargs)
@@ -224,7 +227,8 @@ def main() -> None:
                                     feature_names=feature_names,
                                     seed=args.seed, tau=train_tau,
                                     context_features=True,
-                                    vertex_fit='static')
+                                    vertex_fit='static',
+                                    third_popularity=args.third_popularity)
         os.makedirs(os.path.dirname(os.path.abspath(args.norm_stats)),
                     exist_ok=True)
         save_norm_stats(norm_stats, args.norm_stats)

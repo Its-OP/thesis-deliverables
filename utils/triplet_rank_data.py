@@ -65,6 +65,10 @@ CASCADE_EXTRA_NAMES = ['s1_i', 's1_j', 's1_k', 's2_i', 's2_j', 's2_k',
 CONTEXT_FEATURE_NAMES = ['ctx_filter_rank_frac', 'ctx_filter_top_gap',
                          'ctx_filter_z', 'ctx_log_n_surviving',
                          'ctx_couple_rank_frac']
+# Third-track popularity within the gate-served list (exogenous: computed
+# from the gated candidates, never from model scores). Impostor thirds attach
+# to ~13 couples in the top-100 while the GT third often attaches once.
+THIRD_POPULARITY_NAMES = ['ctx_third_log_attach', 'ctx_third_attach_frac']
 
 IDENTITY_COLS = ['event_run', 'event_id', 'event_luminosity_block',
                  'source_batch_id', 'source_microbatch_id']
@@ -451,6 +455,25 @@ def event_context_features(arrays: dict, cascade: dict, surviving: np.ndarray,
     return torch.tensor(context[lookup], dtype=torch.float32)
 
 
+def third_popularity_features(arrays: dict, surviving: np.ndarray,
+                              selected) -> torch.Tensor:
+    """arrays: candidate_arrays(r). surviving: (S,) and selected: (M,)
+    candidate positions. Returns (M, len(THIRD_POPULARITY_NAMES)) float32."""
+    n_surviving = len(surviving)
+    if n_surviving == 0:
+        return torch.zeros((0, len(THIRD_POPULARITY_NAMES)),
+                           dtype=torch.float32)
+    thirds = arrays['cand_k'][surviving]
+    values, counts = np.unique(thirds, return_counts=True)
+    attachments = counts[np.searchsorted(values, thirds)].astype(np.float64)
+    block = np.stack([np.log1p(attachments), attachments / n_surviving],
+                     axis=1)
+    position_in_surviving = np.empty(int(surviving.max()) + 1, dtype=np.int64)
+    position_in_surviving[surviving] = np.arange(n_surviving)
+    lookup = position_in_surviving[np.asarray(selected)]
+    return torch.tensor(block[lookup], dtype=torch.float32)
+
+
 def _static_fit_block(table: _EventTable, r: int, i, j, k) -> torch.Tensor:
     kw = table.track_kw(r)
     return static_fit_columns(
@@ -466,10 +489,12 @@ def fit_norm_stats(candidates_path: str, src_glob: str, *,
                    per_event: int = 50, seed: int = 0, events=None,
                    tau: float | None = None,
                    context_features: bool = False,
-                   vertex_fit: str = 'off') -> dict:
+                   vertex_fit: str = 'off',
+                   third_popularity: bool = False) -> dict:
     """Median/IQR stats over sampled surviving window candidates; keys =
     feature_names (default BASE_FEATURE_NAMES) plus the static fit block when
-    vertex_fit != 'off' and the context block when context_features."""
+    vertex_fit != 'off', the context block when context_features, and the
+    third-popularity block when third_popularity."""
     if context_features and tau is None:
         raise ValueError('context_features=True requires tau (context is defined '
                          'over the tau-surviving list)')
@@ -480,7 +505,8 @@ def fit_norm_stats(candidates_path: str, src_glob: str, *,
     if feature_names is None:
         feature_names = list(BASE_FEATURE_NAMES)
     base_names = [name for name in feature_names
-                  if name not in CONTEXT_FEATURE_NAMES and name not in FIT_NAMES]
+                  if name not in CONTEXT_FEATURE_NAMES and name not in FIT_NAMES
+                  and name not in THIRD_POPULARITY_NAMES]
     with_fit = vertex_fit != 'off' or any(name in FIT_NAMES for name in feature_names)
     generator = np.random.default_rng(seed)
     pool = np.arange(table.num_rows) if events is None else np.asarray(events)
@@ -505,10 +531,14 @@ def fit_norm_stats(candidates_path: str, src_glob: str, *,
             context = event_context_features(arrays, table.cascade_arrays(int(r)),
                                              surviving, take)
             X = torch.cat([X, context], dim=1)
+        if third_popularity:
+            X = torch.cat([X, third_popularity_features(arrays, surviving,
+                                                        take)], dim=1)
         samples.append(X.numpy())
     sample = np.concatenate(samples)
     names = list(base_names) + (list(FIT_NAMES) if with_fit else []) \
-        + (list(CONTEXT_FEATURE_NAMES) if context_features else [])
+        + (list(CONTEXT_FEATURE_NAMES) if context_features else []) \
+        + (list(THIRD_POPULARITY_NAMES) if third_popularity else [])
     stats = {}
     for column_index, name in enumerate(names):
         if name.endswith('_isvalid'):
@@ -542,7 +572,8 @@ class TripletRankDataset(Dataset):
                  extra_features: str = 'auto', context_features: bool = False,
                  vertex_fit: str = 'off', tail_weighting: bool = False,
                  from_b_targets: bool = False, track32: bool = False,
-                 pv_reassociation: bool = False, max_serving_rows: int = 0):
+                 pv_reassociation: bool = False, max_serving_rows: int = 0,
+                 third_popularity: bool = False):
         assert mode in ('train', 'eval')
         assert vertex_fit in ('off', 'static', 'layer')
         assert not (pv_reassociation and vertex_fit != 'static'), \
@@ -574,6 +605,9 @@ class TripletRankDataset(Dataset):
                 raise ValueError('context_features requires track_s1/track_s2/'
                                  'couple_scores columns in the candidates artifact')
             self.feature_names = self.feature_names + CONTEXT_FEATURE_NAMES
+        self.third_popularity = third_popularity
+        if third_popularity:
+            self.feature_names = self.feature_names + THIRD_POPULARITY_NAMES
 
         flat_scores = np.asarray(self.table.candidates['filter_score'].values)
         flat_kind = np.asarray(self.table.candidates['row_kind'].values)
@@ -643,6 +677,9 @@ class TripletRankDataset(Dataset):
             context = event_context_features(
                 arrays, self.table.cascade_arrays(int(r)), surviving, selected)
             features = torch.cat([features, context], dim=1)
+        if self.third_popularity:
+            popularity = third_popularity_features(arrays, surviving, selected)
+            features = torch.cat([features, popularity], dim=1)
         if self.norm_stats is not None:
             features = standardize_features(features, self.feature_names,
                                             self.norm_stats)

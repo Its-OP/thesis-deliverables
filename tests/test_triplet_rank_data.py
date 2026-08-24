@@ -171,6 +171,30 @@ def test_max_serving_rows_truncates_at_filter_rank(artifact):
                        full[0]['filter_logit'][:min(3, n_full)])
 
 
+def test_third_popularity_features_count_shared_thirds(artifact):
+    from utils.triplet_rank_data import THIRD_POPULARITY_NAMES
+    plain = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
+                               extra_features='auto')
+    dataset = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
+                                 extra_features='auto', third_popularity=True)
+    assert dataset.feature_names == plain.feature_names \
+        + list(THIRD_POPULARITY_NAMES)
+
+    arrays = dataset.table.candidate_arrays(0)
+    serving = arrays['row_kind'] == 0
+    thirds = arrays['cand_k'][serving]
+    values, counts = np.unique(thirds, return_counts=True)
+    expected_counts = counts[np.searchsorted(values, thirds)]
+
+    item = dataset[0]
+    offset = len(plain.feature_names)
+    log_attach = item['features'][:, offset].numpy()
+    attach_frac = item['features'][:, offset + 1].numpy()
+    assert log_attach == pytest.approx(np.log1p(expected_counts), rel=1e-5)
+    assert attach_frac == pytest.approx(expected_counts / serving.sum(),
+                                        rel=1e-5)
+
+
 def test_eval_item_couple_ids_encode_the_stage3_couple(artifact):
     dataset = TripletRankDataset(*artifact, tau=-np.inf, mode='eval',
                                  extra_features='auto')
