@@ -41,11 +41,22 @@ def main() -> None:
     parser.add_argument('--src-glob', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--max-events', type=int, default=0)
+    parser.add_argument('--scores-parquet', default=None,
+                        help='per-event model scores over the tau-gated list; '
+                             'reorders candidates by model rank')
+    parser.add_argument('--tau', type=float, default=None,
+                        help='filter_score gate applied before ranking')
+    parser.add_argument('--max-list', type=int, default=0,
+                        help='cap the gated list at this filter rank (must '
+                             'match the scorer when --scores-parquet is used)')
     args = parser.parse_args()
 
-    candidates = pq.read_table(
-        args.candidates,
-        columns=['cand_k', 'is_gt', 'row_kind', 'gt_k', 'track_s1'])
+    columns = ['cand_k', 'is_gt', 'row_kind', 'gt_k', 'track_s1']
+    if args.tau is not None:
+        columns.append('filter_score')
+    candidates = pq.read_table(args.candidates, columns=columns)
+    external = (pq.read_table(args.scores_parquet, columns=['scores'])
+                if args.scores_parquet else None)
     shards = sorted(glob.glob(args.src_glob))
     source = pa.concat_tables([
         pq.read_table(shard, columns=['track_pt', 'track_label_from_b'])
@@ -56,9 +67,21 @@ def main() -> None:
     per_event: list[dict] = []
     for r in range(n_rows):
         kinds = np.asarray(candidates['row_kind'][r].values)
-        thirds = np.asarray(candidates['cand_k'][r].values)[kinds == 0]
+        serving = kinds == 0
+        if args.tau is not None:
+            scores_stored = np.asarray(candidates['filter_score'][r].values)
+            serving = serving & (scores_stored >= args.tau)
+        serving_indices = np.nonzero(serving)[0]
+        if args.max_list:
+            serving_indices = serving_indices[:args.max_list]
+        thirds = np.asarray(candidates['cand_k'][r].values)[serving_indices]
         if thirds.size == 0:
             continue
+        if external is not None:
+            model_scores = np.asarray(external['scores'][r].values)
+            assert model_scores.size == thirds.size, \
+                f'event {r}: {model_scores.size} scores vs {thirds.size} rows'
+            thirds = thirds[np.argsort(-model_scores, kind='stable')]
         track_s1 = np.asarray(candidates['track_s1'][r].values)
         track_pt = np.asarray(source['track_pt'][r].values)
         from_b = np.asarray(source['track_label_from_b'][r].values)
