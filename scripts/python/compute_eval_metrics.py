@@ -7,10 +7,8 @@ import logging
 import os
 from collections import defaultdict
 
+import numpy as np
 import pyarrow.parquet as pq
-from torch.utils.data import DataLoader
-
-from weaver.utils.dataset import SimpleIterDataset
 
 logger = logging.getLogger('compute_eval_metrics')
 
@@ -26,53 +24,39 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--eval-parquet', required=True)
     parser.add_argument('--val-data-dir', required=True)
-    parser.add_argument('--data-config', required=True)
     parser.add_argument('--output', required=True)
-    parser.add_argument('--num-workers', type=int, default=0)
-    parser.add_argument('--batch-size', type=int, default=64)
     return parser
 
 
-def _composite_key_tuple(observers: dict, b: int) -> tuple[int, int, int, int, int]:
-    return (
-        int(observers['event_run'][b]),
-        int(observers['event_id'][b]),
-        int(observers['event_luminosity_block'][b]),
-        int(observers['source_batch_id'][b]),
-        int(observers['source_microbatch_id'][b]),
-    )
+IDENTITY_COLUMNS = ('event_run', 'event_id', 'event_luminosity_block',
+                    'source_batch_id', 'source_microbatch_id')
+
+
+def build_gt_lookup(parquet_files: list[str]) -> dict[tuple, frozenset]:
+    """parquet_files: raw source shards. Reads only the identity columns and
+    the per-track label column; track order in the shards is the loader
+    order (the data config applies no track sorting), so nonzero label
+    positions are directly comparable to dumped track indices."""
+    gt_lookup: dict[tuple, frozenset] = {}
+    for shard in parquet_files:
+        table = pq.read_table(
+            shard, columns=list(IDENTITY_COLUMNS) + ['track_label_from_tau'])
+        identity_arrays = [table[name].to_numpy(zero_copy_only=False)
+                           for name in IDENTITY_COLUMNS]
+        labels_column = table['track_label_from_tau']
+        for row in range(table.num_rows):
+            key = tuple(int(array[row]) for array in identity_arrays)
+            labels = np.asarray(labels_column[row].values, dtype=np.float32)
+            gt_lookup[key] = frozenset(np.nonzero(labels > 0.5)[0].tolist())
+        logger.info(f'GT lookup: {len(gt_lookup)} events after {shard}')
+    return gt_lookup
 
 
 def _build_gt_lookup(args) -> dict[tuple, frozenset]:
     parquet_files = sorted(glob.glob(f'{args.val_data_dir}/*.parquet'))
     if not parquet_files:
         raise FileNotFoundError(f'No parquet files in {args.val_data_dir}')
-    dataset = SimpleIterDataset(
-        {'data': parquet_files},
-        data_config_file=args.data_config,
-        for_training=False,
-        load_range_and_fraction=((0.0, 1.0), 1.0),
-        fetch_by_files=True,
-        fetch_step=len(parquet_files),
-        in_memory=False,
-    )
-    loader = DataLoader(
-        dataset, batch_size=args.batch_size,
-        drop_last=False, num_workers=args.num_workers,
-    )
-    gt_lookup: dict[tuple, frozenset] = {}
-    for batch_index, (X, _, observers) in enumerate(loader):
-        labels = (X['pf_label'].squeeze(1) > 0.5)  # (B, P)
-        for b in range(labels.shape[0]):
-            key = _composite_key_tuple(observers, b)
-            gt_indices = labels[b].nonzero(as_tuple=True)[0].tolist()
-            gt_lookup[key] = frozenset(int(i) for i in gt_indices)
-        if batch_index % 20 == 0:
-            logger.info(
-                f'GT lookup batch {batch_index} | events: {len(gt_lookup)}',
-            )
-    logger.info(f'GT lookup complete: {len(gt_lookup)} events.')
-    return gt_lookup
+    return build_gt_lookup(parquet_files)
 
 
 def _track_metrics(
