@@ -14,7 +14,8 @@ from weaver.utils.dataset import SimpleIterDataset
 
 logger = logging.getLogger('compute_eval_metrics')
 
-K_TRACKS: tuple[int, ...] = (50, 60, 70, 75, 80, 100, 125, 150, 200, 256, 400, 600)
+K_TRACKS: tuple[int, ...] = (50, 60, 70, 75, 80, 100, 125, 150, 200, 256,
+                             280, 300, 320, 350, 400, 600)
 K_COUPLES: tuple[int, ...] = (30, 40, 50, 60, 75, 100, 125, 150, 200)
 
 
@@ -161,7 +162,13 @@ def main(argv: list[str] | None = None) -> None:
     gt_lookup = _build_gt_lookup(args)
 
     logger.info(f'Reading eval parquet: {args.eval_parquet}')
-    table = pq.read_table(args.eval_parquet)
+    needed_columns = [
+        'event_run', 'event_id', 'event_luminosity_block',
+        'source_batch_id', 'source_microbatch_id',
+        'stage1_sorted_indices', 'stage2_sorted_indices',
+        'stage3_sorted_couples',
+    ]
+    table = pq.read_table(args.eval_parquet, columns=needed_columns)
     dataframe = table.to_pandas()
     logger.info(f'Eval parquet: {len(dataframe)} rows.')
 
