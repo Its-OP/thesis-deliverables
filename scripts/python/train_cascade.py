@@ -34,6 +34,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--stage1-checkpoint', type=str, required=True)
     parser.add_argument('--stage1-num-neighbors', type=int, default=16)
     parser.add_argument('--top-k1', type=int, default=256)
+    parser.add_argument('--stage2-init-checkpoint', type=str, default=None,
+                        help='warm-init Stage 2 weights from a per-stage '
+                             'checkpoint; fresh optimizer and epoch count')
+    parser.add_argument('--selection-k', type=int, default=50,
+                        help='checkpoint selection metric is duplet_at_K')
     parser.add_argument('--model-name', type=str, default='Cascade')
     parser.add_argument('--scheduler', type=str, default='cosine',
                         choices=['plateau', 'cosine'])
@@ -127,7 +132,7 @@ def main():
                 ema_stage2.state_dict() if ema_stage2 is not None else None
             ),
             'best_val_loss': best_val_loss,
-            'best_val_duplet_at_50': best_selection_value,
+            f'best_val_duplet_at_{args.selection_k}': best_selection_value,
             'best_val_epoch': best_val_epoch,
             'global_batch_count': global_batch_count,
             'val_losses': val_losses,
@@ -148,7 +153,7 @@ def main():
             device=device,
         )
         resume_state['best_selection_value'] = checkpoint.get(
-            'best_val_duplet_at_50', 0.0,
+            f'best_val_duplet_at_{args.selection_k}', 0.0,
         )
 
     def metrics_factory():
@@ -176,9 +181,10 @@ def main():
             'stage2_dropout': args.stage2_dropout,
             'stage2_loss_mode': args.stage2_loss_mode,
             'stage2_rs_at_k_target': args.stage2_rs_at_k_target,
+            'stage2_init_checkpoint': args.stage2_init_checkpoint,
         },
-        selection_metric='duplet_at_50',
-        criterion_name_short='D@50',
+        selection_metric=f'duplet_at_{args.selection_k}',
+        criterion_name_short=f'D@{args.selection_k}',
         optimizer_factory=optimizer_factory,
         metrics_accumulator_factory=metrics_factory,
         on_epoch_start=on_epoch_start,

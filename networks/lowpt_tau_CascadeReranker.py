@@ -81,8 +81,16 @@ def infer_stage1_kwargs(stage1_state, stage1_num_neighbors=16):
     )
 
 
+def load_stage2_init(stage2, checkpoint_path: str) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location='cpu',
+                            weights_only=False)
+    stage2.load_state_dict(checkpoint['model_state_dict'])
+    _logger.info(f'Stage 2 warm-initialized from: {checkpoint_path}')
+
+
 def get_model(data_config, **kwargs):
     stage1_checkpoint = kwargs.pop('stage1_checkpoint', None)
+    stage2_init_checkpoint = kwargs.pop('stage2_init_checkpoint', None)
     top_k1 = kwargs.pop('top_k1', 600)
 
     stage2_embed_dim = kwargs.pop('stage2_embed_dim', 128)
@@ -141,6 +149,8 @@ def get_model(data_config, **kwargs):
         loss_mode=stage2_loss_mode,
         rs_at_k_target=stage2_rs_at_k_target,
     )
+    if stage2_init_checkpoint is not None:
+        load_stage2_init(stage2, stage2_init_checkpoint)
     stage2_params = sum(p.numel() for p in stage2.parameters())
     _logger.info(f'Stage 2 (CascadeReranker): {stage2_params:,} params (trainable)')
 
