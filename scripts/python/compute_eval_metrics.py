@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> None:
         event_metrics: dict = {}
         if has_stage1:
             event_metrics['stage1'] = _track_metrics(
-                row.stage1_sorted_indices, gt, K_TRACKS, with_double=False,
+                row.stage1_sorted_indices, gt, K_TRACKS, with_double=True,
             )
         if has_stage2:
             event_metrics['stage2'] = _track_metrics(
