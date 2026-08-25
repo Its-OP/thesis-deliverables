@@ -59,21 +59,38 @@ def _build_gt_lookup(args) -> dict[tuple, frozenset]:
     return build_gt_lookup(parquet_files)
 
 
-def _track_metrics(
-    sorted_indices, gt: frozenset, k_values: tuple[int, ...],
-    *, with_double: bool = False,
-) -> dict[str, dict[int, float]]:
-    n_gt = len(gt)
+def gt_ranks_in_ordering(ordering: np.ndarray,
+                         gt: frozenset) -> np.ndarray:
+    """ordering: (N,) track indices in rank order. Returns the sorted rank
+    positions of the GT tracks that appear in the ordering."""
+    return np.flatnonzero(np.isin(ordering, list(gt)))
+
+
+def metrics_from_ranks(ranks: np.ndarray, n_gt: int,
+                       k_values: tuple[int, ...],
+                       *, with_double: bool = False,
+                       ) -> dict[str, dict[int, float]]:
+    """ranks: sorted rank positions of found GT tracks; n_gt: total GT."""
     out: dict[str, dict[int, float]] = {'recall_at_K': {}, 'perfect_at_K': {}}
     if with_double:
         out['double_at_K'] = {}
     for k in k_values:
-        match_count = sum(1 for i in sorted_indices[:k] if int(i) in gt)
+        match_count = int(np.searchsorted(ranks, k, side='left'))
         out['recall_at_K'][k] = match_count / n_gt if n_gt > 0 else 0.0
         out['perfect_at_K'][k] = 1.0 if (n_gt > 0 and match_count == n_gt) else 0.0
         if with_double:
             out['double_at_K'][k] = 1.0 if match_count >= 2 else 0.0
     return out
+
+
+def _track_metrics(
+    sorted_indices, gt: frozenset, k_values: tuple[int, ...],
+    *, with_double: bool = False,
+) -> dict[str, dict[int, float]]:
+    ordering = np.asarray(sorted_indices)
+    ranks = gt_ranks_in_ordering(ordering, gt)
+    return metrics_from_ranks(ranks, len(gt), k_values,
+                              with_double=with_double)
 
 
 def _couple_metrics(
@@ -86,12 +103,18 @@ def _couple_metrics(
         for i in range(len(sorted_gt))
         for j in range(i + 1, len(sorted_gt))
     )
+    pairs = np.asarray(sorted_couples).reshape(-1, 2)
+    if pairs.size:
+        pair_keys = pairs.min(axis=1) * 4096 + pairs.max(axis=1)
+        gt_keys = [min(couple) * 4096 + max(couple)
+                   for couple in map(sorted, gt_couples)]
+        hit_positions = np.flatnonzero(np.isin(pair_keys, gt_keys))
+        first_hit = int(hit_positions[0]) if hit_positions.size else None
+    else:
+        first_hit = None
     out: dict[str, dict[int, float]] = {'c_at_K': {}, 'rc_at_K': {}}
     for k in k_values:
-        any_gt_couple = any(
-            frozenset({int(pair[0]), int(pair[1])}) in gt_couples
-            for pair in sorted_couples[:k]
-        )
+        any_gt_couple = first_hit is not None and first_hit < k
         out['c_at_K'][k] = 1.0 if any_gt_couple else 0.0
         out['rc_at_K'][k] = (
             1.0 if (any_gt_couple and full_triplet_in_stage2) else 0.0
@@ -153,12 +176,16 @@ def main(argv: list[str] | None = None) -> None:
         'stage3_sorted_couples',
     ]
     table = pq.read_table(args.eval_parquet, columns=needed_columns)
-    dataframe = table.to_pandas()
-    logger.info(f'Eval parquet: {len(dataframe)} rows.')
+    logger.info(f'Eval parquet: {table.num_rows} rows.')
 
-    has_stage1 = (dataframe['stage1_sorted_indices'].apply(len) > 0).any()
-    has_stage2 = (dataframe['stage2_sorted_indices'].apply(len) > 0).any()
-    has_couples = (dataframe['stage3_sorted_couples'].apply(len) > 0).any()
+    identity_arrays = [table[name].to_numpy(zero_copy_only=False)
+                       for name in IDENTITY_COLUMNS]
+    stage1_column = table['stage1_sorted_indices']
+    stage2_column = table['stage2_sorted_indices']
+    couples_column = table['stage3_sorted_couples']
+    has_stage1 = len(stage1_column[0].values) > 0
+    has_stage2 = len(stage2_column[0].values) > 0
+    has_couples = len(couples_column[0].values) > 0
     logger.info(
         f'Stages present: stage1={has_stage1}, stage2={has_stage2}, '
         f'couples={has_couples}',
@@ -166,14 +193,8 @@ def main(argv: list[str] | None = None) -> None:
 
     per_event: list[dict] = []
     n_skipped = 0
-    for row in dataframe.itertuples(index=False):
-        key = (
-            int(row.event_run),
-            int(row.event_id),
-            int(row.event_luminosity_block),
-            int(row.source_batch_id),
-            int(row.source_microbatch_id),
-        )
+    for row in range(table.num_rows):
+        key = tuple(int(array[row]) for array in identity_arrays)
         gt = gt_lookup.get(key)
         if gt is None:
             n_skipped += 1
@@ -181,17 +202,21 @@ def main(argv: list[str] | None = None) -> None:
         event_metrics: dict = {}
         if has_stage1:
             event_metrics['stage1'] = _track_metrics(
-                row.stage1_sorted_indices, gt, K_TRACKS, with_double=True,
+                np.asarray(stage1_column[row].values), gt, K_TRACKS,
+                with_double=True,
             )
         if has_stage2:
+            stage2_indices = np.asarray(stage2_column[row].values)
             event_metrics['stage2'] = _track_metrics(
-                row.stage2_sorted_indices, gt, K_TRACKS, with_double=True,
+                stage2_indices, gt, K_TRACKS, with_double=True,
             )
         if has_couples:
-            stage2_set = frozenset(int(i) for i in row.stage2_sorted_indices)
-            full_triplet = gt.issubset(stage2_set)
+            full_triplet = gt.issubset(
+                frozenset(stage2_indices.tolist()))
+            pairs = np.asarray(
+                couples_column[row].values.flatten()).reshape(-1, 2)
             event_metrics['couples'] = _couple_metrics(
-                row.stage3_sorted_couples, gt, K_COUPLES,
+                pairs, gt, K_COUPLES,
                 full_triplet_in_stage2=full_triplet,
             )
         per_event.append(event_metrics)
