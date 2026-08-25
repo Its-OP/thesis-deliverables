@@ -136,10 +136,10 @@ def build_data_loaders(args, logger: logging.Logger) -> tuple[
     # forks its DataLoader workers; the children inherit the executor's lock
     # in a locked state and hang forever after their first fetch. in_memory
     # mode gains nothing from async prefetch, so it stays off.
-    train_fetch_step = min(
-        args.fetch_step_files or num_train_files, num_train_files)
-    val_fetch_step = min(
-        args.fetch_step_files or num_val_files, num_val_files)
+    fetch_step_files = getattr(args, 'fetch_step_files', None)
+    train_fetch_step = min(fetch_step_files or num_train_files,
+                           num_train_files)
+    val_fetch_step = min(fetch_step_files or num_val_files, num_val_files)
     train_dataset = SimpleIterDataset(
         train_file_dict,
         data_config_file=args.data_config,
