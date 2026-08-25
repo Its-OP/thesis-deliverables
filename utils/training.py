@@ -53,6 +53,10 @@ def add_common_training_args(
 ) -> None:
     parser.add_argument('--data-config', type=str, required=require_data_args)
     parser.add_argument('--data-dir', type=str, required=require_data_args)
+    parser.add_argument('--fetch-step-files', type=int, default=None,
+                        help='files per loader fetch group; default = all '
+                             'assigned files (whole group resident before '
+                             'the first yield), 1 = stream file-by-file')
     parser.add_argument('--network', type=str, required=require_data_args)
     parser.add_argument('--experiments-dir', type=str, default='experiments')
     parser.add_argument('--epochs', type=int, default=default_epochs)
@@ -132,13 +136,17 @@ def build_data_loaders(args, logger: logging.Logger) -> tuple[
     # forks its DataLoader workers; the children inherit the executor's lock
     # in a locked state and hang forever after their first fetch. in_memory
     # mode gains nothing from async prefetch, so it stays off.
+    train_fetch_step = min(
+        args.fetch_step_files or num_train_files, num_train_files)
+    val_fetch_step = min(
+        args.fetch_step_files or num_val_files, num_val_files)
     train_dataset = SimpleIterDataset(
         train_file_dict,
         data_config_file=args.data_config,
         for_training=True,
         load_range_and_fraction=train_range,
         fetch_by_files=True,
-        fetch_step=num_train_files,
+        fetch_step=train_fetch_step,
         in_memory=load_in_memory,
         async_load=False,
     )
@@ -150,7 +158,7 @@ def build_data_loaders(args, logger: logging.Logger) -> tuple[
         for_training=False,
         load_range_and_fraction=val_range,
         fetch_by_files=True,
-        fetch_step=num_val_files,
+        fetch_step=val_fetch_step,
         in_memory=load_in_memory,
         async_load=False,
     )
