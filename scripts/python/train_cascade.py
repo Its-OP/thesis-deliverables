@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 
@@ -106,6 +107,20 @@ def main():
         if state['ema_stage2'] is not None:
             state['ema_stage2'].update_parameters(model.stage2)
 
+    def validation_model():
+        # EMA validation must run the pre-compile model so the stage2 swap
+        # never invalidates torch.compile guards.
+        if state['ema_stage2'] is None:
+            return None
+        return state['original_model']
+
+    def validation_context():
+        if state['ema_stage2'] is None:
+            return contextlib.nullcontext()
+        return use_ema_stage2_for_validation(
+            state['original_model'], state['ema_stage2'],
+        )
+
     def update_val_metrics(accumulator, popped, model_inputs, labels, model):
         # Reuse _run_stage1 to scatter Stage 2 scores back to full-event positions.
         per_track_scores = popped['_scores'].detach()
@@ -196,6 +211,8 @@ def main():
         epoch_metrics_extras_fn=lambda args, epoch: {'top_k1': args.top_k1},
         use_torch_compile=not args.no_compile,
         train_eval_steps_divisor=4,
+        validation_context=validation_context,
+        validation_model=validation_model,
     )
 
 

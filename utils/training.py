@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import logging
 import math
@@ -73,6 +74,7 @@ def add_common_training_args(
     parser.add_argument('--amp', action='store_true')
     parser.add_argument('--no-in-memory', action='store_true')
     parser.add_argument('--steps-per-epoch', type=int, default=None)
+    parser.add_argument('--val-steps', type=int, default=None)
     parser.add_argument('--save-every', type=int, default=default_save_every)
     parser.add_argument('--keep-best-k', type=int, default=default_keep_best_k)
     parser.add_argument('--resume', type=str, default=None)
@@ -580,6 +582,16 @@ def save_per_epoch_artifacts(
     save_epoch_metrics(epoch_metrics, experiment_dir, epoch)
 
 
+def resolve_eval_steps(
+    steps_per_epoch: int,
+    divisor: int,
+    val_steps: int | None,
+) -> int:
+    if val_steps is not None:
+        return max(1, val_steps)
+    return max(1, steps_per_epoch // divisor)
+
+
 def run_training(
     *,
     args,
@@ -611,6 +623,8 @@ def run_training(
     extra_loss_history_keys: tuple[str, ...] = (),
     epoch_metrics_extras_fn: Callable | None = None,
     use_torch_compile: bool = True,
+    validation_context: Callable | None = None,
+    validation_model: Callable | None = None,
 ) -> None:
     """Top-level training driver. Sets up experiment, data loaders, model,
     optimizer, scheduler, GradScaler, checkpoint manager, tensorboard, then
@@ -745,22 +759,21 @@ def run_training(
                 on_step_end=on_step_end,
             )
 
-            eval_steps = max(1, steps_per_epoch // train_eval_steps_divisor)
-
-            val_losses, val_metrics = validate_loop(
-                model, val_loader, device, data_config,
-                mask_input_index, label_input_index,
-                compute_loss_fn=compute_loss_val_fn,
-                metrics_accumulator=metrics_accumulator_factory(),
-                pop_keys=pop_keys_val,
-                update_metrics_fn=update_val_metrics_fn,
-                bn_train_mode=bn_train_mode_for_val,
-                max_steps=eval_steps,
+            eval_steps = resolve_eval_steps(
+                steps_per_epoch, train_eval_steps_divisor,
+                getattr(args, 'val_steps', None),
             )
-            train_eval_metrics: dict[str, float] | None = None
-            if also_validate_train:
-                _, train_eval_metrics = validate_loop(
-                    model, train_loader, device, data_config,
+
+            eval_model = model
+            if validation_model is not None:
+                eval_model = validation_model() or model
+            eval_context = (
+                validation_context() if validation_context is not None
+                else contextlib.nullcontext()
+            )
+            with eval_context:
+                val_losses, val_metrics = validate_loop(
+                    eval_model, val_loader, device, data_config,
                     mask_input_index, label_input_index,
                     compute_loss_fn=compute_loss_val_fn,
                     metrics_accumulator=metrics_accumulator_factory(),
@@ -769,6 +782,18 @@ def run_training(
                     bn_train_mode=bn_train_mode_for_val,
                     max_steps=eval_steps,
                 )
+                train_eval_metrics: dict[str, float] | None = None
+                if also_validate_train:
+                    _, train_eval_metrics = validate_loop(
+                        eval_model, train_loader, device, data_config,
+                        mask_input_index, label_input_index,
+                        compute_loss_fn=compute_loss_val_fn,
+                        metrics_accumulator=metrics_accumulator_factory(),
+                        pop_keys=pop_keys_val,
+                        update_metrics_fn=update_val_metrics_fn,
+                        bn_train_mode=bn_train_mode_for_val,
+                        max_steps=eval_steps,
+                    )
 
             val_loss = val_losses['total_loss']
             selection_value = val_metrics.get(selection_metric, 0.0)
