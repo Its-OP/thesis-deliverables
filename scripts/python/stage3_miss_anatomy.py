@@ -72,6 +72,18 @@ def top_k_composition(sorted_couples, gt, *, k: int) -> dict:
     }
 
 
+def binding_pool_rank(pool_ordering, gt) -> int | None:
+    """pool_ordering: (K2,) track indices in stage-2 rank order; gt: set of
+    GT track indices. Returns the 1-based pool rank of the SECOND GT track
+    (the rank at which a GT couple becomes constructible), or None when
+    fewer than two GT tracks are in the pool."""
+    ranks = [rank for rank, track in enumerate(pool_ordering, start=1)
+             if track in gt]
+    if len(ranks) < 2:
+        return None
+    return ranks[1]
+
+
 def classify_event(sorted_couples, gt, *, n_gt_in_pool: int, k: int) -> dict:
     """n_gt_in_pool: GT tracks inside the K2 pool the couples were built
     from. Fewer than two means no GT couple was constructible."""
@@ -92,15 +104,21 @@ def _rank_bucket(rank: int | None, k: int, list_length: int) -> str:
 
 
 def summarize_events(sorted_couple_lists, gt_sets, n_gt_in_pool_values,
-                     *, k: int) -> dict:
+                     *, k: int, pool_orderings=None) -> dict:
+    """pool_orderings: optional per-event (K2,) stage-2 pool orderings; when
+    given, hits and misses also report where the second GT track sits in
+    the pool (stage-2 marginality)."""
     counts = Counter()
     miss_rank_buckets: Counter = Counter()
     miss_ranks: list[int] = []
     miss_compositions: list[dict] = []
     hit_compositions: list[dict] = []
     list_length = 0
-    for sorted_couples, gt, n_gt_in_pool in zip(
-            sorted_couple_lists, gt_sets, n_gt_in_pool_values):
+    if pool_orderings is None:
+        pool_orderings = [None] * len(gt_sets)
+    for sorted_couples, gt, n_gt_in_pool, pool_ordering in zip(
+            sorted_couple_lists, gt_sets, n_gt_in_pool_values,
+            pool_orderings):
         list_length = max(list_length, len(sorted_couples))
         record = classify_event(sorted_couples, gt,
                                 n_gt_in_pool=n_gt_in_pool, k=k)
@@ -108,6 +126,9 @@ def summarize_events(sorted_couple_lists, gt_sets, n_gt_in_pool_values,
         if record['status'] == 'bound_lost':
             continue
         composition = top_k_composition(sorted_couples, gt, k=k)
+        composition['binding_pool_rank'] = (
+            binding_pool_rank(pool_ordering, gt)
+            if pool_ordering is not None else None)
         if record['status'] == 'hit':
             hit_compositions.append(composition)
         else:
@@ -125,7 +146,9 @@ def summarize_events(sorted_couple_lists, gt_sets, n_gt_in_pool_values,
         gt_present = Counter(c['n_gt_tracks_present'] for c in compositions)
         first_sibling = [c['first_sibling_rank'] for c in compositions
                          if c['first_sibling_rank'] is not None]
-        return {
+        pool_ranks = [c['binding_pool_rank'] for c in compositions
+                      if c['binding_pool_rank'] is not None]
+        aggregated = {
             'n': n,
             'mean_sibling_share_top_k': float(np.mean(sibling_shares)),
             'share_events_sibling_majority': float(np.mean(
@@ -141,6 +164,13 @@ def summarize_events(sorted_couple_lists, gt_sets, n_gt_in_pool_values,
                 float(np.percentile(first_sibling, 50))
                 if first_sibling else None),
         }
+        if pool_ranks:
+            aggregated['binding_pool_rank_quantiles'] = {
+                'p25': float(np.percentile(pool_ranks, 25)),
+                'p50': float(np.percentile(pool_ranks, 50)),
+                'p75': float(np.percentile(pool_ranks, 75)),
+            }
+        return aggregated
 
     n_events = sum(counts.values())
     summary = {
@@ -192,6 +222,7 @@ def main() -> None:
     sorted_couple_lists = []
     gt_sets = []
     n_gt_in_pool_values = []
+    pool_orderings = []
     n_missing_gt = 0
     for row in range(table.num_rows):
         key = tuple(int(array[row]) for array in identity_arrays)
@@ -201,6 +232,7 @@ def main() -> None:
             continue
         pool = np.asarray(pool_column[row].values, dtype=np.int64)[:args.k2]
         n_gt_in_pool_values.append(int(np.isin(pool, list(gt)).sum()))
+        pool_orderings.append(pool.tolist())
         couples = couples_column[row].as_py()
         sorted_couple_lists.append([(int(a), int(b)) for a, b in couples])
         gt_sets.append(gt)
@@ -208,7 +240,8 @@ def main() -> None:
             logger.info(f'{row + 1} / {table.num_rows} rows read')
 
     summary = summarize_events(sorted_couple_lists, gt_sets,
-                               n_gt_in_pool_values, k=args.k)
+                               n_gt_in_pool_values, k=args.k,
+                               pool_orderings=pool_orderings)
     summary['n_skipped_missing_gt'] = n_missing_gt
     summary['input'] = args.couples_parquet
     with open(args.output, 'w') as handle:

@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 from scripts.python.stage3_miss_anatomy import (
+    binding_pool_rank,
     classify_event,
     first_gt_couple_rank,
     summarize_events,
     top_k_composition,
 )
+
+
+def test_binding_pool_rank_is_second_gt_rank():
+    assert binding_pool_rank([9, 1, 8, 3, 2], {1, 2, 3}) == 4
+    assert binding_pool_rank([9, 1, 8], {1, 2, 3}) is None
+
+
+def test_summarize_events_reports_pool_rank_quantiles():
+    hit = [(1, 2), (4, 5)]
+    miss = [(4, 5), (6, 7), (1, 2)]
+    summary = summarize_events(
+        [hit, miss], [{1, 2, 3}, {1, 2, 3}], [3, 3], k=2,
+        pool_orderings=[[1, 2, 3, 9], [9, 8, 1, 2]],
+    )
+    assert summary['hits']['binding_pool_rank_quantiles']['p50'] == 2.0
+    assert summary['misses']['binding_pool_rank_quantiles']['p50'] == 4.0
 
 GT = {1, 2, 3}
 
