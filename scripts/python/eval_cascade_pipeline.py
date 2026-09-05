@@ -318,6 +318,43 @@ def _evaluate_batch(
     return rows
 
 
+class StreamingParquetWriter:
+    """Incremental parquet writer: buffers rows, flushes every flush_rows.
+    Keeps dump RSS bounded by the buffer instead of the full event set."""
+
+    def __init__(self, output_path: str, schema: pa.Schema,
+                 flush_rows: int = 5000):
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        self._schema = schema
+        self._writer = pq.ParquetWriter(
+            output_path, schema, compression='zstd')
+        self._flush_rows = flush_rows
+        self._buffer: list[dict] = []
+        self.rows_written = 0
+
+    def add(self, row: dict) -> None:
+        self._buffer.append(row)
+        if len(self._buffer) >= self._flush_rows:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._buffer:
+            return
+        arrays = [
+            pa.array([row[field.name] for row in self._buffer],
+                     type=field.type)
+            for field in self._schema
+        ]
+        self._writer.write_table(
+            pa.Table.from_arrays(arrays, schema=self._schema))
+        self.rows_written += len(self._buffer)
+        self._buffer = []
+
+    def close(self) -> None:
+        self.flush()
+        self._writer.close()
+
+
 def _write_parquet(rows: list[dict], output_path: str,
                    schema: pa.Schema = OUTPUT_SCHEMA) -> None:
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
@@ -453,7 +490,12 @@ def main(argv: list[str] | None = None) -> None:
     logger.info(f'{total_source_events} source events; writing {total_to_write} '
                 f'starting at event {args.start_event}')
 
-    rows: list[dict] = []
+    stream_writer = StreamingParquetWriter(
+        args.output,
+        schema=(STAGE3_DUMP_SCHEMA if args.dump_stage3_inputs
+                else OUTPUT_SCHEMA),
+        flush_rows=2000,
+    )
     events_done = 0   # rows written (after --start-event)
     events_seen = 0   # source rows consumed (including skipped)
     crash: BaseException | None = None
@@ -484,7 +526,7 @@ def main(argv: list[str] | None = None) -> None:
                     continue
                 row.update(_composite_key(observers, b))
                 row['stage'] = args.stage
-                rows.append(row)
+                stream_writer.add(row)
                 events_done += 1
                 if args.max_events is not None and events_done >= args.max_events:
                     break
@@ -500,12 +542,9 @@ def main(argv: list[str] | None = None) -> None:
         logger.error(f'event loop crashed after {events_done} events:\n{traceback.format_exc()}')
         crash = error
     finally:
-        if rows:
-            logger.info(f'Total events: {len(rows)} → {args.output}')
-            _write_parquet(
-                rows, args.output,
-                schema=(STAGE3_DUMP_SCHEMA if args.dump_stage3_inputs
-                        else OUTPUT_SCHEMA))
+        stream_writer.close()
+        logger.info(
+            f'Total events: {stream_writer.rows_written} → {args.output}')
         marker = args.output + '.INCOMPLETE'
         if crash is not None:
             with open(marker, 'w') as fh:
