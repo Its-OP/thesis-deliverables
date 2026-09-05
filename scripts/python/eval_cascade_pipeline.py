@@ -325,9 +325,11 @@ class StreamingParquetWriter:
     def __init__(self, output_path: str, schema: pa.Schema,
                  flush_rows: int = 5000):
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        self._output_path = output_path
         self._schema = schema
-        self._writer = pq.ParquetWriter(
-            output_path, schema, compression='zstd')
+        # Opened on first flush: a process killed before any rows leaves
+        # no file behind instead of a footer-less stub.
+        self._writer: pq.ParquetWriter | None = None
         self._flush_rows = flush_rows
         self._buffer: list[dict] = []
         self.rows_written = 0
@@ -337,6 +339,12 @@ class StreamingParquetWriter:
         if len(self._buffer) >= self._flush_rows:
             self.flush()
 
+    def _open(self) -> pq.ParquetWriter:
+        if self._writer is None:
+            self._writer = pq.ParquetWriter(
+                self._output_path, self._schema, compression='zstd')
+        return self._writer
+
     def flush(self) -> None:
         if not self._buffer:
             return
@@ -345,14 +353,14 @@ class StreamingParquetWriter:
                      type=field.type)
             for field in self._schema
         ]
-        self._writer.write_table(
+        self._open().write_table(
             pa.Table.from_arrays(arrays, schema=self._schema))
         self.rows_written += len(self._buffer)
         self._buffer = []
 
     def close(self) -> None:
         self.flush()
-        self._writer.close()
+        self._open().close()
 
 
 def _write_parquet(rows: list[dict], output_path: str,
