@@ -3,7 +3,14 @@ set -euo pipefail
 
 if [ $# -lt 1 ]; then
     echo "Usage: bash train_triplet_reranker.sh <experiment_name> [extra trainer args...]"
-    echo "  WAIT=1 blocks until the training session finishes (used by triplet_pipeline.sh)."
+    echo "  WAIT=1 blocks until the training session finishes."
+    echo "  Gate recipe (experiments/bprep_gate_mlp stored args, the MLP twin of the GBDT gate):"
+    echo "    bash train_triplet_reranker.sh bprep_gate --candidates data/triplet_rank_v4/candidates_train.parquet \\"
+    echo "      --eval-candidates data/triplet_rank_v4/candidates_eval.parquet \\"
+    echo "      --operating-points data/triplet_rank_v4/operating_points.json \\"
+    echo "      --norm-stats data/triplet_rank_v4/norm_stats_gate.json --gate tierH --tail-weighting \\"
+    echo "      --extra-features none --epochs 15 --batch-size 96 --lr 1e-3 --num-workers 32 \\"
+    echo "      --eval-batch-size 16 --eval-events 20000"
     exit 1
 fi
 EXPERIMENT_NAME="$1"
@@ -20,7 +27,11 @@ if ! script --version >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ -f /venv/part/bin/activate ]; then
+if [ -f /venv/thesis-deliverables/bin/activate ]; then
+    ACTIVATE="source /venv/thesis-deliverables/bin/activate"
+elif [ -x /venv/thesis-deliverables/bin/python ]; then
+    ACTIVATE="export PATH=/venv/thesis-deliverables/bin:\${PATH}"
+elif [ -f /venv/part/bin/activate ]; then
     ACTIVATE="source /venv/part/bin/activate"
 elif [ -x /venv/part/bin/python ]; then
     ACTIVATE="export PATH=/venv/part/bin:\${PATH}"   # venv without an activate script
@@ -41,12 +52,12 @@ else
 fi
 eval "${ACTIVATE}"
 
-TRIPLET_RANK_DIR="${SCRIPT_DIR}/data/low-pt/eval/triplet_rank"
+TRIPLET_RANK_DIR="${TRIPLET_RANK_DIR:-${SCRIPT_DIR}/data/triplet_rank_v4}"
 python - <<PY
 import os
 import pyarrow.parquet as pq
 directory = "${TRIPLET_RANK_DIR}"
-for name in os.environ.get('PREFLIGHT_ARTIFACTS', 'candidates_train tracks_train').split():
+for name in os.environ.get("PREFLIGHT_ARTIFACTS", "candidates_train candidates_eval").split():
     path = os.path.join(directory, name + '.parquet')
     assert os.path.exists(path), f'missing artifact: {path}'
     print(f'{name}: {pq.read_metadata(path).num_rows} rows')

@@ -1,4 +1,22 @@
 #!/bin/bash
+# =============================================================================
+# Stage-3 couple reranker training in dump mode, the promoted h6s8b recipe
+# (models/couple_reranker_best.pt stored args; canonical full-eval C@100 0.9331
+# / C@125 0.9388 at K1=400): stage-3 input dumps of the frozen stage 1 + 2 at
+# K1=400, K2=125, batch 768, 20 epochs of lr 2e-3 cosine, amp, 10 workers,
+# label smoothing 0.10, full K grids. One epoch = one pass over the dumps.
+#
+# Dumps come from eval_cascade_pipeline.py --stage part --dump-stage3-inputs
+# --top-k1 400 (one pass per train shard, one pass over data/low-pt/eval):
+#   data/dumps_k400_frozen/stage3_dump_train_k400_frozen_s<i>.parquet
+#   data/dumps_k400_frozen/stage3_dump_eval_k400_frozen.parquet
+# The trainer defaults (fp32, lr 5e-4) OOM at batch 768 / K2 125: keep the
+# flags below and pass extra args only on top of them.
+#
+# Usage:
+#   bash train_couple_reranker.sh <experiment_name> [extra trainer args...]
+#   DUMP_DIR=data/other_dumps bash train_couple_reranker.sh <experiment_name>
+# =============================================================================
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -9,33 +27,47 @@ EXPERIMENT_NAME="$1"
 shift
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TRAIN_PARQUET_COUNT=$(find "${SCRIPT_DIR}/data/low-pt/train" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
-VAL_PARQUET_COUNT=$(find "${SCRIPT_DIR}/data/low-pt/val" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
-if [ "$TRAIN_PARQUET_COUNT" -lt 10 ] || [ "$VAL_PARQUET_COUNT" -lt 10 ]; then
-    echo "WARNING: ${TRAIN_PARQUET_COUNT} train + ${VAL_PARQUET_COUNT} val parquet files (expected 10+ each)."
-fi
 
 SESSION_TRAIN="couple_train"
 SESSION_GPU="couple_gpu"
 CONDA_ENV_NAME="part"
 
-DATA_CONFIG="data/low-pt/lowpt_tau_trackfinder.yaml"
-DATA_DIR="data/low-pt/train/"
-VAL_DATA_DIR="data/low-pt/eval/"
-NETWORK="networks/lowpt_tau_CoupleReranker.py"
-STAGE1_CHECKPOINT="models/prefilter_best.pt"
-STAGE2_CHECKPOINT="models/stage2_best.pt"
-TOP_K2=50
+DUMP_DIR="${DUMP_DIR:-data/dumps_k400_frozen}"
+TRAIN_DUMP_GLOB="${DUMP_DIR}/stage3_dump_train_k400_frozen_s*.parquet"
+VAL_DUMP="${DUMP_DIR}/stage3_dump_eval_k400_frozen.parquet"
+TOP_K2=125
 MODEL_NAME="${EXPERIMENT_NAME}_CoupleReranker"
 EXPERIMENTS_DIR="experiments"
-EPOCHS=100
-BATCH_SIZE=16
-LEARNING_RATE=5e-4
+EPOCHS=20
+BATCH_SIZE=768
+LEARNING_RATE=2e-3
 DEVICE="cuda:0"
-STEPS_PER_EPOCH=500
 NUM_WORKERS=10
 KEEP_BEST_K=5
 LABEL_SMOOTHING=0.10
+K_VALUES_TRACKS="30 50 60 70 80 100 125 150 200"
+K_VALUES_COUPLES="50 60 75 100 125 200"
+
+case "${DUMP_DIR}" in
+    /*) DUMP_PATH="${DUMP_DIR}" ;;
+    *)  DUMP_PATH="${SCRIPT_DIR}/${DUMP_DIR}" ;;
+esac
+if [ ! -d "${DUMP_PATH}" ]; then
+    echo "ERROR: dump directory not found: ${DUMP_PATH}"
+    echo "  Produce the dumps with: python -m scripts.python.eval_cascade_pipeline --stage part --dump-stage3-inputs --top-k1 400 ..."
+    exit 1
+fi
+TRAIN_DUMP_COUNT=$(find "${DUMP_PATH}" -maxdepth 1 -name "stage3_dump_train_k400_frozen_s*.parquet" | wc -l | tr -d ' ')
+if [ "$TRAIN_DUMP_COUNT" -lt 1 ]; then
+    echo "ERROR: no train dumps match ${DUMP_PATH}/stage3_dump_train_k400_frozen_s*.parquet"
+    echo "  Produce them with: python -m scripts.python.eval_cascade_pipeline --stage part --dump-stage3-inputs --top-k1 400 ..."
+    exit 1
+fi
+if [ ! -f "${DUMP_PATH}/stage3_dump_eval_k400_frozen.parquet" ]; then
+    echo "ERROR: eval dump not found: ${DUMP_PATH}/stage3_dump_eval_k400_frozen.parquet"
+    exit 1
+fi
+echo "Found ${TRAIN_DUMP_COUNT} train dump files under ${DUMP_DIR}; eval dump ${VAL_DUMP}."
 
 if command -v conda &>/dev/null; then
     CONDA_BASE=$(conda info --base)
@@ -50,33 +82,22 @@ else
     exit 1
 fi
 
-if [ ! -f "${SCRIPT_DIR}/${STAGE1_CHECKPOINT}" ]; then
-    echo "ERROR: Stage 1 checkpoint not found: ${SCRIPT_DIR}/${STAGE1_CHECKPOINT}"
-    exit 1
-fi
-if [ ! -f "${SCRIPT_DIR}/${STAGE2_CHECKPOINT}" ]; then
-    echo "ERROR: Stage 2 checkpoint not found: ${SCRIPT_DIR}/${STAGE2_CHECKPOINT}"
-    exit 1
-fi
-
+# The train-dump glob stays single-quoted so the trainer receives it unexpanded.
 TRAIN_CMD="source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate ${CONDA_ENV_NAME} && cd ${SCRIPT_DIR} && python -m scripts.python.train_couple_reranker \
-    --data-config ${DATA_CONFIG} \
-    --data-dir ${DATA_DIR} \
-    --val-data-dir ${VAL_DATA_DIR} \
-    --network ${NETWORK} \
-    --stage1-checkpoint ${STAGE1_CHECKPOINT} \
-    --stage2-checkpoint ${STAGE2_CHECKPOINT} \
+    --train-dump '${TRAIN_DUMP_GLOB}' \
+    --val-dump ${VAL_DUMP} \
     --top-k2 ${TOP_K2} \
     --model-name ${MODEL_NAME} \
     --experiments-dir ${EXPERIMENTS_DIR} \
     --epochs ${EPOCHS} \
     --batch-size ${BATCH_SIZE} \
-    --steps-per-epoch ${STEPS_PER_EPOCH} \
     --lr ${LEARNING_RATE} \
     --device ${DEVICE} \
     --num-workers ${NUM_WORKERS} \
     --keep-best-k ${KEEP_BEST_K} \
     --couple-label-smoothing ${LABEL_SMOOTHING} \
+    --k-values-tracks ${K_VALUES_TRACKS} \
+    --k-values-couples ${K_VALUES_COUPLES} \
     --amp $@"
 
 if screen -list 2>/dev/null | grep -q "${SESSION_TRAIN}"; then

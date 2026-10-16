@@ -2,6 +2,15 @@
 # =============================================================================
 # Training launch script for CascadeModel (Stage 1 → Stage 2).
 #
+# Recipe = the promoted h6s2 stage 2 (models/stage2_best.pt stored args, full-eval
+# D@50 0.9229): frozen stage 1 at K1=256, dim-10 pairwise interaction block
+# (--stage2-pair-extra-dim 10; the trainer default is 6), 100 epochs x 500 steps,
+# batch 64, lr 1e-3 cosine, 10 workers, amp, no compile, selection on D@50.
+# Serving uses K1=400 (scripts/bash/eval_cascade_pipeline.sh); the K1=400
+# retrain arms (h6s7) lost the full-eval A/B, so training stays at K1=256.
+# --val-steps 375 validates on ~24k events (sigma ~0.09 pp); the trainer default
+# (steps/4 = 8k events) carries ~0.16 pp of selection noise (h6s7).
+#
 # Starts two screen sessions:
 #   - "cascade_train": Training output (train_cascade.py)
 #   - "cascade_gpu":   GPU monitoring (nvidia-smi)
@@ -28,11 +37,11 @@ shift
 # ---- Check data split ----
 SCRIPT_DIR_CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TRAIN_PARQUET_COUNT=$(find "${SCRIPT_DIR_CHECK}/data/low-pt/train" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
-VAL_PARQUET_COUNT=$(find "${SCRIPT_DIR_CHECK}/data/low-pt/val" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
-if [ "$TRAIN_PARQUET_COUNT" -lt 10 ] || [ "$VAL_PARQUET_COUNT" -lt 10 ]; then
-    echo "WARNING: Found ${TRAIN_PARQUET_COUNT} train and ${VAL_PARQUET_COUNT} val parquet files."
+VAL_PARQUET_COUNT=$(find "${SCRIPT_DIR_CHECK}/data/low-pt/eval" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$TRAIN_PARQUET_COUNT" -lt 10 ] || [ "$VAL_PARQUET_COUNT" -lt 9 ]; then
+    echo "WARNING: Found ${TRAIN_PARQUET_COUNT} train and ${VAL_PARQUET_COUNT} eval parquet files."
 fi
-echo "Found ${TRAIN_PARQUET_COUNT} train parquet files, ${VAL_PARQUET_COUNT} val parquet files."
+echo "Found ${TRAIN_PARQUET_COUNT} train parquet files, ${VAL_PARQUET_COUNT} eval parquet files."
 
 # ---- Configuration ----
 SESSION_TRAIN="cascade_train"
@@ -41,10 +50,11 @@ CONDA_ENV_NAME="part"
 
 DATA_CONFIG="data/low-pt/lowpt_tau_trackfinder.yaml"
 DATA_DIR="data/low-pt/train/"
-VAL_DATA_DIR="data/low-pt/val/"
+VAL_DATA_DIR="data/low-pt/eval/"
 NETWORK="networks/lowpt_tau_CascadeReranker.py"
 STAGE1_CHECKPOINT="models/prefilter_best.pt"
 TOP_K1=256
+STAGE2_PAIR_EXTRA_DIM=10
 MODEL_NAME="${EXPERIMENT_NAME}_Cascade"
 EXPERIMENTS_DIR="experiments"
 EPOCHS=100
@@ -53,6 +63,7 @@ LEARNING_RATE=1e-3
 SCHEDULER="cosine"
 DEVICE="cuda:0"
 STEPS_PER_EPOCH=500
+VAL_STEPS=375
 NUM_WORKERS=10
 NO_COMPILE=true
 KEEP_BEST_K=5
@@ -99,11 +110,13 @@ TRAIN_CMD="${CONDA_INIT} && cd ${SCRIPT_DIR} && python -m scripts.python.train_c
     --network ${NETWORK} \
     --stage1-checkpoint ${STAGE1_CHECKPOINT} \
     --top-k1 ${TOP_K1} \
+    --stage2-pair-extra-dim ${STAGE2_PAIR_EXTRA_DIM} \
     --model-name ${MODEL_NAME} \
     --experiments-dir ${EXPERIMENTS_DIR} \
     --epochs ${EPOCHS} \
     --batch-size ${BATCH_SIZE} \
     --steps-per-epoch ${STEPS_PER_EPOCH} \
+    --val-steps ${VAL_STEPS} \
     --lr ${LEARNING_RATE} \
     --scheduler ${SCHEDULER} \
     --device ${DEVICE} \

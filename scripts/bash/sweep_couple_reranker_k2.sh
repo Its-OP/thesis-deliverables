@@ -8,6 +8,11 @@
 #
 # Designed for the GPU box: uses the venv python directly when present,
 # falling back to whatever `python` resolves to.
+#
+# Dumps default to the K1=400 frozen-stack stage-3 inputs that trained the
+# promoted h6s8b stage 3 (eval_cascade_pipeline --stage part --dump-stage3-inputs
+# --top-k1 400, one file per train shard); override with TRAIN_DUMP / VAL_DUMP.
+# The full-eval pass runs at the K1=400 serving operating point.
 # =============================================================================
 set -euo pipefail
 
@@ -21,10 +26,11 @@ else
 fi
 
 K2_GRID=(50 60 70 80 100 125 150)
+TOP_K1=400
 DATA_CONFIG="data/low-pt/lowpt_tau_trackfinder.yaml"
 VAL_DATA_DIR="data/low-pt/eval/"
-TRAIN_DUMP="${TRAIN_DUMP:-/workspace/dumps/stage3_dump_train.parquet}"
-VAL_DUMP="${VAL_DUMP:-/workspace/dumps/stage3_dump_eval.parquet}"
+TRAIN_DUMP="${TRAIN_DUMP:-data/dumps_k400_frozen/stage3_dump_train_k400_frozen_s*.parquet}"
+VAL_DUMP="${VAL_DUMP:-data/dumps_k400_frozen/stage3_dump_eval_k400_frozen.parquet}"
 
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 
@@ -81,14 +87,13 @@ for K2 in "${K2_GRID[@]}"; do
         --stage1-weights models/prefilter_best.pt \
         --stage2-weights models/stage2_best.pt \
         --stage3-weights "${CKPT}" \
-        --top-k2 "${K2}" --num-couples 200 --batch-size 64 --num-workers 0 \
+        --top-k1 "${TOP_K1}" --top-k2 "${K2}" --num-couples 200 --batch-size 64 --num-workers 0 \
         --val-data-dir "${VAL_DATA_DIR}" \
         --data-config "${DATA_CONFIG}" \
         --output "${RUN_DIR}/couples_k${K2}_dump.parquet"
     "${PYTHON}" -m scripts.python.compute_eval_metrics \
         --eval-parquet "${RUN_DIR}/couples_k${K2}_dump.parquet" \
         --val-data-dir "${VAL_DATA_DIR}" \
-        --data-config "${DATA_CONFIG}" \
         --output "${RUN_DIR}/couples_k${K2}_metrics.json"
     echo "=== K2=${K2}: done ==="
 done

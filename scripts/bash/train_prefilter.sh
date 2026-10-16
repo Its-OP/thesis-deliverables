@@ -1,6 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
+# Recipe = the promoted h6s1 stage 1 (models/prefilter_best.pt stored args, full-eval
+# R@256 0.9605): 100 epochs x 500 steps, batch 128, lr 1e-3 cosine, 10 workers, amp,
+# no compile, checkpoint criterion recall@200; validation shards = data/low-pt/eval
+# (the directory the promoted run used; the repo has no data/low-pt/val).
+
 if [ $# -lt 1 ]; then
     echo "Usage: bash train_prefilter.sh <experiment_name> [extra args...]"
     exit 1
@@ -10,9 +15,9 @@ shift
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TRAIN_PARQUET_COUNT=$(find "${SCRIPT_DIR}/data/low-pt/train" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
-VAL_PARQUET_COUNT=$(find "${SCRIPT_DIR}/data/low-pt/val" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
-if [ "$TRAIN_PARQUET_COUNT" -lt 10 ] || [ "$VAL_PARQUET_COUNT" -lt 10 ]; then
-    echo "WARNING: ${TRAIN_PARQUET_COUNT} train + ${VAL_PARQUET_COUNT} val parquet files (expected 10+ each)."
+VAL_PARQUET_COUNT=$(find "${SCRIPT_DIR}/data/low-pt/eval" -maxdepth 1 -name "*.parquet" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$TRAIN_PARQUET_COUNT" -lt 10 ] || [ "$VAL_PARQUET_COUNT" -lt 9 ]; then
+    echo "WARNING: ${TRAIN_PARQUET_COUNT} train + ${VAL_PARQUET_COUNT} eval parquet files (expected 10 train + 9 eval)."
 fi
 
 SESSION_TRAIN="prefilter_train"
@@ -21,7 +26,7 @@ CONDA_ENV_NAME="part"
 
 DATA_CONFIG="data/low-pt/lowpt_tau_trackfinder.yaml"
 DATA_DIR="data/low-pt/train/"
-VAL_DATA_DIR="data/low-pt/val/"
+VAL_DATA_DIR="data/low-pt/eval/"
 NETWORK="networks/lowpt_tau_TrackPreFilter.py"
 MODEL_NAME="${EXPERIMENT_NAME}_PreFilter"
 EXPERIMENTS_DIR="experiments"

@@ -1,13 +1,18 @@
 #!/bin/bash
+# =============================================================================
+# Metrics JSON (R@K / D@K / C@K / RC@K) for a scripts/bash/eval_cascade_pipeline.sh
+# dump. GT labels are read straight from the eval shards, so no data config is
+# needed (the --data-config flag was dropped from compute_eval_metrics.py).
+# Extra args pass through, e.g. --eval-parquet <other dump> --output <json>.
+# =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONDA_ENV_NAME="part"
 
-EVAL_PARQUET="data/low-pt/eval/pipeline_val.parquet"
-VAL_DATA_DIR="data/low-pt/val/"
-DATA_CONFIG="data/low-pt/lowpt_tau_trackfinder.yaml"
-OUTPUT="data/low-pt/eval/pipeline_val_metrics.json"
+EVAL_PARQUET="data/low-pt/eval/pipeline_eval.parquet"
+VAL_DATA_DIR="data/low-pt/eval/"
+OUTPUT="data/low-pt/eval/pipeline_eval_metrics.json"
 
 if command -v conda &>/dev/null; then
     CONDA_BASE=$(conda info --base)
@@ -29,6 +34,5 @@ cd "${SCRIPT_DIR}"
 python -m scripts.python.compute_eval_metrics \
     --eval-parquet "${EVAL_PARQUET}" \
     --val-data-dir "${VAL_DATA_DIR}" \
-    --data-config "${DATA_CONFIG}" \
     --output "${OUTPUT}" \
     "$@"
