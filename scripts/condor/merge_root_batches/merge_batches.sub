@@ -1,5 +1,15 @@
+# Merge the nano microbatches of batches 1..10 into merged_bld_batch<N>.root
+# (skips a batch whose merged file already exists).
+#
+#   mkdir -p logs
+#   condor_submit merge_batches.sub
+#   condor_submit merge_batches.sub -append 'repo_dir = /afs/cern.ch/user/o/oprostak/thesis-deliverables'
 executable = run_merge.sh
-arguments  = $(batch_id)
+
+repo_dir    = $ENV(HOME)/thesis-deliverables
+
+arguments   = $(batch_id)
+environment = "REPO_DIR=$(repo_dir)"
 
 output = logs/merge_batch$(batch_id).out
 error  = logs/merge_batch$(batch_id).err

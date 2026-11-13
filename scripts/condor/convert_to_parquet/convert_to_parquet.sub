@@ -1,4 +1,18 @@
+# Regenerate the train/eval parquet shards of the merged production
+# (one job; reads merged_bld_batch*.root, writes datasets/parquet/{train,eval}).
+#
+#   mkdir -p logs
+#   condor_submit convert_to_parquet.sub
+#   condor_submit convert_to_parquet.sub -append 'repo_dir = /afs/cern.ch/user/o/oprostak/thesis-deliverables'
+#   condor_submit convert_to_parquet.sub -append 'pattern = merged_ext_batch*.root'
 executable = run_convert.sh
+
+repo_dir    = $ENV(HOME)/thesis-deliverables
+input_dir   = /eos/user/o/oprostak/tau_data/datasets/root/train_eval
+pattern     = merged_bld_batch*.root
+output_dir  = /eos/user/o/oprostak/tau_data/datasets/parquet
+
+environment = "REPO_DIR=$(repo_dir) INPUT_DIR=$(input_dir) PATTERN=$(pattern) OUTPUT_DIR=$(output_dir)"
 
 output = logs/convert.$(ClusterId).out
 error  = logs/convert.$(ClusterId).err

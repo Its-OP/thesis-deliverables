@@ -1,0 +1,14 @@
+# Full regeneration of the merged-production parquet shards:
+# 10 merge jobs (nano microbatches -> merged_bld_batch<N>.root) followed by
+# one conversion job (-> datasets/parquet/{train,eval}).
+#
+#   cd ~/thesis-deliverables/scripts/condor
+#   mkdir -p merge_root_batches/logs convert_to_parquet/logs
+#   condor_submit_dag regenerate_parquet.dag
+#
+# A batch whose merged file already exists is skipped by merge_batches.py, so
+# the DAG can be resubmitted after a failure. Clear the destination shards
+# before submitting: the conversion overwrites them.
+JOB merge   merge_batches.sub    DIR merge_root_batches
+JOB convert convert_to_parquet.sub DIR convert_to_parquet
+PARENT merge CHILD convert
