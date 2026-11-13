@@ -1,0 +1,29 @@
+# Baseline-block extraction of ONE abcbatch_2024 batch split over n_stripes
+# jobs: job i processes the files whose index in the sorted file list
+# satisfies index % n_stripes == i. Outputs are per file and skip-if-exists,
+# so stripes never collide and a failed stripe is resubmitted as is.
+#
+#   mkdir -p logs
+#   condor_submit extract_baseline_striped.sub -append 'batch = 3' -append 'n_stripes = 4'
+#
+# (-append is required: a plain `name=value` on the command line is parsed
+# BEFORE the file and loses to the defaults below.)
+executable = run_extract_baseline.sh
+
+batch       = 0
+n_stripes   = 4
+batch_root  = /eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau
+output_root = /eos/user/o/oprostak/tau_data/datasets/parquet/abcbatch_2024
+repo_dir    = $ENV(HOME)/thesis-deliverables
+
+arguments   = "$(batch) $(batch_root) $(output_root) $(Process) $(n_stripes)"
+environment = "REPO_DIR=$(repo_dir)"
+
+output = logs/extract_baseline_b$(batch).$(ClusterId).$(Process).out
+error  = logs/extract_baseline_b$(batch).$(ClusterId).$(Process).err
+log    = logs/extract_baseline_b$(batch).$(ClusterId).$(Process).log
+
+request_memory = 4000
++JobFlavour = "workday"
+
+queue $(n_stripes)

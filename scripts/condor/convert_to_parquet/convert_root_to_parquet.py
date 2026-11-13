@@ -10,6 +10,9 @@ Reads multiple merged_noBKstar_batch*.root files sequentially, applies:
 
 Output is split into train/ and val/ subdirectories, each containing
 sharded Parquet files with jagged awkward arrays consumable by weaver.
+With --extended --builder-blocks the shards also carry the inputs of the
+CERN TauTo3PiBuilder emulation: per-event K* veto scalars, the builder's
+own tau output block and the beam-spot reference point.
 
 After writing, all output files are validated against the pT cutoff
 and GT pion count constraints.
@@ -20,6 +23,24 @@ Usage:
         --output-dir ./parquet_low_pt_cutoff \\
         --train-events 300000 --val-events 75000 \\
         --pt-cutoff 0.5 --gt-pions 3
+
+abcbatch evaluation conversion (every qualifying event, no quota):
+    python3 convert_root_to_parquet.py \\
+        --input-dir /eos/.../abcbatch0_2024 \\
+        --pattern 'abcbatch*_job*_ditaus_mc.root' \\
+        --extended --eval-only --shard-events 5000 \\
+        --output-dir /eos/.../abcbatch_2024/model/batch0 --val-subdir model
+
+Event identity (event_identity.py): the 5-key (event_run, event_id,
+event_luminosity_block, source_batch_id, source_microbatch_id) is unique by
+construction. Merged production: the source ids are copied from the
+branches. abcbatch job files (no such branches): source_batch_id = batch
+number from the file name, source_microbatch_id = job * 100000 + entry
+index; event_source_job / event_source_entry carry the decoded values.
+Every shard also carries track_root_index (the kept track's position in
+the raw Track table, the index space of the baseline blocks) and, in
+extended mode, the optional truth / vertex / K* blocks (OPTIONAL_BLOCKS)
+present in the first input file.
 
 References:
   - Dataset description: part/data/low-pt/description.tex
@@ -32,7 +53,6 @@ Versions:
 """
 
 import os
-import re
 import sys
 import glob
 import time
@@ -43,6 +63,8 @@ import numpy as np
 import awkward as ak
 import uproot
 
+import event_identity  # sibling module: composite event key (batch / job / entry)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -51,6 +73,12 @@ import uproot
 PION_PDG_ID = 211
 
 ROOT_TREE_NAME = 'Events'
+
+# Synthetic key under which read_and_filter_pion_tracks carries each kept
+# track's position in the raw Track table (never requested from uproot);
+# written as the track_root_index column.
+TRACK_ROOT_INDEX_KEY = '__track_root_index__'
+TRACK_ROOT_INDEX_COLUMN = 'track_root_index'
 
 # Complete mapping from ROOT branch names to output column names for track features.
 # Only raw features are stored — derived features (log pT, 4-vectors, tanh(dxy),
@@ -131,6 +159,9 @@ EXTENDED_TRACK_COLUMNS = DEFAULT_COLUMNS + [
     'track_covariance_lambda_dxy',
     'track_covariance_phi_dxy',
     'track_covariance_qop_dxy',
+    # q/p variance: the one diagonal of the TauTo3PiBuilder's 8-element
+    # packed covariance that the legacy columns do not carry.
+    'track_covariance_qop_qop',
     'track_n_valid_hits',
     'track_is_lost',
     'track_is_matched_to_muon',
@@ -219,6 +250,49 @@ OTHER_TRACK_PT_FLOOR = 0.3
 # Pileup context (H6.P).
 EXTENDED_EVENT_BRANCHES = ['OtherPV_z', 'PV_npvs', 'PV_npvsGood']
 
+# CERN TauTo3PiBuilder emulation inputs (--builder-blocks). Never filtered,
+# never event-dropping. The K* pair table (all pairs in the sample files,
+# thousands of rows per event) is reduced to per-event scalars: the first
+# row is kstarcandidates->front() of an all-pairs collection, the
+# highest-pT row stands in for the best-by-fitted-pT collection the
+# current DiTrackBuilder emits. Indices address the unfiltered NanoAOD
+# Track table (= the builder's SelectedTracks); -1 when the event has no
+# K* pair.
+KSTAR_BRANCHES = ['KstarToPiK_trk1_idx', 'KstarToPiK_trk2_idx', 'KstarToPiK_pt']
+
+KSTAR_SCALAR_COLUMNS = [
+    'event_n_kstar',
+    'event_kstar_front_track1_index', 'event_kstar_front_track2_index',
+    'event_kstar_leading_track1_index', 'event_kstar_leading_track2_index',
+]
+
+# The builder's own output for the same event: validation target of the
+# emulation (indices again address the unfiltered Track table).
+TAU_BUILDER_BRANCH_MAP = {
+    'TauTo3Pi_idx1': 'tau_track1_index',
+    'TauTo3Pi_idx2': 'tau_track2_index',
+    'TauTo3Pi_idx3': 'tau_track3_index',
+    'TauTo3Pi_vprob': 'tau_vertex_probability',
+    'TauTo3Pi_v4trkprob': 'tau_four_track_vertex_probability',
+    'TauTo3Pi_fit_pt': 'tau_fit_pt',
+    'TauTo3Pi_mass': 'tau_mass',
+    'TauTo3Pi_vx': 'tau_vertex_x',
+    'TauTo3Pi_vy': 'tau_vertex_y',
+    'TauTo3Pi_vz': 'tau_vertex_z',
+    'TauTo3Pi_declen_sig': 'tau_decay_length_significance',
+}
+
+TAU_BUILDER_INTEGER_COLUMNS = {
+    'tau_track1_index', 'tau_track2_index', 'tau_track3_index',
+}
+
+# Beam spot: the builder's reference point for ip / declen / lxyip.
+BEAM_SPOT_BRANCH_MAP = {
+    'BeamSpot_x': 'event_beam_spot_x',
+    'BeamSpot_y': 'event_beam_spot_y',
+    'BeamSpot_z': 'event_beam_spot_z',
+}
+
 # Event-level branches (scalars per event).
 # PV_x/y/z: primary vertex coordinates (float).
 # run, event, luminosityBlock: CMS event identifiers for tracing back to ROOT source.
@@ -234,12 +308,87 @@ EVENT_BRANCHES = [
 ]
 
 # Integer columns for type casting (int32 instead of float32).
+# Optional blocks (extended mode only): truth, vertex and K*-candidate
+# branches of the raw / abcbatch productions that the merged production
+# lacks. A block is written when ALL its branches exist in the first input
+# file of a run and is then required in every later file (fixed schema per
+# run). Index columns point into the raw Track table (= track_root_index).
+OPTIONAL_TRACK_BRANCH_MAP = {
+    'Track_trackFromKstar': 'track_label_from_kstar',
+    'Track_trackgenIdx': 'track_gen_index',
+    'Track_trackgenFlav': 'track_gen_flavour',
+    'Track_isPacked': 'track_is_packed',
+}
+OPTIONAL_TRACK_INTEGER_COLUMNS = set(OPTIONAL_TRACK_BRANCH_MAP.values())
+OPTIONAL_EVENT_SCALAR_MAP = {
+    'PV_score': 'event_primary_vertex_score',
+    'PV_sumpt2': 'event_primary_vertex_sum_pt2',
+}
+OPTIONAL_EVENT_JAGGED_MAP = {'OtherPV_score': 'event_other_pv_score'}
+PVTX_BRANCH_MAP = {
+    'PVtx_vx': 'pvtx_x', 'PVtx_vy': 'pvtx_y', 'PVtx_vz': 'pvtx_z',
+    'PVtx_covXX': 'pvtx_cov_xx', 'PVtx_covXY': 'pvtx_cov_xy', 'PVtx_covXZ': 'pvtx_cov_xz',
+    'PVtx_covYY': 'pvtx_cov_yy', 'PVtx_covYZ': 'pvtx_cov_yz', 'PVtx_covZZ': 'pvtx_cov_zz',
+    'PVtx_ndof': 'pvtx_ndof', 'PVtx_chi2': 'pvtx_chi2', 'PVtx_score': 'pvtx_score',
+    'PVtx_ntracks': 'pvtx_n_tracks',
+}
+PVTX_INTEGER_COLUMNS = {'pvtx_n_tracks'}
+GENPART_BRANCH_MAP = {
+    'GenPart_pdgId': 'gen_pdg_id', 'GenPart_status': 'gen_status',
+    'GenPart_genPartIdxMother': 'gen_mother_index',
+    'GenPart_pt': 'gen_pt', 'GenPart_eta': 'gen_eta', 'GenPart_phi': 'gen_phi',
+    'GenPart_vx': 'gen_vertex_x', 'GenPart_vy': 'gen_vertex_y', 'GenPart_vz': 'gen_vertex_z',
+    'GenPart_gentrackIdx': 'gen_track_index',
+    'GenPart_gentrackMatchDr': 'gen_track_match_delta_r',
+    'GenPart_gentrackMatchDPt': 'gen_track_match_delta_pt',
+}
+GENPART_INTEGER_COLUMNS = {'gen_pdg_id', 'gen_status', 'gen_mother_index', 'gen_track_index'}
+OPTIONAL_MUON_BRANCH_MAP = {
+    'Muon_muonFromTau': 'muon_label_from_tau',
+    'Muon_muonFromB': 'muon_label_from_b',
+    'Muon_muonFromKstar': 'muon_label_from_kstar',
+    'Muon_muonGenFlav': 'muon_gen_flavour',
+    'Muon_muonGenIdx': 'muon_gen_index',
+}
+OPTIONAL_MUON_INTEGER_COLUMNS = set(OPTIONAL_MUON_BRANCH_MAP.values())
+KSTAR_ALL_BRANCH_MAP = {
+    'KstarToPiKAll_trk1_idx': 'kstar_track1_root_index',
+    'KstarToPiKAll_trk2_idx': 'kstar_track2_root_index',
+    'KstarToPiKAll_vtx_x': 'kstar_vertex_x', 'KstarToPiKAll_vtx_y': 'kstar_vertex_y',
+    'KstarToPiKAll_vtx_z': 'kstar_vertex_z',
+    'KstarToPiKAll_svprob': 'kstar_vertex_probability',
+    'KstarToPiKAll_fitted_mass_Kpi': 'kstar_fitted_mass_kpi',
+    'KstarToPiKAll_fitted_mass_piK': 'kstar_fitted_mass_pik',
+    'KstarToPiKAll_fitted_pt': 'kstar_fitted_pt',
+    'KstarToPiKAll_lxy': 'kstar_lxy', 'KstarToPiKAll_lxyerr': 'kstar_lxy_error',
+    'KstarToPiKAll_pt': 'kstar_pt', 'KstarToPiKAll_eta': 'kstar_eta',
+    'KstarToPiKAll_phi': 'kstar_phi', 'KstarToPiKAll_charge': 'kstar_charge',
+}
+KSTAR_ALL_INTEGER_COLUMNS = {'kstar_track1_root_index', 'kstar_track2_root_index', 'kstar_charge'}
+KSTAR_SELECTED_BRANCH_MAP = {
+    'KstarToPiK_trk1_idx': 'event_kstar_selected_track1_root_index',
+    'KstarToPiK_trk2_idx': 'event_kstar_selected_track2_root_index',
+}
+KSTAR_SELECTED_INTEGER_COLUMNS = set(KSTAR_SELECTED_BRANCH_MAP.values())
+# block name -> (ROOT branch -> column map, integer column names)
+OPTIONAL_BLOCKS = {
+    'track': (OPTIONAL_TRACK_BRANCH_MAP, OPTIONAL_TRACK_INTEGER_COLUMNS),
+    'event_scalar': (OPTIONAL_EVENT_SCALAR_MAP, set()),
+    'event_jagged': (OPTIONAL_EVENT_JAGGED_MAP, set()),
+    'pvtx': (PVTX_BRANCH_MAP, PVTX_INTEGER_COLUMNS),
+    'genpart': (GENPART_BRANCH_MAP, GENPART_INTEGER_COLUMNS),
+    'muon_truth': (OPTIONAL_MUON_BRANCH_MAP, OPTIONAL_MUON_INTEGER_COLUMNS),
+    'kstar_all': (KSTAR_ALL_BRANCH_MAP, KSTAR_ALL_INTEGER_COLUMNS),
+    'kstar_selected': (KSTAR_SELECTED_BRANCH_MAP, KSTAR_SELECTED_INTEGER_COLUMNS),
+}
+
 TRACK_INTEGER_COLUMNS = {
     'track_charge', 'track_n_valid_hits',
     'track_n_valid_pixel_hits', 'track_label_from_tau',
     'track_is_lost', 'track_is_matched_to_muon',
     'track_is_matched_to_ele', 'track_label_from_b',
-}
+    TRACK_ROOT_INDEX_COLUMN,
+} | OPTIONAL_TRACK_INTEGER_COLUMNS
 
 # The H6-extension float columns of the kept-track block. These are NOT
 # covered by the legacy clean-event mask (frozen to LEGACY_CLEAN_BRANCHES
@@ -256,14 +405,15 @@ NEW_TRACK_FLOAT_COLUMNS = [
 # ---------------------------------------------------------------------------
 
 def discover_root_files(input_dir, pattern='merged_noBKstar_batch*.root'):
-    """Find and sort ROOT files by batch number.
+    """Find and sort ROOT files numerically by (batch number, job number).
 
     Args:
         input_dir: Directory containing ROOT files.
         pattern: Glob pattern for matching files.
 
     Returns:
-        List of file paths sorted numerically by batch number.
+        List of file paths sorted by event_identity.file_sort_key (merged
+        production: batch number; abcbatch production: batch, then job).
 
     Raises:
         FileNotFoundError: If no matching files are found.
@@ -274,11 +424,7 @@ def discover_root_files(input_dir, pattern='merged_noBKstar_batch*.root'):
             f'No ROOT files matching "{pattern}" found in {input_dir}'
         )
 
-    def batch_number(filepath):
-        match = re.search(r'batch(\d+)', os.path.basename(filepath))
-        return int(match.group(1)) if match else 0
-
-    matches.sort(key=batch_number)
+    matches.sort(key=event_identity.file_sort_key)
     return matches
 
 
@@ -408,12 +554,26 @@ def read_and_filter_pion_tracks(tree, track_branch_map, entry_start=None, entry_
     filtered_data = {}
     for root_branch_name in track_branch_map:
         filtered_data[root_branch_name] = track_data[root_branch_name][pion_mask]
+    # Raw Track-table position of every kept track (the index space of the
+    # builder / ABCNet / K* / GenPart track references), carried through the
+    # same masks as the features.
+    filtered_data[TRACK_ROOT_INDEX_KEY] = ak.local_index(
+        track_data['Track_pdgId'], axis=1)[pion_mask]
 
     return filtered_data, clean_event_mask
 
 
-def read_event_info(tree, clean_event_mask, entry_start=None, entry_stop=None):
-    """Read event-level scalar branches (primary vertex), filtered to clean events.
+def read_event_info(tree, clean_event_mask, entry_start=None, entry_stop=None,
+                    filepath=None):
+    """Read event-level scalar branches (primary vertex, CMS ids) and the
+    source ids, filtered to clean events.
+
+    Source ids (event_identity.source_ids): copied from the
+    source_batch_id / source_microbatch_id branches when present; for
+    abcbatch job files without them, derived from the file name (batch,
+    job) and the ROOT entry index; -1 otherwise (also when filepath is
+    None). The decoded job number and entry index are returned as
+    event_source_job / event_source_entry.
 
     Args:
         tree: An uproot TTree object.
@@ -421,12 +581,16 @@ def read_event_info(tree, clean_event_mask, entry_start=None, entry_stop=None):
             (True = event is clean, False = event dropped).
         entry_start: Optional first entry index to read.
         entry_stop: Optional last entry index (exclusive) to read.
+        filepath: Path of the ROOT file (needed for file-name derived ids).
 
     Returns:
-        A dict mapping branch names to numpy arrays (one value per clean event).
+        A dict mapping branch names (plus the two event_source_* columns)
+        to numpy arrays (one value per clean event).
     """
     available = set(tree.keys())
-    branches_to_read = [b for b in EVENT_BRANCHES if b in available]
+    scalar_branches = [b for b in EVENT_BRANCHES
+                       if b not in event_identity.SOURCE_ID_BRANCHES]
+    branches_to_read = [b for b in scalar_branches if b in available]
     event_data = tree.arrays(
         expressions=branches_to_read,
         entry_start=entry_start,
@@ -435,13 +599,16 @@ def read_event_info(tree, clean_event_mask, entry_start=None, entry_stop=None):
 
     result = {}
     n_clean = int(clean_event_mask.sum())
-    for branch in EVENT_BRANCHES:
+    for branch in scalar_branches:
         if branch in available:
             result[branch] = ak.to_numpy(event_data[branch])[clean_event_mask]
         else:
-            # Fill missing source ID branches with -1 (old .root files
-            # produced before merge_batches added these columns).
             result[branch] = np.full(n_clean, -1, dtype=np.int32)
+    ids = event_identity.source_ids(tree, filepath or '', entry_start, entry_stop)
+    result['source_batch_id'] = ids.batch[clean_event_mask]
+    result['source_microbatch_id'] = ids.microbatch[clean_event_mask]
+    result['event_source_job'] = ids.job[clean_event_mask]
+    result['event_source_entry'] = ids.entry[clean_event_mask]
     return result
 
 
@@ -527,6 +694,118 @@ def read_extended_collections(tree, clean_event_mask, entry_start=None,
         ak.to_numpy(data['PV_npvs'])[clean_event_mask].astype(np.int32)
     result['event_n_pvs_good'] = \
         ak.to_numpy(data['PV_npvsGood'])[clean_event_mask].astype(np.int32)
+    return result
+
+
+def resolve_optional_branches(tree):
+    """tree: uproot Events tree (the first input file of a run). Returns
+    {block name: branch map} for every OPTIONAL_BLOCKS block whose branches
+    are all present; partially present blocks are skipped with a note."""
+    available = set(tree.keys())
+    resolved = {}
+    for name, (branch_map, _) in OPTIONAL_BLOCKS.items():
+        present = [branch for branch in branch_map if branch in available]
+        if len(present) == len(branch_map):
+            resolved[name] = dict(branch_map)
+        elif present:
+            print(f'  optional block {name} skipped: missing '
+                  f'{sorted(set(branch_map) - set(present))}')
+    return resolved
+
+
+def check_optional_branches(tree, optional_blocks, basename):
+    """tree: uproot Events tree; optional_blocks: resolve_optional_branches
+    output. Raises ValueError when a resolved branch is absent (the schema
+    is fixed per run from the first file)."""
+    available = set(tree.keys())
+    missing = [branch for branch_map in optional_blocks.values()
+               for branch in branch_map if branch not in available]
+    if missing:
+        raise ValueError(f'{basename} lacks optional branches resolved from the first '
+                         f'file: {missing}')
+
+
+def read_optional_collections(tree, clean_event_mask, entry_start, entry_stop,
+                              optional_blocks):
+    """Reads the resolved event-level optional blocks (everything but the
+    per-track block, which rides the track branch map), masked to clean
+    events. Returns a dict of output-named, cast, sanitized columns; the
+    selected-K* pair becomes two int32 scalars (-1 without a pair)."""
+    event_blocks = [name for name in optional_blocks if name != 'track']
+    if not event_blocks:
+        return {}
+    branches = [branch for name in event_blocks for branch in optional_blocks[name]]
+    data = tree.arrays(
+        expressions=branches,
+        entry_start=entry_start,
+        entry_stop=entry_stop,
+    )
+    result = {}
+    for name in event_blocks:
+        branch_map = optional_blocks[name]
+        integer_columns = OPTIONAL_BLOCKS[name][1]
+        if name == 'event_scalar':
+            for branch, column in branch_map.items():
+                result[column] = \
+                    ak.to_numpy(data[branch])[clean_event_mask].astype(np.float32)
+        elif name == 'kstar_selected':
+            for branch, column in branch_map.items():
+                firsts = ak.fill_none(ak.firsts(data[branch][clean_event_mask]), -1)
+                result[column] = ak.to_numpy(firsts).astype(np.int32)
+        else:
+            block = {column: data[branch][clean_event_mask]
+                     for branch, column in branch_map.items()}
+            block = cast_to_float32(block, integer_columns=integer_columns)
+            result.update(sanitize_float_block(block, integer_columns))
+    return result
+
+
+def reduce_kstar_pairs(track1_index, track2_index, pair_pt):
+    """track1_index, track2_index, pair_pt: jagged awkward arrays of the
+    per-event K* pair table (any row count). Returns the
+    KSTAR_SCALAR_COLUMNS dict of int32 numpy arrays: row count, the first
+    row's track indices and the highest-pT row's track indices (-1 for
+    events without a pair)."""
+    leading_row = ak.argmax(pair_pt, axis=1, keepdims=True)
+
+    def first_or_minus_one(array):
+        return ak.to_numpy(ak.fill_none(ak.firsts(array), -1)).astype(np.int32)
+
+    return {
+        'event_n_kstar': ak.to_numpy(ak.num(track1_index, axis=1)).astype(np.int32),
+        'event_kstar_front_track1_index': first_or_minus_one(track1_index),
+        'event_kstar_front_track2_index': first_or_minus_one(track2_index),
+        'event_kstar_leading_track1_index': first_or_minus_one(track1_index[leading_row]),
+        'event_kstar_leading_track2_index': first_or_minus_one(track2_index[leading_row]),
+    }
+
+
+def read_builder_blocks(tree, clean_event_mask, entry_start=None,
+                        entry_stop=None):
+    """Reads the TauTo3PiBuilder emulation inputs (K* pair table reduced
+    to per-event scalars, the builder's tau output block, beam spot),
+    masked to clean events. Missing branches raise. Returns a dict of
+    output-named, cast, sanitized columns."""
+    branches = (KSTAR_BRANCHES + list(TAU_BUILDER_BRANCH_MAP)
+                + list(BEAM_SPOT_BRANCH_MAP))
+    data = tree.arrays(
+        expressions=branches,
+        entry_start=entry_start,
+        entry_stop=entry_stop,
+    )
+
+    result = reduce_kstar_pairs(
+        *(data[branch][clean_event_mask] for branch in KSTAR_BRANCHES)
+    )
+    tau_block = {
+        output_name: data[branch][clean_event_mask]
+        for branch, output_name in TAU_BUILDER_BRANCH_MAP.items()
+    }
+    tau_block = cast_to_float32(tau_block, integer_columns=TAU_BUILDER_INTEGER_COLUMNS)
+    result.update(sanitize_float_block(tau_block, TAU_BUILDER_INTEGER_COLUMNS))
+    for branch, output_name in BEAM_SPOT_BRANCH_MAP.items():
+        result[output_name] = \
+            ak.to_numpy(data[branch])[clean_event_mask].astype(np.float32)
     return result
 
 
@@ -652,13 +931,18 @@ def build_output_table(track_features, event_info, pion_counts,
     # CMS event identifiers — for tracing events back to ROOT source.
     # (run, luminosityBlock, event) is NOT unique per row because the
     # upstream CMSSW analysis writes one entry per tau candidate.
-    # source_batch_id + source_microbatch_id (added during merge_batches)
-    # disambiguate candidates within the same CMS event.
+    # source_batch_id + source_microbatch_id disambiguate: in the merged
+    # production they are the merge batch / microbatch file (added by
+    # merge_batches); in the abcbatch production they are the batch number
+    # and job * ENTRIES_PER_JOB_LIMIT + entry index (event_identity).
+    # event_source_job / event_source_entry carry the decoded values.
     output['event_run'] = event_info['run'].astype(np.int32)
     output['event_id'] = event_info['event'].astype(np.int64)
     output['event_luminosity_block'] = event_info['luminosityBlock'].astype(np.int32)
     output['source_batch_id'] = event_info['source_batch_id'].astype(np.int32)
     output['source_microbatch_id'] = event_info['source_microbatch_id'].astype(np.int32)
+    output['event_source_job'] = event_info['event_source_job'].astype(np.int32)
+    output['event_source_entry'] = event_info['event_source_entry'].astype(np.int32)
 
     # Track (pion) features and per-track label — jagged arrays
     output.update(track_features)
@@ -724,10 +1008,62 @@ def write_parquet_shard(output_array, filepath):
 # Validation
 # ---------------------------------------------------------------------------
 
-def validate_extended_blocks(data, filepath, pt_cutoff):
+def validate_builder_blocks(data, basename):
+    """data: one shard's awkward array. Checks the --builder-blocks
+    columns: presence, tau-block length consistency, integer dtypes,
+    K* scalars (-1 indices exactly for events without a pair) and
+    finiteness of the float columns.
+
+    Raises:
+        ValueError: If any builder-block constraint is violated.
+    """
+    expected_columns = (
+        set(KSTAR_SCALAR_COLUMNS)
+        | set(TAU_BUILDER_BRANCH_MAP.values())
+        | set(BEAM_SPOT_BRANCH_MAP.values())
+    )
+    missing = expected_columns - set(data.fields)
+    if missing:
+        raise ValueError(f'Missing builder-block columns in {basename}: '
+                         f'{sorted(missing)}')
+
+    tau_counts = ak.num(data['tau_track1_index'], axis=1)
+    for column in TAU_BUILDER_BRANCH_MAP.values():
+        if ak.any(ak.num(data[column], axis=1) != tau_counts):
+            raise ValueError(f'Tau block length mismatch in {basename}: '
+                             f'{column}')
+
+    for column in TAU_BUILDER_INTEGER_COLUMNS:
+        if ak.to_numpy(ak.flatten(data[column])).dtype.kind != 'i':
+            raise ValueError(f'Wrong dtype for {column} in {basename}: '
+                             f'expected integer')
+
+    n_kstar = ak.to_numpy(data['event_n_kstar'])
+    for column in KSTAR_SCALAR_COLUMNS:
+        values = ak.to_numpy(data[column])
+        if values.dtype.kind != 'i':
+            raise ValueError(f'Wrong dtype for {column} in {basename}: '
+                             f'expected integer')
+        if column != 'event_n_kstar' and ((values < 0) != (n_kstar == 0)).any():
+            raise ValueError(f'K* index/count mismatch in {basename}: '
+                             f'{column}')
+
+    float_columns = (
+        sorted(set(TAU_BUILDER_BRANCH_MAP.values()) - TAU_BUILDER_INTEGER_COLUMNS)
+        + list(BEAM_SPOT_BRANCH_MAP.values())
+    )
+    for column in float_columns:
+        flat = ak.to_numpy(ak.ravel(data[column]))
+        if not np.isfinite(flat).all():
+            raise ValueError(f'Non-finite values in {column} of {basename} '
+                             f'(sanitization failed)')
+
+
+def validate_extended_blocks(data, filepath, pt_cutoff, builder_blocks=False):
     """data: one shard's awkward array. Checks the extended-mode blocks:
     column presence, other_track pT window, muon length consistency,
-    integer flag dtypes, and finiteness of sanitized float columns.
+    integer flag dtypes, and finiteness of sanitized float columns; with
+    builder_blocks=True also the --builder-blocks columns.
 
     Raises:
         ValueError: If any extended-block constraint is violated.
@@ -781,22 +1117,110 @@ def validate_extended_blocks(data, filepath, pt_cutoff):
             raise ValueError(f'Non-finite values in {column} of {basename} '
                              f'(sanitization failed)')
 
+    if builder_blocks:
+        validate_builder_blocks(data, basename)
+
+
+def _dtype_kind(array):
+    values = ak.flatten(array) if array.ndim > 1 else array
+    return ak.to_numpy(values).dtype.kind
+
+
+def validate_optional_blocks(data, basename):
+    """data: one shard's awkward array. For every optional block present in
+    the shard: all its columns present, integer dtypes, and equal list
+    lengths (per-track columns vs track_pt, muon truth vs muon_pt,
+    OtherPV score vs event_other_pv_z, PVtx / GenPart / K* blocks within
+    themselves). Blocks absent from the shard are skipped.
+
+    Raises:
+        ValueError: If any constraint is violated.
+    """
+    fields = set(data.fields)
+    length_reference = {'track': 'track_pt', 'muon_truth': 'muon_pt',
+                        'event_jagged': 'event_other_pv_z'}
+    for name, (branch_map, integer_columns) in OPTIONAL_BLOCKS.items():
+        columns = list(branch_map.values())
+        present = [column for column in columns if column in fields]
+        if not present:
+            continue
+        if len(present) != len(columns):
+            raise ValueError(f'optional block {name} is partial in {basename}: missing '
+                             f'{sorted(set(columns) - set(present))}')
+        for column in integer_columns:
+            if _dtype_kind(data[column]) != 'i':
+                raise ValueError(f'{column} in {basename} is not integer')
+        if name in ('event_scalar', 'kstar_selected'):
+            continue
+        reference = data[length_reference.get(name, columns[0])]
+        for column in columns:
+            if not ak.all(ak.num(data[column], axis=1) == ak.num(reference, axis=1)):
+                raise ValueError(f'optional block {name}: {column} length differs from '
+                                 f'its reference in {basename}')
+
+
+def validate_track_root_index(data, basename):
+    """data: one shard's awkward array. Checks the track_root_index column:
+    present, integer, one entry per kept track, non-negative and strictly
+    increasing within each event (kept tracks keep the raw table order).
+
+    Raises:
+        ValueError: If any constraint is violated.
+    """
+    if TRACK_ROOT_INDEX_COLUMN not in data.fields:
+        raise ValueError(f'Missing column {TRACK_ROOT_INDEX_COLUMN} in {basename}')
+    root_index = data[TRACK_ROOT_INDEX_COLUMN]
+    if ak.to_numpy(ak.flatten(root_index)).dtype.kind != 'i':
+        raise ValueError(f'{TRACK_ROOT_INDEX_COLUMN} in {basename} is not integer')
+    if not ak.all(ak.num(root_index, axis=1) == ak.num(data['track_pt'], axis=1)):
+        raise ValueError(f'{TRACK_ROOT_INDEX_COLUMN} length differs from track_pt in {basename}')
+    flat = ak.to_numpy(ak.flatten(root_index))
+    if flat.size and flat.min() < 0:
+        raise ValueError(f'{TRACK_ROOT_INDEX_COLUMN} has negative entries in {basename}')
+    steps = root_index[:, 1:] - root_index[:, :-1]
+    if not ak.all(ak.flatten(steps) > 0):
+        raise ValueError(f'{TRACK_ROOT_INDEX_COLUMN} is not strictly increasing in {basename}')
+
+
+def validate_identity_unique(parquet_files):
+    """parquet_files: list of shard paths. Checks that the 5-key
+    (event_run, event_id, event_luminosity_block, source_batch_id,
+    source_microbatch_id) is unique across all of them: a duplicate among
+    rows with file-derived or copied source ids raises, duplicates among
+    legacy -1 rows only warn (event_identity.assert_unique_identity).
+
+    Raises:
+        ValueError: On a duplicate key among rows with real source ids.
+    """
+    names = list(event_identity.IDENTITY_COLUMNS + event_identity.SOURCE_DETAIL_COLUMNS)
+    collected = {name: [] for name in names}
+    for path in parquet_files:
+        data = ak.from_parquet(path)
+        for name in names:
+            if name in data.fields:
+                collected[name].append(ak.to_numpy(data[name]))
+    columns = {name: np.concatenate(arrays) for name, arrays in collected.items() if arrays}
+    context = f'{len(parquet_files)} shard(s) under {os.path.dirname(parquet_files[0])}'
+    event_identity.assert_unique_identity(columns, context=context)
+
 
 def validate_parquet_output(output_dir, pt_cutoff, required_gt_pions,
-                            extended=False):
+                            extended=False, builder_blocks=False):
     """Validate all Parquet files in a directory against quality constraints.
 
     Reads each file and checks:
       1. Every pion track has pT >= pt_cutoff.
       2. Every event has exactly required_gt_pions tracks with label == 1.
       3. With extended=True: the extended blocks (see
-         validate_extended_blocks).
+         validate_extended_blocks); with builder_blocks=True also the
+         --builder-blocks columns.
 
     Args:
         output_dir: Directory containing .parquet files.
         pt_cutoff: Minimum pT in GeV.
         required_gt_pions: Required GT pion count per event.
         extended: Whether to also validate the extended-mode blocks.
+        builder_blocks: Whether to also validate the builder blocks.
 
     Raises:
         FileNotFoundError: If no parquet files are found.
@@ -857,8 +1281,12 @@ def validate_parquet_output(output_dir, pt_cutoff, required_gt_pions,
                     f'{id_values.dtype} (expected integer)'
                 )
 
+        validate_track_root_index(data, os.path.basename(filepath))
+
         if extended:
-            validate_extended_blocks(data, filepath, pt_cutoff)
+            validate_extended_blocks(data, filepath, pt_cutoff,
+                                     builder_blocks=builder_blocks)
+            validate_optional_blocks(data, os.path.basename(filepath))
 
         print(f'    OK {os.path.basename(filepath)}: '
               f'{n_events} events, {n_tracks} tracks, min pT={min_pt:.4f}')
@@ -886,12 +1314,16 @@ def print_progress(total_scanned, total_qualifying, total_needed,
     else:
         acceptance_percent = 0.0
 
+    qualifying = (f'Qualifying {total_qualifying:,}' if total_needed is None
+                  else f'Qualifying {total_qualifying:,}/{total_needed:,}')
+    shards = (f'Shards {current_shard_index}' if total_shards is None
+              else f'Shards {current_shard_index}/{total_shards}')
     line = (
         f'  [{minutes:02d}:{seconds:02d}] '
         f'Scanned {total_scanned:,} | '
-        f'Qualifying {total_qualifying:,}/{total_needed:,} '
+        f'{qualifying} '
         f'({acceptance_percent:.1f}% accept) | '
-        f'Shards {current_shard_index}/{total_shards}'
+        f'{shards}'
     )
 
     # Overwrite previous line; pad with spaces to clear leftover characters
@@ -907,7 +1339,8 @@ def convert(input_dir, output_dir, train_events, val_events,
             train_files, val_files, pt_cutoff, required_gt_pions,
             chunk_size, output_columns, extended=False,
             pattern='merged_noBKstar_batch*.root',
-            train_subdir='train', val_subdir='val'):
+            train_subdir='train', val_subdir='val', builder_blocks=False,
+            eval_only=False, shard_events=5000):
     """Convert ROOT files to sharded Parquet with pT cutoff and GT pion filter.
 
     Processes ROOT files sequentially in chunks, applying quality cleaning,
@@ -934,35 +1367,64 @@ def convert(input_dir, output_dir, train_events, val_events,
         pattern: Glob pattern for input ROOT files.
         train_subdir: Subdirectory (and shard-name prefix) for the train split.
         val_subdir: Subdirectory (and shard-name prefix) for the val split.
+        builder_blocks: With extended=True, also extract the TauTo3PiBuilder
+            emulation inputs (K* veto scalars, builder tau output, beam spot).
+        eval_only: Write EVERY qualifying event into the val split as
+            shards of shard_events events (the last one partial), with no
+            event quota; train_events/val_events/train_files/val_files are
+            ignored. Used for the abcbatch evaluation conversion.
+        shard_events: Events per shard in eval_only mode.
     """
     # --- Validate configuration ---
-    if train_events % train_files != 0:
-        raise ValueError(
-            f'train_events ({train_events}) must be evenly divisible by '
-            f'train_files ({train_files})'
-        )
-    if val_events % val_files != 0:
-        raise ValueError(
-            f'val_events ({val_events}) must be evenly divisible by '
-            f'val_files ({val_files})'
-        )
-
-    train_events_per_file = train_events // train_files
-    val_events_per_file = val_events // val_files
-    total_needed = train_events + val_events
+    if builder_blocks and not extended:
+        raise ValueError('builder_blocks=True requires extended=True')
+    if eval_only:
+        if shard_events <= 0:
+            raise ValueError('shard_events must be positive in eval_only mode')
+        print('eval-only mode: every qualifying event is written to '
+              f'{val_subdir}/ in shards of {shard_events:,}; the train/val '
+              'quota arguments are ignored')
+    else:
+        if train_events % train_files != 0:
+            raise ValueError(
+                f'train_events ({train_events}) must be evenly divisible by '
+                f'train_files ({train_files})'
+            )
+        if val_events % val_files != 0:
+            raise ValueError(
+                f'val_events ({val_events}) must be evenly divisible by '
+                f'val_files ({val_files})'
+            )
 
     train_dir = os.path.join(output_dir, train_subdir)
     val_dir = os.path.join(output_dir, val_subdir)
 
-    # Build shard plan: ordered list of (directory, filename, events_per_shard)
-    # Train shards are filled first, then val shards.
-    shard_plan = []
-    for i in range(train_files):
-        shard_plan.append(
-            (train_dir, f'{train_subdir}_{i:03d}.parquet', train_events_per_file))
-    for i in range(val_files):
-        shard_plan.append(
-            (val_dir, f'{val_subdir}_{i:03d}.parquet', val_events_per_file))
+    # Shard plan: ordered list of (directory, filename, events_per_shard);
+    # train shards are filled first, then val shards. In eval_only mode the
+    # plan is open-ended: shard i of the val split holds shard_events events.
+    if eval_only:
+        shard_plan = None
+        total_needed = None
+    else:
+        train_events_per_file = train_events // train_files
+        val_events_per_file = val_events // val_files
+        total_needed = train_events + val_events
+        shard_plan = []
+        for i in range(train_files):
+            shard_plan.append(
+                (train_dir, f'{train_subdir}_{i:03d}.parquet', train_events_per_file))
+        for i in range(val_files):
+            shard_plan.append(
+                (val_dir, f'{val_subdir}_{i:03d}.parquet', val_events_per_file))
+    total_shards = None if shard_plan is None else len(shard_plan)
+
+    def plan_complete():
+        return shard_plan is not None and current_shard_index >= len(shard_plan)
+
+    def shard_spec(index):
+        if shard_plan is None:
+            return (val_dir, f'{val_subdir}_{index:03d}.parquet', shard_events)
+        return shard_plan[index]
 
     # Build branch map
     if extended:
@@ -977,13 +1439,26 @@ def convert(input_dir, output_dir, train_events, val_events,
 
     # Discover input files
     root_files = discover_root_files(input_dir, pattern=pattern)
+    event_identity.assert_unique_file_keys(root_files)
+
+    # Optional truth / vertex / K* blocks: resolved once from the first file
+    # (extended mode only), then required in every file of the run.
+    optional_blocks = {}
+    if extended:
+        optional_blocks = resolve_optional_branches(load_root_tree(root_files[0]))
+        track_branch_map = {**track_branch_map, **optional_blocks.get('track', {})}
+        print(f'Optional blocks: {sorted(optional_blocks) or "none"}')
 
     print(f'Found {len(root_files)} ROOT files in {input_dir}')
     print(f'Extracting {len(track_branch_map)} track columns')
     print(f'pT cutoff: >= {pt_cutoff} GeV | Required GT pions: {required_gt_pions}')
-    print(f'Target: {train_events} train + {val_events} val = {total_needed} events')
-    print(f'Output: {train_files} x {train_events_per_file} train + '
-          f'{val_files} x {val_events_per_file} val shards')
+    if eval_only:
+        print(f'Target: every qualifying event, {shard_events:,} per shard')
+    else:
+        print(f'Target: {train_events} train + {val_events} val = {total_needed} events')
+    if not eval_only:
+        print(f'Output: {train_files} x {train_events_per_file} train + '
+              f'{val_files} x {val_events_per_file} val shards')
     print()
 
     # --- Process ROOT files ---
@@ -997,7 +1472,7 @@ def convert(input_dir, output_dir, train_events, val_events,
     start_time = time.time()
 
     for file_index, root_filepath in enumerate(root_files):
-        if current_shard_index >= len(shard_plan):
+        if plan_complete():
             break
 
         basename = os.path.basename(root_filepath)
@@ -1007,9 +1482,13 @@ def convert(input_dir, output_dir, train_events, val_events,
         tree = load_root_tree(root_filepath)
         number_of_entries = tree.num_entries
         file_qualifying = 0
+        identity_origin = event_identity.source_ids(
+            tree, root_filepath, 0, min(1, number_of_entries)).origin
+        print(f'  identity: source ids from {identity_origin}')
+        check_optional_branches(tree, optional_blocks, basename)
 
         for chunk_start in range(0, number_of_entries, chunk_size):
-            if current_shard_index >= len(shard_plan):
+            if plan_complete():
                 break
 
             chunk_end = min(chunk_start + chunk_size, number_of_entries)
@@ -1022,21 +1501,29 @@ def convert(input_dir, output_dir, train_events, val_events,
             )
             event_info = read_event_info(
                 tree, clean_event_mask, chunk_start, chunk_end,
+                filepath=root_filepath,
             )
             if extended:
                 extended_collections = read_extended_collections(
                     tree, clean_event_mask, chunk_start, chunk_end,
                 )
+                extended_collections.update(read_optional_collections(
+                    tree, clean_event_mask, chunk_start, chunk_end, optional_blocks,
+                ))
                 other_track_data = extract_other_tracks(
                     raw_track_data, pt_cutoff,
                 )
+                if builder_blocks:
+                    extended_collections.update(read_builder_blocks(
+                        tree, clean_event_mask, chunk_start, chunk_end,
+                    ))
 
             number_of_clean = int(clean_event_mask.sum())
             total_dropped_quality += (chunk_events - number_of_clean)
 
             if number_of_clean == 0:
                 print_progress(total_scanned, total_qualifying, total_needed,
-                               current_shard_index, len(shard_plan), start_time)
+                               current_shard_index, total_shards, start_time)
                 continue
 
             # Step 2: Apply pT cutoff — drop all pion tracks with pT < threshold
@@ -1056,7 +1543,7 @@ def convert(input_dir, output_dir, train_events, val_events,
 
             if number_after_filter == 0:
                 print_progress(total_scanned, total_qualifying, total_needed,
-                               current_shard_index, len(shard_plan), start_time)
+                               current_shard_index, total_shards, start_time)
                 continue
 
             total_qualifying += number_after_filter
@@ -1082,7 +1569,10 @@ def convert(input_dir, output_dir, train_events, val_events,
             )
 
             # Rename ROOT branch names -> output column names, cast types
-            track_features = rename_branches(gt_filtered_data, track_branch_map)
+            track_features = rename_branches(
+                gt_filtered_data,
+                {**track_branch_map, TRACK_ROOT_INDEX_KEY: TRACK_ROOT_INDEX_COLUMN},
+            )
             track_features = cast_to_float32(
                 track_features, integer_columns=TRACK_INTEGER_COLUMNS,
             )
@@ -1099,9 +1589,9 @@ def convert(input_dir, output_dir, train_events, val_events,
             buffer_count += number_after_filter
 
             # Flush full shards from buffer to disk
-            while (current_shard_index < len(shard_plan)
-                   and buffer_count >= shard_plan[current_shard_index][2]):
-                shard_dir, shard_filename, shard_n_events = shard_plan[current_shard_index]
+            while (not plan_complete()
+                   and buffer_count >= shard_spec(current_shard_index)[2]):
+                shard_dir, shard_filename, shard_n_events = shard_spec(current_shard_index)
 
                 all_buffered = ak.concatenate(buffer)
                 shard_data = all_buffered[:shard_n_events]
@@ -1129,7 +1619,7 @@ def convert(input_dir, output_dir, train_events, val_events,
                 current_shard_index += 1
 
             print_progress(total_scanned, total_qualifying, total_needed,
-                           current_shard_index, len(shard_plan), start_time)
+                           current_shard_index, total_shards, start_time)
 
             # Free chunk memory
             del raw_track_data, pt_filtered_data, gt_filtered_data
@@ -1139,6 +1629,17 @@ def convert(input_dir, output_dir, train_events, val_events,
         sys.stdout.write('\r' + ' ' * 100 + '\r')
         print(f'  {basename}: {file_qualifying:,} qualifying / {number_of_entries:,} total '
               f'(cumulative: {total_qualifying:,})')
+
+    # eval-only: the remaining buffered events form the last, partial shard
+    if eval_only and buffer_count > 0:
+        shard_dir, shard_filename, _ = shard_spec(current_shard_index)
+        shard_path = os.path.join(shard_dir, shard_filename)
+        write_parquet_shard(ak.concatenate(buffer), shard_path)
+        sys.stdout.write('\r' + ' ' * 100 + '\r')
+        print(f'  -> {shard_filename} ({buffer_count:,} events, final partial shard)')
+        buffer = []
+        buffer_count = 0
+        current_shard_index += 1
 
     # --- Summary ---
     elapsed = time.time() - start_time
@@ -1154,9 +1655,14 @@ def convert(input_dir, output_dir, train_events, val_events,
     print(f'  Dropped (quality):       {total_dropped_quality:,}')
     print(f'  Dropped (pT cutoff/GT):  {total_dropped_filter:,}')
     print(f'  Qualifying events:       {total_qualifying:,}')
-    print(f'  Shards written:          {current_shard_index}/{len(shard_plan)}')
+    shards_written = (f'{current_shard_index}' if total_shards is None
+                      else f'{current_shard_index}/{total_shards}')
+    print(f'  Shards written:          {shards_written}')
 
-    if current_shard_index < len(shard_plan):
+    if eval_only and current_shard_index == 0:
+        print(f'\n  WARNING: No qualifying events; nothing written.')
+        return
+    if not eval_only and current_shard_index < len(shard_plan):
         print(f'\n  WARNING: Not enough qualifying events!')
         print(f'  Collected {total_qualifying}, needed {total_needed}.')
         print(f'  Only {current_shard_index}/{len(shard_plan)} shards written.')
@@ -1167,13 +1673,15 @@ def convert(input_dir, output_dir, train_events, val_events,
     print(f'Validating Output')
     print(f'{"=" * 50}')
 
-    print(f'  Train ({train_dir}):')
-    validate_parquet_output(train_dir, pt_cutoff, required_gt_pions,
-                            extended=extended)
-
-    print(f'  Val ({val_dir}):')
-    validate_parquet_output(val_dir, pt_cutoff, required_gt_pions,
-                            extended=extended)
+    split_dirs = [val_dir] if eval_only else [train_dir, val_dir]
+    for split_dir in split_dirs:
+        print(f'  {os.path.basename(split_dir)} ({split_dir}):')
+        validate_parquet_output(split_dir, pt_cutoff, required_gt_pions,
+                                extended=extended, builder_blocks=builder_blocks)
+    written_files = [path for split_dir in split_dirs
+                     for path in sorted(glob.glob(os.path.join(split_dir, '*.parquet')))]
+    validate_identity_unique(written_files)
+    print(f'    event keys unique across {len(written_files)} shard(s)')
 
     print(f'\nDone. Output directory: {output_dir}')
 
@@ -1252,6 +1760,12 @@ def main():
         help='Extract the H6 extended schema: EXTENDED_TRACK_COLUMNS plus '
              'the muon/SV/other_track/pileup blocks',
     )
+    parser.add_argument(
+        '--builder-blocks', action='store_true',
+        help='With --extended: also extract the CERN TauTo3PiBuilder '
+             'emulation inputs (K* veto scalars, builder tau output, beam '
+             'spot); needs a source merged with those branches',
+    )
 
     parser.add_argument(
         '--pattern', type=str, default='merged_noBKstar_batch*.root',
@@ -1266,6 +1780,16 @@ def main():
         '--val-subdir', type=str, default='val',
         help='Subdirectory and shard prefix for the val split '
              '(default: %(default)s)',
+    )
+    parser.add_argument(
+        '--eval-only', action='store_true',
+        help='Write every qualifying event into the val split as shards of '
+             '--shard-events events, no quota (train/val counts ignored); '
+             'the abcbatch evaluation conversion',
+    )
+    parser.add_argument(
+        '--shard-events', type=int, default=5000,
+        help='Events per shard with --eval-only (default: %(default)s)',
     )
 
     arguments = parser.parse_args()
@@ -1293,6 +1817,9 @@ def main():
         pattern=arguments.pattern,
         train_subdir=arguments.train_subdir,
         val_subdir=arguments.val_subdir,
+        builder_blocks=arguments.builder_blocks,
+        eval_only=arguments.eval_only,
+        shard_events=arguments.shard_events,
     )
 
 

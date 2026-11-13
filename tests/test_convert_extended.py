@@ -21,8 +21,11 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 from convert_root_to_parquet import (
+    BEAM_SPOT_BRANCH_MAP,
     DEFAULT_COLUMNS,
     EXTENDED_TRACK_COLUMNS,
+    KSTAR_BRANCHES,
+    KSTAR_SCALAR_COLUMNS,
     LEGACY_CLEAN_BRANCHES,
     MUON_BRANCH_MAP,
     MUON_INTEGER_COLUMNS,
@@ -30,8 +33,11 @@ from convert_root_to_parquet import (
     OTHER_TRACK_PT_FLOOR,
     SV_BRANCH_MAP,
     SV_INTEGER_COLUMNS,
+    TAU_BUILDER_BRANCH_MAP,
+    TAU_BUILDER_INTEGER_COLUMNS,
     build_track_branch_map,
     convert,
+    reduce_kstar_pairs,
     sanitize_jagged,
     validate_parquet_output,
 )
@@ -57,6 +63,7 @@ LEGACY_SCHEMA = {
     'event_primary_vertex_x', 'event_primary_vertex_y', 'event_primary_vertex_z',
     'event_n_tracks', 'event_run', 'event_id', 'event_luminosity_block',
     'source_batch_id', 'source_microbatch_id',
+    'event_source_job', 'event_source_entry', 'track_root_index',
 } | set(DEFAULT_COLUMNS)
 
 
@@ -82,6 +89,15 @@ def extended_dir(tmp_path_factory):
     return output_dir
 
 
+@pytest.fixture(scope='session')
+def builder_dir(tmp_path_factory):
+    output_dir = str(tmp_path_factory.mktemp('parquet_builder'))
+    convert(input_dir=_source_dir(tmp_path_factory), output_dir=output_dir,
+            output_columns=None, extended=True, builder_blocks=True,
+            **CONVERT_KWARGS)
+    return output_dir
+
+
 def _read(output_dir, split):
     return ak.from_parquet(os.path.join(output_dir, split, f'{split}_000.parquet'))
 
@@ -89,8 +105,9 @@ def _read(output_dir, split):
 class TestColumnDefinitions:
     def test_extended_track_columns_resolve(self):
         branch_map = build_track_branch_map(EXTENDED_TRACK_COLUMNS)
-        assert len(branch_map) == 29
+        assert len(branch_map) == 30
         assert set(DEFAULT_COLUMNS) < set(branch_map.values())
+        assert 'track_covariance_qop_qop' in branch_map.values()
 
     def test_extended_track_columns_exist_in_fixture(self):
         import uproot
@@ -100,6 +117,25 @@ class TestColumnDefinitions:
         assert set(MUON_BRANCH_MAP) <= available
         assert set(SV_BRANCH_MAP) <= available
         assert set(OTHER_TRACK_BRANCH_MAP) <= available
+
+    def test_builder_branches_exist_in_fixture(self):
+        import uproot
+        available = set(uproot.open(FIXTURE)['Events'].keys())
+        assert set(KSTAR_BRANCHES) <= available
+        assert set(TAU_BUILDER_BRANCH_MAP) <= available
+        assert set(BEAM_SPOT_BRANCH_MAP) <= available
+
+    def test_builder_branches_kept_by_merge(self):
+        merge_dir = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), '..', 'scripts', 'condor',
+            'merge_root_batches',
+        ))
+        if merge_dir not in sys.path:
+            sys.path.insert(0, merge_dir)
+        from merge_batches import KEEP_BRANCHES
+        needed = (set(KSTAR_BRANCHES) | set(TAU_BUILDER_BRANCH_MAP)
+                  | set(BEAM_SPOT_BRANCH_MAP) | {'Track_covQopQop'})
+        assert needed <= set(KEEP_BRANCHES)
 
     def test_block_sizes(self):
         assert len(MUON_BRANCH_MAP) == 17
@@ -206,6 +242,121 @@ class TestDeterminism:
             assert ak.to_list(legacy['track_pt']) == ak.to_list(extended['track_pt'])
 
 
+class TestBuilderBlocks:
+    """--builder-blocks: the CERN TauTo3PiBuilder emulation inputs (K* veto
+    scalars, the builder's own tau output, beam spot)."""
+
+    def test_reduce_kstar_pairs_against_source(self):
+        import uproot
+        data = uproot.open(FIXTURE)['Events'].arrays(KSTAR_BRANCHES)
+        reduced = reduce_kstar_pairs(
+            data['KstarToPiK_trk1_idx'], data['KstarToPiK_trk2_idx'],
+            data['KstarToPiK_pt'],
+        )
+        assert set(reduced) == set(KSTAR_SCALAR_COLUMNS)
+        for column in KSTAR_SCALAR_COLUMNS:
+            assert reduced[column].dtype == np.int32, column
+        rows = [ak.to_list(data[branch]) for branch in KSTAR_BRANCHES]
+        assert any(len(pt) == 0 for pt in rows[2])
+        for event, (track1, track2, pt) in enumerate(zip(*rows)):
+            assert reduced['event_n_kstar'][event] == len(pt)
+            if not pt:
+                for column in KSTAR_SCALAR_COLUMNS[1:]:
+                    assert reduced[column][event] == -1, column
+                continue
+            leading = int(np.argmax(pt))
+            assert reduced['event_kstar_front_track1_index'][event] == track1[0]
+            assert reduced['event_kstar_front_track2_index'][event] == track2[0]
+            assert reduced['event_kstar_leading_track1_index'][event] == track1[leading]
+            assert reduced['event_kstar_leading_track2_index'][event] == track2[leading]
+
+    def test_schema_and_dtypes(self, builder_dir):
+        data = _read(builder_dir, 'train')
+        expected = (set(KSTAR_SCALAR_COLUMNS)
+                    | set(TAU_BUILDER_BRANCH_MAP.values())
+                    | set(BEAM_SPOT_BRANCH_MAP.values()))
+        assert expected <= set(data.fields)
+        for column in KSTAR_SCALAR_COLUMNS:
+            assert ak.to_numpy(data[column]).dtype == np.int32, column
+        for column in TAU_BUILDER_INTEGER_COLUMNS:
+            assert ak.to_numpy(ak.flatten(data[column])).dtype == np.int32, column
+        for column in set(TAU_BUILDER_BRANCH_MAP.values()) - TAU_BUILDER_INTEGER_COLUMNS:
+            assert ak.to_numpy(ak.flatten(data[column])).dtype == np.float32, column
+        for column in BEAM_SPOT_BRANCH_MAP.values():
+            values = ak.to_numpy(data[column])
+            assert values.dtype == np.float32, column
+            assert np.isfinite(values).all(), column
+
+    def test_tau_block_lengths_and_finiteness(self, builder_dir):
+        data = _read(builder_dir, 'train')
+        counts = ak.num(data['tau_track1_index'], axis=1)
+        assert ak.sum(counts) > 0
+        for column in TAU_BUILDER_BRANCH_MAP.values():
+            assert ak.to_list(ak.num(data[column], axis=1)) == ak.to_list(counts), column
+        for column in set(TAU_BUILDER_BRANCH_MAP.values()) - TAU_BUILDER_INTEGER_COLUMNS:
+            assert np.isfinite(ak.to_numpy(ak.flatten(data[column]))).all(), column
+        for column in TAU_BUILDER_INTEGER_COLUMNS:
+            assert (ak.to_numpy(ak.flatten(data[column])) >= 0).all(), column
+
+    def test_kstar_scalars_consistent(self, builder_dir):
+        data = _read(builder_dir, 'train')
+        n_kstar = ak.to_numpy(data['event_n_kstar'])
+        for column in KSTAR_SCALAR_COLUMNS[1:]:
+            values = ak.to_numpy(data[column])
+            assert ((values < 0) == (n_kstar == 0)).all(), column
+
+    def test_round_trip_against_source(self, builder_dir):
+        import uproot
+        source = uproot.open(FIXTURE)['Events'].arrays(
+            ['run', 'luminosityBlock', 'event']
+            + KSTAR_BRANCHES + list(TAU_BUILDER_BRANCH_MAP)
+            + list(BEAM_SPOT_BRANCH_MAP)
+        )
+        source_rows = {}
+        for row, key in enumerate(zip(ak.to_list(source['run']),
+                                      ak.to_list(source['luminosityBlock']),
+                                      ak.to_list(source['event']))):
+            assert key not in source_rows
+            source_rows[key] = row
+        for split in ('train', 'val'):
+            data = _read(builder_dir, split)
+            keys = zip(ak.to_list(data['event_run']),
+                       ak.to_list(data['event_luminosity_block']),
+                       ak.to_list(data['event_id']))
+            for event, key in enumerate(keys):
+                row = source_rows[key]
+                for branch, column in TAU_BUILDER_BRANCH_MAP.items():
+                    np.testing.assert_allclose(
+                        ak.to_numpy(data[column][event]),
+                        np.nan_to_num(ak.to_numpy(source[branch][row])),
+                        rtol=1e-6, err_msg=column)
+                pt = ak.to_list(source['KstarToPiK_pt'][row])
+                track1 = ak.to_list(source['KstarToPiK_trk1_idx'][row])
+                assert data['event_n_kstar'][event] == len(pt)
+                if pt:
+                    assert data['event_kstar_front_track1_index'][event] == track1[0]
+                    assert data['event_kstar_leading_track1_index'][event] == \
+                        track1[int(np.argmax(pt))]
+                for branch, column in BEAM_SPOT_BRANCH_MAP.items():
+                    assert float(data[column][event]) == \
+                        pytest.approx(float(source[branch][row])), column
+
+    def test_event_order_identical_to_extended(self, extended_dir, builder_dir):
+        for split in ('train', 'val'):
+            extended = _read(extended_dir, split)
+            builder = _read(builder_dir, split)
+            assert len(extended) == len(builder)
+            assert ak.to_list(extended['event_id']) == ak.to_list(builder['event_id'])
+            assert ak.to_list(extended['track_pt']) == ak.to_list(builder['track_pt'])
+
+    def test_requires_extended(self, tmp_path_factory):
+        output_dir = str(tmp_path_factory.mktemp('parquet_builder_bad'))
+        with pytest.raises(ValueError, match='builder_blocks'):
+            convert(input_dir=_source_dir(tmp_path_factory),
+                    output_dir=output_dir, output_columns=None,
+                    builder_blocks=True, **CONVERT_KWARGS)
+
+
 class TestSplitSubdirNaming:
     def test_custom_val_subdir(self, tmp_path_factory):
         output_dir = str(tmp_path_factory.mktemp('parquet_named'))
@@ -261,7 +412,7 @@ class TestNaNSanitization:
 
     def test_new_track_float_columns_sanitized(self, nan_converted_dir):
         from convert_root_to_parquet import NEW_TRACK_FLOAT_COLUMNS
-        assert len(NEW_TRACK_FLOAT_COLUMNS) == 11
+        assert len(NEW_TRACK_FLOAT_COLUMNS) == 12
         for split in ('train', 'val'):
             data = _read(nan_converted_dir, split)
             for column in NEW_TRACK_FLOAT_COLUMNS:
@@ -275,3 +426,14 @@ class TestValidators:
         validate_parquet_output(os.path.join(extended_dir, 'train'),
                                 pt_cutoff=0.5, required_gt_pions=3,
                                 extended=True)
+
+    def test_builder_output_validates(self, builder_dir):
+        validate_parquet_output(os.path.join(builder_dir, 'train'),
+                                pt_cutoff=0.5, required_gt_pions=3,
+                                extended=True, builder_blocks=True)
+
+    def test_builder_validation_rejects_plain_extended(self, extended_dir):
+        with pytest.raises(ValueError, match='builder'):
+            validate_parquet_output(os.path.join(extended_dir, 'train'),
+                                    pt_cutoff=0.5, required_gt_pions=3,
+                                    extended=True, builder_blocks=True)

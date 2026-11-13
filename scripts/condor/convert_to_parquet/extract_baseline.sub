@@ -1,0 +1,29 @@
+# Baseline-block extraction of the abcbatch_2024 production: one job per batch,
+# every file of the batch in one job.
+#
+#   mkdir -p logs            # condor refuses to submit without the log directory
+#   condor_submit extract_baseline.sub
+#
+# Override a default with -append (a plain `name=value` on the command line is
+# parsed BEFORE the file and therefore loses to the assignments below):
+#   condor_submit extract_baseline.sub -append 'repo_dir = /afs/cern.ch/user/o/oprostak/thesis-deliverables'
+# To split one slow batch over several jobs use extract_baseline_striped.sub.
+# Output: $(output_root)/baseline/batch{B}/baseline_batch{B}_job{J}.parquet,
+# next to datasets/parquet/{train,eval,test}.
+executable = run_extract_baseline.sh
+
+batch_root  = /eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau
+output_root = /eos/user/o/oprostak/tau_data/datasets/parquet/abcbatch_2024
+repo_dir    = $ENV(HOME)/thesis-deliverables
+
+arguments   = "$(batch) $(batch_root) $(output_root) 0 1"
+environment = "REPO_DIR=$(repo_dir)"
+
+output = logs/extract_baseline.$(ClusterId).$(Process).out
+error  = logs/extract_baseline.$(ClusterId).$(Process).err
+log    = logs/extract_baseline.$(ClusterId).$(Process).log
+
+request_memory = 4000
++JobFlavour = "workday"
+
+queue batch in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)

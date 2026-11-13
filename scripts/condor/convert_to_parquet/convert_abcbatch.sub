@@ -1,0 +1,29 @@
+# Model-input conversion of the abcbatch_2024 production: one job per batch.
+#
+#   mkdir -p logs            # condor refuses to submit without the log directory
+#   condor_submit convert_abcbatch.sub
+#
+# Override a default with -append (a plain `name=value` on the command line is
+# parsed BEFORE the file and therefore loses to the assignments below):
+#   condor_submit convert_abcbatch.sub -append 'repo_dir = /afs/cern.ch/user/o/oprostak/thesis-deliverables'
+#   condor_submit convert_abcbatch.sub -append 'output_root = /eos/user/o/oprostak/scratch/abcbatch_2024'
+# Batch 0 is also mirrored at /eos/user/v/valukash/new_tau_prod/abcbatch0_2024.
+# Output: $(output_root)/model/batch{B}/batch{B}_NNN.parquet, next to
+# datasets/parquet/{train,eval,test}.
+executable = run_convert_abcbatch.sh
+
+batch_root  = /eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau
+output_root = /eos/user/o/oprostak/tau_data/datasets/parquet/abcbatch_2024
+repo_dir    = $ENV(HOME)/thesis-deliverables
+
+arguments   = "$(batch) $(batch_root) $(output_root)"
+environment = "REPO_DIR=$(repo_dir)"
+
+output = logs/convert_abcbatch.$(ClusterId).$(Process).out
+error  = logs/convert_abcbatch.$(ClusterId).$(Process).err
+log    = logs/convert_abcbatch.$(ClusterId).$(Process).log
+
+request_memory = 8000
++JobFlavour = "workday"
+
+queue batch in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
