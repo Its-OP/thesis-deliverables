@@ -10,6 +10,7 @@ dependencies:
   - pip:
       - torch>=2.2
       - awkward>=2.6
+      - uproot>=5
       - PyYAML>=6.0
       - tqdm>=4.66
       - matplotlib>=3.8
