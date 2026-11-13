@@ -7,12 +7,15 @@
 # parsed BEFORE the file and therefore loses to the assignments below):
 #   condor_submit convert_abcbatch.sub -append 'repo_dir = /afs/cern.ch/user/o/oprostak/thesis-deliverables'
 #   condor_submit convert_abcbatch.sub -append 'output_root = /eos/user/o/oprostak/scratch/abcbatch_2024'
-# Batch 0 is also mirrored at /eos/user/v/valukash/new_tau_prod/abcbatch0_2024.
+# Ntuples: $(batch_root)/abcbatch{B}_2024/abcbatch{B}_2024_job{J}_ditaus_mc.root
+# (the group area .../phys_bphys/valukash/BdToKstarTauTau/abcbatch{B}_2024 holds
+# the CRAB MiniAOD step, not readable by these scripts). Only batch 0 is shared
+# so far: use convert_abcbatch_single.sub for a single batch.
 # Output: $(output_root)/model/batch{B}/batch{B}_NNN.parquet, next to
 # datasets/parquet/{train,eval,test}.
 executable = run_convert_abcbatch.sh
 
-batch_root  = /eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau
+batch_root  = /eos/user/v/valukash/new_tau_prod
 output_root = /eos/user/o/oprostak/tau_data/datasets/parquet/abcbatch_2024
 repo_dir    = $ENV(HOME)/thesis-deliverables
 

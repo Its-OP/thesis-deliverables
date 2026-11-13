@@ -4,7 +4,7 @@
 #
 # Arguments: BATCH BATCH_ROOT OUTPUT_ROOT [STRIPE N_STRIPES]
 #   BATCH        batch number B; input = $BATCH_ROOT/abcbatch${B}_2024
-#   BATCH_ROOT   /eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau
+#   BATCH_ROOT   /eos/user/v/valukash/new_tau_prod
 #   OUTPUT_ROOT  /eos/user/o/oprostak/tau_data/datasets/parquet/abcbatch_2024
 #                (next to datasets/parquet/{train,eval,test})
 #                -> $OUTPUT_ROOT/baseline/batch${B}/baseline_batch${B}_job${J}.parquet
@@ -20,7 +20,7 @@
 set -eo pipefail
 
 BATCH="${1:?batch number}"
-BATCH_ROOT="${2:-/eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau}"
+BATCH_ROOT="${2:-/eos/user/v/valukash/new_tau_prod}"
 OUTPUT_ROOT="${3:-/eos/user/o/oprostak/tau_data/datasets/parquet/abcbatch_2024}"
 STRIPE="${4:-0}"
 N_STRIPES="${5:-1}"

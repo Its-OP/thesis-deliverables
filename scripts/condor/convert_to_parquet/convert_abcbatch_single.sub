@@ -1,0 +1,29 @@
+# Model-input conversion of ONE abcbatch_2024 batch (default batch 0, the
+# only batch whose ntuples are shared so far).
+#
+#   mkdir -p logs
+#   condor_submit convert_abcbatch_single.sub                      # batch 0
+#   condor_submit convert_abcbatch_single.sub -append 'batch = 3'  # another batch
+#
+# The ntuples (abcbatch{B}_2024_job{J}_ditaus_mc.root) live under
+# /eos/user/v/valukash/new_tau_prod/abcbatch{B}_2024. The group area
+# /eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau/abcbatch{B}_2024
+# holds the CRAB MiniAOD step (miniaod_N.root), which these scripts cannot read.
+executable = run_convert_abcbatch.sh
+
+batch       = 0
+batch_root  = /eos/user/v/valukash/new_tau_prod
+output_root = /eos/user/o/oprostak/tau_data/datasets/parquet/abcbatch_2024
+repo_dir    = $ENV(HOME)/thesis-deliverables
+
+arguments   = "$(batch) $(batch_root) $(output_root)"
+environment = "REPO_DIR=$(repo_dir)"
+
+output = logs/convert_abcbatch_b$(batch).$(ClusterId).out
+error  = logs/convert_abcbatch_b$(batch).$(ClusterId).err
+log    = logs/convert_abcbatch_b$(batch).$(ClusterId).log
+
+request_memory = 8000
++JobFlavour = "workday"
+
+queue 1

@@ -4,7 +4,7 @@
 #
 # Arguments: BATCH BATCH_ROOT OUTPUT_ROOT
 #   BATCH        batch number B; input = $BATCH_ROOT/abcbatch${B}_2024
-#   BATCH_ROOT   /eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau
+#   BATCH_ROOT   /eos/user/v/valukash/new_tau_prod
 #   OUTPUT_ROOT  /eos/user/o/oprostak/tau_data/datasets/parquet/abcbatch_2024
 #                (next to datasets/parquet/{train,eval,test})
 #                -> $OUTPUT_ROOT/model/batch${B}/batch${B}_NNN.parquet
@@ -18,7 +18,7 @@
 set -eo pipefail
 
 BATCH="${1:?batch number}"
-BATCH_ROOT="${2:-/eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau}"
+BATCH_ROOT="${2:-/eos/user/v/valukash/new_tau_prod}"
 OUTPUT_ROOT="${3:-/eos/user/o/oprostak/tau_data/datasets/parquet/abcbatch_2024}"
 REPO_DIR="${REPO_DIR:-$HOME/thesis-deliverables}"
 
