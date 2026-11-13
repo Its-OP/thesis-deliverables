@@ -33,6 +33,6 @@ set -u
 
 python3 "$REPO_DIR/scripts/condor/convert_to_parquet/extract_baseline_blocks.py" \
     --input-dir "$BATCH_ROOT/abcbatch${BATCH}_2024" \
-    --pattern 'abcbatch*_job*_ditaus_mc.root' \
+    --pattern '**/abcbatch*_job*_ditaus_mc.root' \
     --output-dir "$OUTPUT_ROOT/baseline/batch${BATCH}" \
     --stripe "$STRIPE" --num-stripes "$N_STRIPES"

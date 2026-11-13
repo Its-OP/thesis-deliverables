@@ -354,6 +354,29 @@ def test_nan_fixture_copies_ids_and_skips_absent_blocks(tmp_path):
 
 
 @job0_required
+def test_discover_root_files_recursive(tmp_path):
+    nested = tmp_path / 'BdToKstarTauTau' / 'crab_abcbatch1' / '0000'
+    nested.mkdir(parents=True)
+    os.symlink(os.path.abspath(JOB0), nested / 'abcbatch1_2024_job5_ditaus_mc.root')
+    os.symlink(os.path.abspath(JOB0), tmp_path / 'abcbatch1_2024_job0_ditaus_mc.root')
+    recursive = converter.discover_root_files(str(tmp_path), '**/abcbatch*_job*_ditaus_mc.root')
+    assert [os.path.basename(path) for path in recursive] == [
+        'abcbatch1_2024_job0_ditaus_mc.root', 'abcbatch1_2024_job5_ditaus_mc.root']
+    flat = converter.discover_root_files(str(tmp_path), 'abcbatch*_job*_ditaus_mc.root')
+    assert [os.path.basename(path) for path in flat] == ['abcbatch1_2024_job0_ditaus_mc.root']
+
+
+@example_fixture_required
+def test_eval_only_requires_source_ids(tmp_path):
+    source_dir = tmp_path / 'source'
+    source_dir.mkdir()
+    os.symlink(os.path.abspath(EXAMPLE_FIXTURE), source_dir / 'merged_noBKstar_batch1.root')
+    with pytest.raises(ValueError, match='source ids'):
+        converter.convert(input_dir=str(source_dir), output_dir=str(tmp_path / 'out'),
+                          pattern='merged_noBKstar_batch1.root', shard_events=50, **EVAL_ONLY_KWARGS)
+
+
+@job0_required
 def test_convert_rejects_duplicate_batch_job_names(tmp_path):
     source_dir = tmp_path / 'source'
     source_dir.mkdir()

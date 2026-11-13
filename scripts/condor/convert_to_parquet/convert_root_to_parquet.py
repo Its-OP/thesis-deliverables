@@ -409,7 +409,8 @@ def discover_root_files(input_dir, pattern='merged_noBKstar_batch*.root'):
 
     Args:
         input_dir: Directory containing ROOT files.
-        pattern: Glob pattern for matching files.
+        pattern: Glob pattern for matching files; '**/' prefixes descend
+            into subdirectories (CRAB-style nested productions).
 
     Returns:
         List of file paths sorted by event_identity.file_sort_key (merged
@@ -418,7 +419,7 @@ def discover_root_files(input_dir, pattern='merged_noBKstar_batch*.root'):
     Raises:
         FileNotFoundError: If no matching files are found.
     """
-    matches = glob.glob(os.path.join(input_dir, pattern))
+    matches = glob.glob(os.path.join(input_dir, pattern), recursive=True)
     if not matches:
         raise FileNotFoundError(
             f'No ROOT files matching "{pattern}" found in {input_dir}'
@@ -1485,6 +1486,11 @@ def convert(input_dir, output_dir, train_events, val_events,
         identity_origin = event_identity.source_ids(
             tree, root_filepath, 0, min(1, number_of_entries)).origin
         print(f'  identity: source ids from {identity_origin}')
+        if eval_only and identity_origin == 'missing':
+            raise ValueError(
+                f'{basename}: eval-only conversion needs source ids (the '
+                f'source_batch_id/source_microbatch_id branches, or a job token '
+                f'in the file name); without them the event keys would collide')
         check_optional_branches(tree, optional_blocks, basename)
 
         for chunk_start in range(0, number_of_entries, chunk_size):

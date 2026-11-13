@@ -414,6 +414,11 @@ def extract_file(path, output_path, entry_stop=None, chunk_size=100, pt_cutoff=0
     entry_stop entries (all when None) in windows of chunk_size. Returns the
     number of rows written (one per entry)."""
     tree = converter.load_root_tree(path)
+    origin = event_identity.source_ids(tree, path, 0, min(1, tree.num_entries)).origin
+    if origin == 'missing':
+        raise ValueError(f'{os.path.basename(path)}: no source ids (source_batch_id/'
+                         f'source_microbatch_id branches or a job token in the file name); '
+                         f'the event keys would collide')
     n_entries = tree.num_entries if entry_stop is None else min(int(entry_stop), tree.num_entries)
     cutflow_branches = cutflow_branches_of(tree)
     chunks = [build_chunk_table(tree, path, start, min(start + chunk_size, n_entries),

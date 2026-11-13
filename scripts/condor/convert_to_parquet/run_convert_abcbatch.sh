@@ -29,7 +29,7 @@ set -u
 
 python3 "$REPO_DIR/scripts/condor/convert_to_parquet/convert_root_to_parquet.py" \
     --input-dir "$BATCH_ROOT/abcbatch${BATCH}_2024" \
-    --pattern 'abcbatch*_job*_ditaus_mc.root' \
+    --pattern '**/abcbatch*_job*_ditaus_mc.root' \
     --extended --eval-only --shard-events 5000 \
     --output-dir "$OUTPUT_ROOT/model" \
     --val-subdir "batch${BATCH}"

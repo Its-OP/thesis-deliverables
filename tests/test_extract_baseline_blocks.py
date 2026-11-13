@@ -291,6 +291,18 @@ def test_extract_file_writes_atomically(tmp_path):
     assert len(ak.from_parquet(str(output))) == 20
 
 
+EXAMPLE_FIXTURE = os.path.join(ROOT, '..', 'part', 'data', 'low-pt', 'example_root.root')
+
+
+@pytest.mark.skipif(not os.path.exists(EXAMPLE_FIXTURE), reason='example_root.root not present')
+def test_extract_file_requires_source_ids(tmp_path):
+    link = tmp_path / 'merged_noBKstar_batch1.root'
+    os.symlink(os.path.abspath(EXAMPLE_FIXTURE), link)
+    with pytest.raises(ValueError, match='source ids'):
+        extractor.extract_file(str(link), str(tmp_path / 'out.parquet'), entry_stop=5)
+    assert not (tmp_path / 'out.parquet').exists()
+
+
 def test_output_name_for():
     assert extractor.output_name_for('/x/abcbatch0_2024_job305_ditaus_mc.root') == 'baseline_batch0_job305.parquet'
     assert extractor.output_name_for('/x/abcbatch7_2024_job4_ditaus_mc.root') == 'baseline_batch7_job4.parquet'
