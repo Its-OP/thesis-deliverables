@@ -55,6 +55,34 @@ def test_numbers_from_filename():
     assert [event_identity.job_number_from_filename(name) for name in ordered] == [0, 58, 67, 305]
 
 
+def test_numbers_from_crab_layout():
+    path = ('/eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau/abcbatch1_2024/BdToKstarTauTau/'
+            'crab_abcbatch1_2024_BdToKstarTauTau_20261030_161621/261030_151701/0000/miniaod_10.root')
+    assert event_identity.batch_number_from_filename(path) == 1
+    assert event_identity.job_number_from_filename(path) == 10
+    assert event_identity.file_sort_key(path) == (1, 10)
+    assert event_identity.job_number_from_filename('/x/abcbatch7_2024/0000/step1_7.root') == 7
+    assert event_identity.batch_number_from_filename('/x/abcbatch7_2024/0000/step1_7.root') == 7
+    assert event_identity.job_number_from_filename('step_MINI_10_nano_ditaus_mc.root') is None
+    assert event_identity.job_number_from_filename('merged_noBKstar_batch12.root') is None
+    assert event_identity.job_number_from_filename('nan_covariance_fixture.root') is None
+    assert event_identity.batch_number_from_filename('/data/batch3_2024/x.root') is None
+
+
+@job0_required
+def test_source_ids_from_crab_layout(tmp_path):
+    nested = tmp_path / 'abcbatch3_2024' / 'BdToKstarTauTau' / 'crab_x' / '0000'
+    nested.mkdir(parents=True)
+    link = nested / 'miniaod_7.root'
+    os.symlink(os.path.abspath(JOB0), link)
+    tree = uproot.open(str(link))['Events']
+    ids = event_identity.source_ids(tree, str(link), 0, 5)
+    assert ids.origin == 'filename'
+    assert ids.batch.tolist() == [3] * 5
+    assert ids.job.tolist() == [7] * 5
+    assert ids.microbatch.tolist() == [700000 + entry for entry in range(5)]
+
+
 def test_encode_decode_microbatch_id():
     assert event_identity.encode_microbatch_id(305, 42) == 30500042
     encoded = event_identity.encode_microbatch_id(305, np.arange(5))

@@ -25,9 +25,10 @@ from collections import namedtuple
 
 import numpy as np
 
-BATCH_NUMBER_PATTERN = re.compile(r'abcbatch(\d+)')
-FALLBACK_BATCH_PATTERN = re.compile(r'batch(\d+)')
-JOB_NUMBER_PATTERN = re.compile(r'job(\d+)')
+BATCH_NUMBER_PATTERN = re.compile(r'abcbatch(\d+)')      # anywhere in the path
+FALLBACK_BATCH_PATTERN = re.compile(r'batch(\d+)')       # file name only (merged production)
+JOB_NUMBER_PATTERN = re.compile(r'job(\d+)')             # abcbatch ntuplizer files
+FILE_NUMBER_PATTERN = re.compile(r'_(\d+)\.root$')       # CRAB outputs: miniaod_<N>.root, step1_<N>.root
 ENTRIES_PER_JOB_LIMIT = 100_000
 INT32_MAX = 2 ** 31 - 1
 MISSING_SOURCE_ID = -1
@@ -47,16 +48,20 @@ SourceIds = namedtuple('SourceIds', ['batch', 'microbatch', 'job', 'entry', 'ori
 
 
 def batch_number_from_filename(path):
-    """path: str. Returns the batch number from an ``abcbatch<N>`` token,
-    else from a ``batch<N>`` token, else None."""
-    basename = os.path.basename(path)
-    match = BATCH_NUMBER_PATTERN.search(basename) or FALLBACK_BATCH_PATTERN.search(basename)
+    """path: str. Returns the batch number from the first ``abcbatch<N>``
+    token anywhere in the path (file name or a parent directory), else
+    from a ``batch<N>`` token in the file name, else None."""
+    match = (BATCH_NUMBER_PATTERN.search(os.path.normpath(path))
+             or FALLBACK_BATCH_PATTERN.search(os.path.basename(path)))
     return int(match.group(1)) if match else None
 
 
 def job_number_from_filename(path):
-    """path: str. Returns the number of the ``job<N>`` token, else None."""
-    match = JOB_NUMBER_PATTERN.search(os.path.basename(path))
+    """path: str. Returns the number of the ``job<N>`` token of the file
+    name, else the trailing ``_<N>.root`` number of a CRAB output, else
+    None."""
+    basename = os.path.basename(path)
+    match = JOB_NUMBER_PATTERN.search(basename) or FILE_NUMBER_PATTERN.search(basename)
     return int(match.group(1)) if match else None
 
 

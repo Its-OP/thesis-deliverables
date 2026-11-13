@@ -6,6 +6,10 @@
 #   mkdir -p logs
 #   condor_submit regenerate_abcbatch.sub
 #   condor_submit regenerate_abcbatch.sub -append 'repo_dir = /afs/cern.ch/user/o/oprostak/thesis-deliverables'
+#   group-area CRAB layout (abcbatch{B}_2024/BdToKstarTauTau/crab_*/*/0000/<name>_<N>.root):
+#   condor_submit regenerate_abcbatch.sub \
+#       -append 'batch_root = /eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau' \
+#       -append 'pattern = **/miniaod_*.root'
 #
 # The train job reads about 2,800 files sequentially: "tomorrow" flavour (24 h).
 executable = run_regenerate_abcbatch.sh
@@ -13,8 +17,9 @@ executable = run_regenerate_abcbatch.sh
 batch_root  = /eos/user/v/valukash/new_tau_prod
 output_dir  = /eos/user/o/oprostak/tau_data/datasets/parquet
 repo_dir    = $ENV(HOME)/thesis-deliverables
+pattern     = **/abcbatch*_job*_ditaus_mc.root
 
-arguments   = "$(split) '$(batches)' $(shard_events) $(batch_root) $(output_dir)"
+arguments   = "$(split) '$(batches)' $(shard_events) $(batch_root) $(output_dir) '$(pattern)'"
 environment = "REPO_DIR=$(repo_dir)"
 
 output = logs/regenerate_$(split).$(ClusterId).out
