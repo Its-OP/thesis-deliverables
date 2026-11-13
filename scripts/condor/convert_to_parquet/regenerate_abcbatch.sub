@@ -1,0 +1,31 @@
+# Regenerate the whole dataset from the abcbatch_2024 ntuples: three jobs,
+#   train = batches 1-8, eval = batch 9, test = batch 0,
+# into /eos/user/o/oprostak/tau_data/datasets/parquet/{train,eval,test}
+# (shards OVERWRITTEN; clear the three directories first).
+#
+#   mkdir -p logs
+#   condor_submit regenerate_abcbatch.sub
+#   condor_submit regenerate_abcbatch.sub -append 'repo_dir = /afs/cern.ch/user/o/oprostak/thesis-deliverables'
+#
+# The train job reads about 2,800 files sequentially: "tomorrow" flavour (24 h).
+executable = run_regenerate_abcbatch.sh
+
+batch_root  = /eos/user/v/valukash/new_tau_prod
+output_dir  = /eos/user/o/oprostak/tau_data/datasets/parquet
+repo_dir    = $ENV(HOME)/thesis-deliverables
+
+arguments   = "$(split) '$(batches)' $(shard_events) $(batch_root) $(output_dir)"
+environment = "REPO_DIR=$(repo_dir)"
+
+output = logs/regenerate_$(split).$(ClusterId).out
+error  = logs/regenerate_$(split).$(ClusterId).err
+log    = logs/regenerate_$(split).$(ClusterId).log
+
+request_memory = 8000
++JobFlavour = "tomorrow"
+
+queue split, batches, shard_events from (
+  train, 1 2 3 4 5 6 7 8, 25000
+  eval, 9, 5000
+  test, 0, 5000
+)

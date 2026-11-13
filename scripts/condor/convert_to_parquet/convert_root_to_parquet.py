@@ -408,7 +408,8 @@ def discover_root_files(input_dir, pattern='merged_noBKstar_batch*.root'):
     """Find and sort ROOT files numerically by (batch number, job number).
 
     Args:
-        input_dir: Directory containing ROOT files.
+        input_dir: Directory containing ROOT files, or a list of such
+            directories (e.g. the batch directories of one production).
         pattern: Glob pattern for matching files; '**/' prefixes descend
             into subdirectories (CRAB-style nested productions).
 
@@ -419,10 +420,12 @@ def discover_root_files(input_dir, pattern='merged_noBKstar_batch*.root'):
     Raises:
         FileNotFoundError: If no matching files are found.
     """
-    matches = glob.glob(os.path.join(input_dir, pattern), recursive=True)
+    input_dirs = [input_dir] if isinstance(input_dir, str) else list(input_dir)
+    matches = [path for directory in input_dirs
+               for path in glob.glob(os.path.join(directory, pattern), recursive=True)]
     if not matches:
         raise FileNotFoundError(
-            f'No ROOT files matching "{pattern}" found in {input_dir}'
+            f'No ROOT files matching "{pattern}" found in {input_dirs}'
         )
 
     matches.sort(key=event_identity.file_sort_key)
@@ -1352,7 +1355,8 @@ def convert(input_dir, output_dir, train_events, val_events,
     as soon as a shard's worth of events is collected.
 
     Args:
-        input_dir: Directory containing merged_noBKstar_batch*.root files.
+        input_dir: Directory containing the ROOT files, or a list of
+            directories (e.g. several batch directories of one production).
         output_dir: Base output directory (creates train/ and val/ subdirs).
         train_events: Total number of training events to collect.
         val_events: Total number of validation events to collect.
@@ -1451,6 +1455,8 @@ def convert(input_dir, output_dir, train_events, val_events,
         print(f'Optional blocks: {sorted(optional_blocks) or "none"}')
 
     print(f'Found {len(root_files)} ROOT files in {input_dir}')
+    if not isinstance(input_dir, str):
+        print(f'  from {len(input_dir)} input directories')
     print(f'Extracting {len(track_branch_map)} track columns')
     print(f'pT cutoff: >= {pt_cutoff} GeV | Required GT pions: {required_gt_pions}')
     if eval_only:
@@ -1707,9 +1713,10 @@ def main():
 
     # Input / output paths
     parser.add_argument(
-        '--input-dir',
-        default='/eos/user/o/oprostak/tau_data/root1',
-        help='Directory containing merged_noBKstar_batch*.root files (default: %(default)s)',
+        '--input-dir', nargs='+',
+        default=['/eos/user/o/oprostak/tau_data/root1'],
+        help='Directory (or several directories, e.g. the batch directories of '
+             'one production) holding the ROOT files (default: %(default)s)',
     )
     parser.add_argument(
         '--output-dir',

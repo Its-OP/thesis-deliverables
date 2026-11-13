@@ -366,6 +366,47 @@ def test_discover_root_files_recursive(tmp_path):
     assert [os.path.basename(path) for path in flat] == ['abcbatch1_2024_job0_ditaus_mc.root']
 
 
+@four_files_required
+def test_discover_root_files_several_input_dirs(tmp_path):
+    first = tmp_path / 'abcbatch0_2024'
+    second = tmp_path / 'abcbatch1_2024'
+    first.mkdir()
+    second.mkdir()
+    os.symlink(FOUR_FILES[0], first / os.path.basename(FOUR_FILES[0]))
+    os.symlink(FOUR_FILES[1], first / os.path.basename(FOUR_FILES[1]))
+    for path in FOUR_FILES[2:]:
+        os.symlink(path, second / os.path.basename(path).replace('abcbatch0_', 'abcbatch1_'))
+    files = converter.discover_root_files([str(second), str(first)], PATTERN)
+    assert [os.path.basename(path) for path in files] == [
+        'abcbatch0_2024_job0_ditaus_mc.root', 'abcbatch0_2024_job305_ditaus_mc.root',
+        'abcbatch1_2024_job58_ditaus_mc.root', 'abcbatch1_2024_job67_ditaus_mc.root']
+    assert converter.discover_root_files(str(first), PATTERN) == files[:2]
+    with pytest.raises(FileNotFoundError):
+        converter.discover_root_files([str(tmp_path / 'empty_a'), str(tmp_path / 'empty_b')], PATTERN)
+
+
+@four_files_required
+def test_eval_only_over_several_input_dirs(tmp_path):
+    first = tmp_path / 'abcbatch0_2024'
+    second = tmp_path / 'abcbatch1_2024'
+    first.mkdir()
+    second.mkdir()
+    os.symlink(FOUR_FILES[0], first / os.path.basename(FOUR_FILES[0]))
+    os.symlink(FOUR_FILES[1], first / os.path.basename(FOUR_FILES[1]))
+    for path in FOUR_FILES[2:]:
+        os.symlink(path, second / os.path.basename(path).replace('abcbatch0_', 'abcbatch1_'))
+    output_dir = tmp_path / 'parquet'
+    converter.convert(input_dir=[str(first), str(second)], output_dir=str(output_dir),
+                      pattern=PATTERN, shard_events=5000,
+                      **{**EVAL_ONLY_KWARGS, 'val_subdir': 'train'})
+    files, rows = _all_rows(str(output_dir), 'train')
+    assert [os.path.basename(path) for path in files] == ['train_000.parquet']
+    assert len(rows) == 277
+    assert sorted(set(zip(ak.to_numpy(rows['source_batch_id']).tolist(),
+                          ak.to_numpy(rows['event_source_job']).tolist()))) == [
+        (0, 0), (0, 305), (1, 58), (1, 67)]
+
+
 @example_fixture_required
 def test_eval_only_requires_source_ids(tmp_path):
     source_dir = tmp_path / 'source'
