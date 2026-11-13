@@ -84,3 +84,26 @@ def test_merged_jagged_content_roundtrip(merged_path):
     source_soft_id = uproot.open(EXAMPLE)['Events']['Muon_softId'].array()
     assert ak.to_list(ak.values_astype(merged_soft_id, np.int32)) == \
         ak.to_list(ak.values_astype(source_soft_id, np.int32))
+
+
+# Inputs of the CERN TauTo3PiBuilder emulation (convert --builder-blocks).
+BUILDER_BRANCHES = [
+    'KstarToPiK_trk1_idx', 'KstarToPiK_trk2_idx', 'KstarToPiK_pt',
+    'TauTo3Pi_idx1', 'TauTo3Pi_idx2', 'TauTo3Pi_idx3',
+    'TauTo3Pi_vprob', 'TauTo3Pi_v4trkprob', 'TauTo3Pi_fit_pt',
+    'TauTo3Pi_mass', 'TauTo3Pi_vx', 'TauTo3Pi_vy', 'TauTo3Pi_vz',
+    'TauTo3Pi_declen_sig',
+    'BeamSpot_x', 'BeamSpot_y', 'BeamSpot_z',
+]
+
+
+def test_merged_keeps_builder_branches(merged_path):
+    assert set(BUILDER_BRANCHES) <= set(KEEP_BRANCHES)
+    tree = uproot.open(merged_path)['Events']
+    missing = set(BUILDER_BRANCHES) - set(tree.keys())
+    assert not missing, f'builder branches lost at merge: {sorted(missing)}'
+    source = uproot.open(EXAMPLE)['Events']
+    for branch in ('KstarToPiK_trk1_idx', 'KstarToPiK_pt', 'TauTo3Pi_idx1',
+                   'TauTo3Pi_vprob', 'BeamSpot_x'):
+        assert ak.to_list(tree[branch].array(entry_stop=100)) == \
+            ak.to_list(source[branch].array()), branch

@@ -11,6 +11,9 @@ Keeps only the branches needed by convert_root_to_parquet.py --extended:
   - Track_pdgId: used for pion filtering (|pdgId| == 211)
   - Muon collection: the H6.M branch set
   - SV collection: the H6.S branch set
+  - TauTo3PiBuilder emulation inputs (convert --builder-blocks): the K*
+    pair table (track indices + pT), the builder's TauTo3Pi output block
+    and the beam spot
 
 The source_batch_id and source_microbatch_id columns are derived from
 the input file path. Together with ``(run, event, luminosityBlock)``
@@ -70,6 +73,13 @@ KEEP_BRANCHES = [
     # Secondary-vertex collection (H6.S)
     'SV_x', 'SV_y', 'SV_z', 'SV_dlen', 'SV_dlenSig', 'SV_pAngle',
     'SV_mass', 'SV_ntracks', 'SV_chi2', 'SV_dxySig',
+    # TauTo3PiBuilder emulation inputs (convert --builder-blocks)
+    'KstarToPiK_trk1_idx', 'KstarToPiK_trk2_idx', 'KstarToPiK_pt',
+    'TauTo3Pi_idx1', 'TauTo3Pi_idx2', 'TauTo3Pi_idx3',
+    'TauTo3Pi_vprob', 'TauTo3Pi_v4trkprob', 'TauTo3Pi_fit_pt',
+    'TauTo3Pi_mass', 'TauTo3Pi_vx', 'TauTo3Pi_vy', 'TauTo3Pi_vz',
+    'TauTo3Pi_declen_sig',
+    'BeamSpot_x', 'BeamSpot_y', 'BeamSpot_z',
 ]
 
 # Regex to extract microbatch id from filename:
@@ -131,10 +141,12 @@ def merge_batch(batch_id, files, output):
 def main():
     batch_id = int(sys.argv[1])
 
-    # Extended-schema merge output. Distinct filename prefix (merged_ext_) so
-    # the skip-if-exists guard can never collide with legacy merged files.
+    # Builder-schema merge output (extended branches + the TauTo3PiBuilder
+    # emulation inputs). Distinct filename prefix (merged_bld_) so the
+    # skip-if-exists guard can never collide with the merged_ext_ / legacy
+    # merged files, which lack the K*/TauTo3Pi/BeamSpot branches.
     output = os.path.join(BASE_DIR, "datasets", "root", "train_eval",
-                          f"merged_ext_batch{batch_id}.root")
+                          f"merged_bld_batch{batch_id}.root")
 
     if os.path.exists(output):
         print(f"batch{batch_id}: already exists, skipping -> {output}")
