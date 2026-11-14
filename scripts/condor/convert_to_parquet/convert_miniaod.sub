@@ -1,0 +1,40 @@
+# Dataset straight from the CRAB MiniAOD files of the abcbatch_2024 production:
+# one job per batch directory, train = batches 1-8, eval = 9, test = 0.
+#
+#   mkdir -p logs            # condor refuses to submit without the log directory
+#   condor_submit convert_miniaod.sub
+#
+# Override a default with -append (a plain `name=value` on the command line is
+# parsed BEFORE the file and therefore loses to the assignments below):
+#   condor_submit convert_miniaod.sub -append 'track_selection = all' -append 'output_dir = /eos/user/o/oprostak/tau_data/datasets/parquet_miniaod_v1_alltracks'
+# Input:  $(batch_root)/abcbatch{B}_2024/**/miniaod_*.root
+# Output: $(output_dir)/{train,eval,test}/{split}_b{B}_NNN.parquet
+executable = run_convert_miniaod.sh
+
+batch_root      = /eos/cms/store/group/phys_bphys/valukash/BdToKstarTauTau
+output_dir      = /eos/user/o/oprostak/tau_data/datasets/parquet_miniaod_v1
+track_selection = from_pv
+repo_dir        = $ENV(HOME)/thesis-deliverables
+
+arguments   = "$(split) $(batch) $(batch_root) $(output_dir) $(track_selection)"
+environment = "REPO_DIR=$(repo_dir)"
+
+output = logs/convert_miniaod.$(ClusterId).$(Process).out
+error  = logs/convert_miniaod.$(ClusterId).$(Process).err
+log    = logs/convert_miniaod.$(ClusterId).$(Process).log
+
+request_memory = 8000
++JobFlavour = "workday"
+
+queue split, batch from (
+    train 1
+    train 2
+    train 3
+    train 4
+    train 5
+    train 6
+    train 7
+    train 8
+    eval 9
+    test 0
+)

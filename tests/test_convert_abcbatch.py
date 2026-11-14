@@ -451,3 +451,36 @@ def test_build_output_table_emits_source_detail_columns():
     assert output['source_microbatch_id'].tolist() == [0, 1]
     assert output['event_source_job'].dtype == np.int32
     assert output['event_source_entry'].dtype == np.int32
+
+
+@job0_required
+def test_track_selection_from_pv_needs_the_branch():
+    tree = converter.load_root_tree(JOB0)
+    branch_map = converter.build_track_branch_map(converter.EXTENDED_TRACK_COLUMNS)
+    with pytest.raises(ValueError, match='Track_fromPV'):
+        converter.read_and_filter_pion_tracks(tree, branch_map, 0, 5, track_selection='from_pv')
+
+
+@job0_required
+def test_shard_prefix_renames_the_shards_only(job0_model_dir, tmp_path):
+    converter.convert(input_dir=ABCBATCH_DIR, output_dir=str(tmp_path),
+                      pattern='abcbatch0_2024_job0_ditaus_mc.root', shard_events=50,
+                      shard_prefix='test_b0', **EVAL_ONLY_KWARGS)
+    files, rows = _all_rows(tmp_path)
+    assert [os.path.basename(path) for path in files] == ['test_b0_000.parquet', 'test_b0_001.parquet']
+    _, reference = _all_rows(job0_model_dir)
+    assert rows.fields == reference.fields
+    assert ak.to_list(rows['track_pt']) == ak.to_list(reference['track_pt'])
+
+
+@job0_required
+def test_prefixed_run_validates_only_its_own_shards(tmp_path):
+    """Several condor jobs write into one split directory: a half-written
+    shard of another job must not fail this run's validation."""
+    split_dir = tmp_path / 'model'
+    split_dir.mkdir()
+    (split_dir / 'train_b9_000.parquet').write_bytes(b'shard of another job, still being written')
+    converter.convert(input_dir=ABCBATCH_DIR, output_dir=str(tmp_path),
+                      pattern='abcbatch0_2024_job0_ditaus_mc.root', shard_events=50,
+                      shard_prefix='test_b0', **EVAL_ONLY_KWARGS)
+    assert sorted(os.listdir(split_dir)) == ['test_b0_000.parquet', 'test_b0_001.parquet', 'train_b9_000.parquet']

@@ -64,6 +64,8 @@ import awkward as ak
 import uproot
 
 import event_identity  # sibling module: composite event key (batch / job / entry)
+import miniaod_reader  # sibling module: raw MiniAOD reader (imports ROOT only when a MiniAOD file is read)
+import miniaod_source  # sibling module: MiniAOD file as an ntuple-like Events tree
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +372,45 @@ KSTAR_SELECTED_BRANCH_MAP = {
     'KstarToPiK_trk2_idx': 'event_kstar_selected_track2_root_index',
 }
 KSTAR_SELECTED_INTEGER_COLUMNS = set(KSTAR_SELECTED_BRANCH_MAP.values())
+# Blocks only the MiniAOD source provides (miniaod_source.py): vertex
+# association, anchor-muon and generator-match columns per track, trigger
+# and anchor flags per muon, trigger / pileup / beam-spot scalars per event,
+# and the K* candidate distances. Trigger bit i = path i of
+# miniaod_source.MUON_TRIGGER_PATHS.
+MINIAOD_TRACK_BRANCH_MAP = {
+    'Track_fromPV': 'track_from_pv',
+    'Track_pvAssocQuality': 'track_pv_association_quality',
+    'Track_pvIdx': 'track_pv_index',
+    'Track_lostInnerHits': 'track_lost_inner_hits',
+    'Track_puppiWeight': 'track_puppi_weight',
+    'Track_covLamDsz': 'track_covariance_lambda_dsz',
+    'Track_dzTrg': 'track_dz_to_anchor_muon',
+    'Track_genMatchDr': 'track_gen_match_delta_r',
+    'Track_genAssocIdx': 'track_gen_association_index',
+}
+MINIAOD_TRACK_INTEGER_COLUMNS = {
+    'track_from_pv', 'track_pv_association_quality', 'track_pv_index', 'track_lost_inner_hits',
+    'track_gen_association_index',
+}
+MINIAOD_MUON_BRANCH_MAP = {
+    'Muon_isPFcand': 'muon_is_pf',
+    'Muon_triggerBits': 'muon_trigger_bits',
+    'Muon_isAnchor': 'muon_is_anchor',
+}
+MINIAOD_EVENT_BRANCH_MAP = {
+    'Trigger_bits': 'event_trigger_bits',
+    'Trigger_firedAny': 'event_fired_any_muon_path',
+    'Trigger_firedIP6': 'event_fired_ip6',
+    'Pileup_nTrueInt': 'event_n_true_interactions',
+    'BeamSpot_x': 'event_beam_spot_x',
+    'BeamSpot_y': 'event_beam_spot_y',
+    'BeamSpot_z': 'event_beam_spot_z',
+}
+MINIAOD_EVENT_INTEGER_COLUMNS = {'event_trigger_bits', 'event_fired_any_muon_path', 'event_fired_ip6'}
+MINIAOD_KSTAR_BRANCH_MAP = {
+    'KstarToPiKAll_muon_dca': 'kstar_muon_dca',
+    'KstarToPiKAll_pair_dca': 'kstar_pair_dca',
+}
 # block name -> (ROOT branch -> column map, integer column names)
 OPTIONAL_BLOCKS = {
     'track': (OPTIONAL_TRACK_BRANCH_MAP, OPTIONAL_TRACK_INTEGER_COLUMNS),
@@ -380,7 +421,31 @@ OPTIONAL_BLOCKS = {
     'muon_truth': (OPTIONAL_MUON_BRANCH_MAP, OPTIONAL_MUON_INTEGER_COLUMNS),
     'kstar_all': (KSTAR_ALL_BRANCH_MAP, KSTAR_ALL_INTEGER_COLUMNS),
     'kstar_selected': (KSTAR_SELECTED_BRANCH_MAP, KSTAR_SELECTED_INTEGER_COLUMNS),
+    'track_miniaod': (MINIAOD_TRACK_BRANCH_MAP, MINIAOD_TRACK_INTEGER_COLUMNS),
+    'muon_miniaod': (MINIAOD_MUON_BRANCH_MAP, set(MINIAOD_MUON_BRANCH_MAP.values())),
+    'event_miniaod': (MINIAOD_EVENT_BRANCH_MAP, MINIAOD_EVENT_INTEGER_COLUMNS),
+    'kstar_miniaod': (MINIAOD_KSTAR_BRANCH_MAP, set()),
 }
+# Blocks that ride the track branch map (filtered with the tracks) and
+# blocks of per-event scalars.
+PER_TRACK_OPTIONAL_BLOCKS = ('track', 'track_miniaod')
+EVENT_SCALAR_OPTIONAL_BLOCKS = ('event_scalar', 'event_miniaod')
+# List whose length each jagged optional block must share (default: the
+# block's own first column).
+OPTIONAL_BLOCK_LENGTH_REFERENCE = {
+    'track': 'track_pt', 'track_miniaod': 'track_pt', 'muon_truth': 'muon_pt', 'muon_miniaod': 'muon_pt',
+    'event_jagged': 'event_other_pv_z', 'kstar_miniaod': 'kstar_track1_root_index',
+}
+
+# Track selections (--track-selection): every pion track, or only those not
+# used in the fit of another primary vertex (Track_fromPV > 0, the pool of
+# the collaborator's ntuple; MiniAOD input only).
+TRACK_SELECTIONS = ('all', 'from_pv')
+FROM_PV_BRANCH = 'Track_fromPV'
+
+# A MiniAOD run skips unreadable input files (CRAB leftovers, storage
+# errors) and fails only above this fraction of the files.
+MAXIMUM_UNREADABLE_FRACTION = 0.02
 
 TRACK_INTEGER_COLUMNS = {
     'track_charge', 'track_n_valid_hits',
@@ -388,7 +453,7 @@ TRACK_INTEGER_COLUMNS = {
     'track_is_lost', 'track_is_matched_to_muon',
     'track_is_matched_to_ele', 'track_label_from_b',
     TRACK_ROOT_INDEX_COLUMN,
-} | OPTIONAL_TRACK_INTEGER_COLUMNS
+} | OPTIONAL_TRACK_INTEGER_COLUMNS | MINIAOD_TRACK_INTEGER_COLUMNS
 
 # The H6-extension float columns of the kept-track block. These are NOT
 # covered by the legacy clean-event mask (frozen to LEGACY_CLEAN_BRANCHES
@@ -443,7 +508,9 @@ def load_root_tree(filepath):
         filepath: Path to the ROOT file.
 
     Returns:
-        An uproot TTree object for the Events tree.
+        An uproot TTree object for the Events tree of an ntuple; for a
+        MiniAOD file a miniaod_source.MiniAODTree, which exposes the same
+        keys() / num_entries / arrays() with the ntuple's branch names.
 
     Raises:
         FileNotFoundError: If the ROOT file does not exist.
@@ -461,11 +528,18 @@ def load_root_tree(filepath):
             f'Available keys: {available_keys}'
         )
 
-    return root_file[ROOT_TREE_NAME]
+    tree = root_file[ROOT_TREE_NAME]
+    if miniaod_reader.is_miniaod_tree(tree):
+        return miniaod_source.MiniAODTree(filepath, num_entries=tree.num_entries)
+    return tree
 
 
-def read_and_filter_pion_tracks(tree, track_branch_map, entry_start=None, entry_stop=None):
+def read_and_filter_pion_tracks(tree, track_branch_map, entry_start=None, entry_stop=None,
+                                track_selection='all'):
     """Read Track branches and filter to keep only charged pions (|pdgId| == 211).
+
+    With track_selection='from_pv' only the pions with Track_fromPV > 0
+    are kept (a tree without that branch raises ValueError).
 
     The filtering applies a boolean mask per event, so the output jagged arrays
     have variable length (only pion entries survive).
@@ -485,10 +559,18 @@ def read_and_filter_pion_tracks(tree, track_branch_map, entry_start=None, entry_
           - filtered_data: dict mapping ROOT branch names to filtered awkward arrays.
           - clean_event_mask: boolean numpy array (True = event is clean).
     """
+    if track_selection not in TRACK_SELECTIONS:
+        raise ValueError(f'track_selection must be one of {TRACK_SELECTIONS}, got {track_selection!r}')
+    if track_selection == 'from_pv' and FROM_PV_BRANCH not in tree.keys():
+        raise ValueError(f"track_selection='from_pv' needs the {FROM_PV_BRANCH} branch "
+                         f'(MiniAOD input); this tree does not have it')
+
     # Read all track branches needed, plus pdgId and eta for filtering
     branches_to_read = list(track_branch_map.keys()) + ['Track_pdgId']
     if 'Track_eta' not in branches_to_read:
         branches_to_read.append('Track_eta')
+    if track_selection == 'from_pv' and FROM_PV_BRANCH not in branches_to_read:
+        branches_to_read.append(FROM_PV_BRANCH)
     track_data = tree.arrays(
         expressions=branches_to_read,
         entry_start=entry_start,
@@ -554,6 +636,8 @@ def read_and_filter_pion_tracks(tree, track_branch_map, entry_start=None, entry_
 
     # Filter: keep only charged pions where |pdgId| == 211
     pion_mask = abs(track_data['Track_pdgId']) == PION_PDG_ID
+    if track_selection == 'from_pv':
+        pion_mask = pion_mask & (track_data[FROM_PV_BRANCH] > 0)
 
     filtered_data = {}
     for root_branch_name in track_branch_map:
@@ -732,10 +816,10 @@ def check_optional_branches(tree, optional_blocks, basename):
 def read_optional_collections(tree, clean_event_mask, entry_start, entry_stop,
                               optional_blocks):
     """Reads the resolved event-level optional blocks (everything but the
-    per-track block, which rides the track branch map), masked to clean
+    per-track blocks, which ride the track branch map), masked to clean
     events. Returns a dict of output-named, cast, sanitized columns; the
     selected-K* pair becomes two int32 scalars (-1 without a pair)."""
-    event_blocks = [name for name in optional_blocks if name != 'track']
+    event_blocks = [name for name in optional_blocks if name not in PER_TRACK_OPTIONAL_BLOCKS]
     if not event_blocks:
         return {}
     branches = [branch for name in event_blocks for branch in optional_blocks[name]]
@@ -748,10 +832,10 @@ def read_optional_collections(tree, clean_event_mask, entry_start, entry_stop,
     for name in event_blocks:
         branch_map = optional_blocks[name]
         integer_columns = OPTIONAL_BLOCKS[name][1]
-        if name == 'event_scalar':
+        if name in EVENT_SCALAR_OPTIONAL_BLOCKS:
             for branch, column in branch_map.items():
-                result[column] = \
-                    ak.to_numpy(data[branch])[clean_event_mask].astype(np.float32)
+                result[column] = ak.to_numpy(data[branch])[clean_event_mask].astype(
+                    np.int32 if column in integer_columns else np.float32)
         elif name == 'kstar_selected':
             for branch, column in branch_map.items():
                 firsts = ak.fill_none(ak.firsts(data[branch][clean_event_mask]), -1)
@@ -1141,12 +1225,14 @@ def validate_optional_blocks(data, basename):
         ValueError: If any constraint is violated.
     """
     fields = set(data.fields)
-    length_reference = {'track': 'track_pt', 'muon_truth': 'muon_pt',
-                        'event_jagged': 'event_other_pv_z'}
+    length_reference = OPTIONAL_BLOCK_LENGTH_REFERENCE
+    # the beam-spot columns are also written by --builder-blocks: alone they
+    # do not make an optional block present
+    shared_columns = set(BEAM_SPOT_BRANCH_MAP.values())
     for name, (branch_map, integer_columns) in OPTIONAL_BLOCKS.items():
         columns = list(branch_map.values())
         present = [column for column in columns if column in fields]
-        if not present:
+        if not set(present) - shared_columns:
             continue
         if len(present) != len(columns):
             raise ValueError(f'optional block {name} is partial in {basename}: missing '
@@ -1154,7 +1240,7 @@ def validate_optional_blocks(data, basename):
         for column in integer_columns:
             if _dtype_kind(data[column]) != 'i':
                 raise ValueError(f'{column} in {basename} is not integer')
-        if name in ('event_scalar', 'kstar_selected'):
+        if name in EVENT_SCALAR_OPTIONAL_BLOCKS or name == 'kstar_selected':
             continue
         reference = data[length_reference.get(name, columns[0])]
         for column in columns:
@@ -1209,8 +1295,10 @@ def validate_identity_unique(parquet_files):
 
 
 def validate_parquet_output(output_dir, pt_cutoff, required_gt_pions,
-                            extended=False, builder_blocks=False):
-    """Validate all Parquet files in a directory against quality constraints.
+                            extended=False, builder_blocks=False,
+                            shard_glob='*.parquet'):
+    """Validate the Parquet files of a directory (those matching shard_glob)
+    against quality constraints.
 
     Reads each file and checks:
       1. Every pion track has pT >= pt_cutoff.
@@ -1225,12 +1313,15 @@ def validate_parquet_output(output_dir, pt_cutoff, required_gt_pions,
         required_gt_pions: Required GT pion count per event.
         extended: Whether to also validate the extended-mode blocks.
         builder_blocks: Whether to also validate the builder blocks.
+        shard_glob: File-name pattern of the shards to validate (a run
+            that shares its split directory with other jobs validates
+            only its own prefix).
 
     Raises:
         FileNotFoundError: If no parquet files are found.
         ValueError: If any constraint is violated.
     """
-    parquet_files = sorted(glob.glob(os.path.join(output_dir, '*.parquet')))
+    parquet_files = sorted(glob.glob(os.path.join(output_dir, shard_glob)))
     if not parquet_files:
         raise FileNotFoundError(f'No parquet files found in {output_dir}')
 
@@ -1344,7 +1435,8 @@ def convert(input_dir, output_dir, train_events, val_events,
             chunk_size, output_columns, extended=False,
             pattern='merged_noBKstar_batch*.root',
             train_subdir='train', val_subdir='val', builder_blocks=False,
-            eval_only=False, shard_events=5000):
+            eval_only=False, shard_events=5000, track_selection='all',
+            shard_prefix=None, max_unreadable_fraction=MAXIMUM_UNREADABLE_FRACTION):
     """Convert ROOT files to sharded Parquet with pT cutoff and GT pion filter.
 
     Processes ROOT files sequentially in chunks, applying quality cleaning,
@@ -1379,6 +1471,16 @@ def convert(input_dir, output_dir, train_events, val_events,
             event quota; train_events/val_events/train_files/val_files are
             ignored. Used for the abcbatch evaluation conversion.
         shard_events: Events per shard in eval_only mode.
+        track_selection: 'all' (every pion track) or 'from_pv' (only
+            tracks with Track_fromPV > 0; MiniAOD input).
+        shard_prefix: eval_only shard-name prefix (default: val_subdir).
+            When given, only shards with this prefix are validated, so
+            several jobs can fill one split directory.
+        max_unreadable_fraction: A MiniAOD run skips and reports input
+            files that cannot be read (never the first one) and raises
+            RuntimeError after writing when more than this fraction of
+            the files was skipped. Ntuple runs fail on the first
+            unreadable file.
     """
     # --- Validate configuration ---
     if builder_blocks and not extended:
@@ -1428,7 +1530,7 @@ def convert(input_dir, output_dir, train_events, val_events,
 
     def shard_spec(index):
         if shard_plan is None:
-            return (val_dir, f'{val_subdir}_{index:03d}.parquet', shard_events)
+            return (val_dir, f'{shard_prefix or val_subdir}_{index:03d}.parquet', shard_events)
         return shard_plan[index]
 
     # Build branch map
@@ -1448,11 +1550,16 @@ def convert(input_dir, output_dir, train_events, val_events,
 
     # Optional truth / vertex / K* blocks: resolved once from the first file
     # (extended mode only), then required in every file of the run.
+    first_tree = load_root_tree(root_files[0])
+    miniaod_input = isinstance(first_tree, miniaod_source.MiniAODTree)
+    unreadable_files = []
     optional_blocks = {}
     if extended:
-        optional_blocks = resolve_optional_branches(load_root_tree(root_files[0]))
-        track_branch_map = {**track_branch_map, **optional_blocks.get('track', {})}
+        optional_blocks = resolve_optional_branches(first_tree)
+        for name in PER_TRACK_OPTIONAL_BLOCKS:
+            track_branch_map = {**track_branch_map, **optional_blocks.get(name, {})}
         print(f'Optional blocks: {sorted(optional_blocks) or "none"}')
+    print(f'Input format: {"MiniAOD" if miniaod_input else "ntuple"} | track selection: {track_selection}')
 
     print(f'Found {len(root_files)} ROOT files in {input_dir}')
     if not isinstance(input_dir, str):
@@ -1486,7 +1593,17 @@ def convert(input_dir, output_dir, train_events, val_events,
         # Clear progress line before printing file header
         sys.stdout.write('\r' + ' ' * 100 + '\r')
         print(f'[{file_index + 1}/{len(root_files)}] {basename}')
-        tree = load_root_tree(root_filepath)
+        if file_index == 0:
+            tree = first_tree
+        else:
+            try:
+                tree = load_root_tree(root_filepath)
+            except Exception as error:
+                if not miniaod_input:
+                    raise
+                unreadable_files.append(root_filepath)
+                print(f'  UNREADABLE, skipped: {root_filepath} ({type(error).__name__}: {error})')
+                continue
         number_of_entries = tree.num_entries
         file_qualifying = 0
         identity_origin = event_identity.source_ids(
@@ -1510,6 +1627,7 @@ def convert(input_dir, output_dir, train_events, val_events,
             # Step 1: Read pion tracks + quality cleaning
             raw_track_data, clean_event_mask = read_and_filter_pion_tracks(
                 tree, track_branch_map, chunk_start, chunk_end,
+                track_selection=track_selection,
             )
             event_info = read_event_info(
                 tree, clean_event_mask, chunk_start, chunk_end,
@@ -1670,9 +1788,16 @@ def convert(input_dir, output_dir, train_events, val_events,
     shards_written = (f'{current_shard_index}' if total_shards is None
                       else f'{current_shard_index}/{total_shards}')
     print(f'  Shards written:          {shards_written}')
+    if miniaod_input:
+        print(f'  Unreadable files skipped: {len(unreadable_files)}')
+        for path in unreadable_files:
+            print(f'    {path}')
+    too_many_unreadable = len(unreadable_files) > max_unreadable_fraction * len(root_files)
 
     if eval_only and current_shard_index == 0:
         print(f'\n  WARNING: No qualifying events; nothing written.')
+        if too_many_unreadable:
+            raise RuntimeError(f'{len(unreadable_files)} of {len(root_files)} input files were unreadable')
         return
     if not eval_only and current_shard_index < len(shard_plan):
         print(f'\n  WARNING: Not enough qualifying events!')
@@ -1686,15 +1811,21 @@ def convert(input_dir, output_dir, train_events, val_events,
     print(f'{"=" * 50}')
 
     split_dirs = [val_dir] if eval_only else [train_dir, val_dir]
+    shard_glob = f'{shard_prefix}_*.parquet' if eval_only and shard_prefix else '*.parquet'
     for split_dir in split_dirs:
         print(f'  {os.path.basename(split_dir)} ({split_dir}):')
         validate_parquet_output(split_dir, pt_cutoff, required_gt_pions,
-                                extended=extended, builder_blocks=builder_blocks)
+                                extended=extended, builder_blocks=builder_blocks,
+                                shard_glob=shard_glob)
     written_files = [path for split_dir in split_dirs
-                     for path in sorted(glob.glob(os.path.join(split_dir, '*.parquet')))]
+                     for path in sorted(glob.glob(os.path.join(split_dir, shard_glob)))]
     validate_identity_unique(written_files)
     print(f'    event keys unique across {len(written_files)} shard(s)')
 
+    if too_many_unreadable:
+        raise RuntimeError(
+            f'{len(unreadable_files)} of {len(root_files)} input files were unreadable (more than '
+            f'{max_unreadable_fraction:.0%}); the shards of the readable files are written and valid')
     print(f'\nDone. Output directory: {output_dir}')
 
 
@@ -1804,6 +1935,18 @@ def main():
         '--shard-events', type=int, default=5000,
         help='Events per shard with --eval-only (default: %(default)s)',
     )
+    parser.add_argument(
+        '--shard-prefix', type=str, default=None,
+        help='Shard-name prefix with --eval-only (default: the --val-subdir '
+             'name); lets several jobs fill one split directory, each '
+             'validating only its own shards',
+    )
+    parser.add_argument(
+        '--track-selection', choices=TRACK_SELECTIONS, default='all',
+        help='all: every pion track; from_pv: only tracks not used in the '
+             'fit of another primary vertex (Track_fromPV > 0, MiniAOD '
+             'input) (default: %(default)s)',
+    )
 
     arguments = parser.parse_args()
 
@@ -1833,6 +1976,8 @@ def main():
         builder_blocks=arguments.builder_blocks,
         eval_only=arguments.eval_only,
         shard_events=arguments.shard_events,
+        track_selection=arguments.track_selection,
+        shard_prefix=arguments.shard_prefix,
     )
 
 
