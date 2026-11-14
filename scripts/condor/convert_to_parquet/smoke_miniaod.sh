@@ -16,6 +16,7 @@ LCG_VIEW="${LCG_VIEW:-/cvmfs/sft.cern.ch/lcg/views/LCG_106/x86_64-el9-gcc13-opt}
 source "$LCG_VIEW/setup.sh"
 set -u
 
+export MINIAOD_READER_TRACE=1
 OUTPUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/miniaod_smoke.XXXXXX")"
 echo "SMOKE output directory: $OUTPUT_DIR (full log: $OUTPUT_DIR/smoke.log)"
 if ! python3 "$REPO_DIR/scripts/condor/convert_to_parquet/smoke_miniaod.py" "$INPUT_DIR" "$OUTPUT_DIR" > "$OUTPUT_DIR/smoke.log" 2>&1; then

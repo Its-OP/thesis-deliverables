@@ -1,20 +1,33 @@
 """Raw reader of CMS MiniAOD files without CMSSW.
 
 MiniAOD stores a few large collections split into one branch per data member
-(packed PF candidates, primary vertices, generator particles); uproot reads
-those. Everything else is stored object-wise and is read member by member
-through plain ROOT's TTree::Draw on emulated classes (lost tracks, secondary
-vertices, event ids, trigger results and objects, pileup summary, vertex
-scores, beam spot, the candidate-to-generator associations).
+(packed PF candidates, primary vertices, generator particles, trigger
+objects); uproot reads those and the beam spot. Everything else is stored
+object-wise and is read member by member through plain ROOT's TTree::Draw
+on emulated classes (lost tracks, secondary vertices, event ids, trigger
+results, pileup summary, vertex scores, the candidate-to-generator
+associations).
 
-Not readable this way: slimmedMuons and the generator mother links.
+The trigger objects must NOT be read through ROOT: the class holds a
+std::string, ROOT relocates emulated collection elements byte-wise, and a
+libstdc++ string keeps a pointer into itself, so the element destructor
+frees an invalid pointer (segmentation fault on Linux; libc++ on macOS is
+immune). The classes still read through ROOT hold no string inside a
+collection element.
+
+Not readable either way: slimmedMuons and the generator mother links.
+
+MINIAOD_READER_TRACE=1 prints each product before it is read (stderr), to
+locate a crash inside ROOT.
 
 All per-object quantities are returned as awkward arrays jagged per event,
 still in MiniAOD's packed integer form; packed_candidate.py unpacks them.
 """
 from __future__ import annotations
 
+import os
 import re
+import sys
 
 import awkward as ak
 import numpy as np
@@ -32,7 +45,7 @@ LOST_MATCH = 'recoGenParticlesedmAssociation_lostTracksToGenAssociation__PAT.obj
 TRIGGER_STATUS = 'edmTriggerResults_TriggerResults__HLT.obj.paths_.status_'
 PILEUP_TRUE = 'PileupSummaryInfos_slimmedAddPileupInfo__PAT.obj.TrueNumInteractions_'
 PV_SCORE = 'floatedmValueMap_offlineSlimmedPrimaryVertices__PAT.obj.values_'
-BEAM_SPOT_PREFIX = 'recoBeamSpot_offlineBeamSpot__RECO.obj.position_.fCoordinates.'
+BEAM_SPOT = 'recoBeamSpot_offlineBeamSpot__RECO.obj'
 
 COVARIANCE_MEMBERS = tuple('packedCovariance_.' + name for name in (
     'dptdpt', 'detadeta', 'dphidphi', 'dxydxy', 'dzdz', 'dxydz', 'dlambdadz', 'dphidxy'))
@@ -51,9 +64,10 @@ SV_MEMBERS = ('m_state.vertex_.fCoordinates.fX', 'm_state.vertex_.fCoordinates.f
               'm_state.p4Polar_.fCoordinates.fEta', 'm_state.p4Polar_.fCoordinates.fPhi',
               'm_state.p4Polar_.fCoordinates.fM', 'm_state.qx3_', 'dau@.size()')
 TRIGGER_OBJECT_MEMBERS = ('m_state.p4Polar_.fCoordinates.fPt', 'm_state.p4Polar_.fCoordinates.fEta',
-                          'm_state.p4Polar_.fCoordinates.fPhi', 'pathIndices_@.size()')
+                          'm_state.p4Polar_.fCoordinates.fPhi', 'pathIndices_', 'pathLastFilterAccepted_')
 SPLIT_BLOCKS = {'pf': (PF_PREFIX, CANDIDATE_MEMBERS), 'pv': (PV_PREFIX, PV_MEMBERS),
-                'gen': (GEN_PREFIX, GEN_MEMBERS), 'packed_gen': (PACKED_GEN_PREFIX, PACKED_GEN_MEMBERS)}
+                'gen': (GEN_PREFIX, GEN_MEMBERS), 'packed_gen': (PACKED_GEN_PREFIX, PACKED_GEN_MEMBERS),
+                'trigger_objects': (TRIGGER_OBJECT_PREFIX, TRIGGER_OBJECT_MEMBERS)}
 VERTEX_COVARIANCE_SIZE = 10
 DRAW_ESTIMATE = 20_000_000
 EXPRESSIONS_PER_DRAW = 3
@@ -74,15 +88,30 @@ def is_miniaod(path):
         return 'Events' in root_file and is_miniaod_tree(root_file['Events'])
 
 
+def _trace(label):
+    if os.environ.get('MINIAOD_READER_TRACE'):
+        print(f'miniaod_reader: reading {label}', file=sys.stderr, flush=True)
+
+
 def read_split_products(path):
     """path: MiniAOD file. Returns {'n_events': int, block: {member: awkward
-    array jagged per event}} for the blocks pf, pv, gen, packed_gen."""
+    array jagged per event}} for the blocks pf, pv, gen, packed_gen, plus
+    trigger_objects (pt, eta, phi per object; path_indices and
+    path_accepted per object and path) and beam_spot ((n_events, 3))."""
+    _trace('split products (uproot)')
     events = uproot.open(path)['Events']
     names = [prefix + member for prefix, members in SPLIT_BLOCKS.values() for member in members]
     data = events.arrays(names)
     products = {'n_events': int(events.num_entries)}
     for block, (prefix, members) in SPLIT_BLOCKS.items():
         products[block] = {member: data[prefix + member] for member in members}
+    objects = products['trigger_objects']
+    products['trigger_objects'] = {
+        'pt': objects['m_state.p4Polar_.fCoordinates.fPt'], 'eta': objects['m_state.p4Polar_.fCoordinates.fEta'],
+        'phi': objects['m_state.p4Polar_.fCoordinates.fPhi'], 'path_indices': objects['pathIndices_'],
+        'path_accepted': objects['pathLastFilterAccepted_']}
+    position = events[BEAM_SPOT].array()['position_']['fCoordinates']
+    products['beam_spot'] = np.stack([ak.to_numpy(position[axis]) for axis in ('fX', 'fY', 'fZ')], axis=1)
     return products
 
 
@@ -152,9 +181,7 @@ def read_unsplit_products(path, n_events):
     index per candidate, -1 unmatched), trigger_status (per event, one value
     per HLT path), event (run, luminosityBlock, event, bunchCrossing as
     (n_events,) int64), pileup ((n_events,) true interactions), sv (members
-    + covariance (n_sv, 10)), pv_score, beam_spot ((n_events, 3)),
-    trigger_objects (pt, eta, phi per object; path_indices and
-    path_accepted per object)."""
+    + covariance (n_sv, 10)), pv_score."""
     import ROOT
     ROOT.gROOT.SetBatch(True)
     ROOT.gErrorIgnoreLevel = ROOT.kError
@@ -163,14 +190,17 @@ def read_unsplit_products(path, n_events):
         raise OSError(f'{path}: ROOT cannot open the file')
     tree = root_file.Get('Events')
     tree.SetEstimate(DRAW_ESTIMATE)
-    products = {
-        'lost': _draw_block(tree, LOST_PREFIX, CANDIDATE_MEMBERS, n_events),
-        'pf_match': _draw_single(tree, PF_MATCH, n_events),
-        'lost_match': _draw_single(tree, LOST_MATCH, n_events),
-        'trigger_status': _draw_single(tree, TRIGGER_STATUS, n_events),
-        'pv_score': _draw_single(tree, PV_SCORE, n_events),
-        'sv': _draw_block(tree, SV_PREFIX, SV_MEMBERS, n_events),
-    }
+    products = {}
+    for name, read in (
+            ('lost', lambda: _draw_block(tree, LOST_PREFIX, CANDIDATE_MEMBERS, n_events)),
+            ('pf_match', lambda: _draw_single(tree, PF_MATCH, n_events)),
+            ('lost_match', lambda: _draw_single(tree, LOST_MATCH, n_events)),
+            ('trigger_status', lambda: _draw_single(tree, TRIGGER_STATUS, n_events)),
+            ('pv_score', lambda: _draw_single(tree, PV_SCORE, n_events)),
+            ('sv', lambda: _draw_block(tree, SV_PREFIX, SV_MEMBERS, n_events))):
+        _trace(f'{name} (ROOT)')
+        products[name] = read()
+    _trace('sv covariance, event ids, pileup (ROOT)')
     sv_counts = ak.num(products['sv']['chi2_'])
     covariance = _draw_single(tree, SV_PREFIX + 'covariance_', n_events)
     products['sv']['covariance'] = ak.unflatten(
@@ -188,23 +218,7 @@ def read_unsplit_products(path, n_events):
     }
     pileup = _draw_single(tree, PILEUP_TRUE, n_events)
     products['pileup'] = ak.to_numpy(ak.fill_none(ak.firsts(pileup), np.nan)).astype(np.float64)
-    beam = _draw(tree, [BEAM_SPOT_PREFIX + 'fX', BEAM_SPOT_PREFIX + 'fY', BEAM_SPOT_PREFIX + 'fZ'])[1]
-    products['beam_spot'] = np.stack([beam[BEAM_SPOT_PREFIX + axis] for axis in ('fX', 'fY', 'fZ')], axis=1)
-
-    objects = _draw_block(tree, TRIGGER_OBJECT_PREFIX, TRIGGER_OBJECT_MEMBERS, n_events)
-    path_counts = ak.values_astype(objects['pathIndices_@.size()'], np.int64)
-    path_entry, path_columns = _draw(tree, [TRIGGER_OBJECT_PREFIX + 'pathIndices_',
-                                            TRIGGER_OBJECT_PREFIX + 'pathLastFilterAccepted_'])
-    flat_counts = ak.to_numpy(ak.flatten(path_counts))
-    products['trigger_objects'] = {
-        'pt': objects['m_state.p4Polar_.fCoordinates.fPt'],
-        'eta': objects['m_state.p4Polar_.fCoordinates.fEta'],
-        'phi': objects['m_state.p4Polar_.fCoordinates.fPhi'],
-        'path_indices': ak.unflatten(ak.unflatten(
-            path_columns[TRIGGER_OBJECT_PREFIX + 'pathIndices_'].astype(np.int64), flat_counts), ak.num(path_counts)),
-        'path_accepted': ak.unflatten(ak.unflatten(
-            path_columns[TRIGGER_OBJECT_PREFIX + 'pathLastFilterAccepted_'].astype(np.int64), flat_counts), ak.num(path_counts)),
-    }
+    _trace('closing the file (ROOT)')
     root_file.Close()
     return products
 
