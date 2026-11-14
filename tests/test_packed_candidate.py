@@ -122,7 +122,8 @@ def test_unpacked_pion_tracks_pass_through_the_true_tau_decay_vertex(tables):
         for row in range(products['n_events']):
             gen = {member: ak.to_numpy(values[row]) for member, values in products['gen'].items()}
             vertex = np.stack([gen[f'vertex_.fCoordinates.f{axis}'] for axis in 'XYZ'], axis=1)
-            chain = truth.signal_chain(gen['pdgId_'], gen['status_'], vertex)
+            chain = truth.signal_chain(gen['pdgId_'], gen['status_'], vertex, gen['p4Polar_.fCoordinates.fEta'],
+                                       gen['p4Polar_.fCoordinates.fPhi'])
             if chain['tau_pions'].size != 3:
                 continue
             block, pv_position, pv_ndof = event_blocks(products, row)
